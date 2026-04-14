@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pycache_tmp/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build artifacts
+build/
+dist/
+*.spec.bak
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local sample data and generated outputs
+test_data/
+output/
+**/output/
+**/masks/
+
+# Test / local media and tracking files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wmv
+*.m4v
+*.csv

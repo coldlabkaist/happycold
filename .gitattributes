@@ -1,0 +1,39 @@
+# Default: treat known text files as text and keep LF in the repository/worktree where specified.
+* text=auto
+
+# Source and config files
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.ini text eol=lf
+*.cfg text eol=lf
+*.spec text eol=lf
+*.gitignore text eol=lf
+*.gitattributes text eol=lf
+
+# Shell / Windows scripts
+*.sh text eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.mp4 binary
+*.avi binary
+*.mov binary
+*.mkv binary
+*.wmv binary
+*.m4v binary
+*.zip binary
+*.exe binary
+*.dll binary
+*.pyd binary
