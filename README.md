@@ -1,6 +1,6 @@
 # happycold
 
-`happycold` is a set of tools required for a behavioral analysis pipeline, including coordinate normalization, location detection, and occlusion detection. For happy CoLD!
+`happycold` is a set of tools required for a behavioral analysis pipeline, including coordinate normalization, location detection, and occlusion detection. **For happy CoLD!**
 
 It currently supports:
 
