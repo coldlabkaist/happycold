@@ -9,7 +9,7 @@ class SquareTabMixin:
         tooltip = "Choose four corners of the arena or region. These points define the perspective correction used for normalization and geometric mask margin."
         tab.setToolTip(tooltip)
         layout = QVBoxLayout(tab)
-        info = QLabel("Click four corners on the frame. Use Preview to inspect normalized trajectories.")
+        info = QLabel("Click four corners on the frame. With no points selected, Preview shows the raw full-area trajectory.")
         info.setWordWrap(True)
         info.setToolTip(tooltip)
         self.square_points_label = QLabel("Selected points: 0 / 4")
@@ -19,7 +19,7 @@ class SquareTabMixin:
         self.square_reset_button.setToolTip("Clear the current four-point selection and start over.")
         self.square_preview_button = QPushButton("Preview")
         self.square_preview_button.setEnabled(False)
-        self.square_preview_button.setToolTip("Open a plot preview of the normalized trajectories using the selected four points.")
+        self.square_preview_button.setToolTip("With 4 points, open a normalized trajectory preview. With 0 points, open a raw trajectory preview.")
         row = QHBoxLayout()
         row.addWidget(self.square_reset_button)
         row.addWidget(self.square_preview_button)
@@ -32,18 +32,25 @@ class SquareTabMixin:
     def _refresh_square_ui(self) -> None:
         detail = " | ".join(f"{index + 1}: ({point[0]:.1f}, {point[1]:.1f})" for index, point in enumerate(self.frame_viewer.square_points))
         self.square_points_label.setText(f"Selected points: {len(self.frame_viewer.square_points)} / 4\n{detail if detail else '-'}")
-        self.square_preview_button.setEnabled(self.csv_df is not None and len(self.frame_viewer.square_points) == 4)
+        self.square_preview_button.setEnabled(self.csv_df is not None)
         self._refresh_output_ui()
 
     def _on_square_points_changed(self) -> None:
         self._refresh_square_ui()
 
     def preview_square_normalization(self) -> None:
-        if self.csv_df is None or self.video_state is None or len(self.frame_viewer.square_points) != 4:
-            QMessageBox.warning(self, "Preview", "Load CSV and choose four square points first.")
+        if self.csv_df is None or self.video_state is None:
+            QMessageBox.warning(self, "Preview", "Load a video and CSV first.")
+            return
+        point_count = len(self.frame_viewer.square_points)
+        if point_count == 0:
+            self._show_normalized_preview(self.csv_df, normalized=False)
+            return
+        if point_count != 4:
+            QMessageBox.warning(self, "Preview", "Choose either zero points for a raw preview or four points for a normalized preview.")
             return
         normalized_df = build_normalized_dataframe(self.csv_df, self.bodyparts, self.frame_viewer.square_points, self.video_state.width, self.video_state.height)
-        self._show_normalized_preview(normalized_df)
+        self._show_normalized_preview(normalized_df, normalized=True)
 
     def save_normalized_csv(self) -> None:
         if self.csv_df is None or self.video_state is None:

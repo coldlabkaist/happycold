@@ -66,14 +66,27 @@ from happycold_shared import (
     adjust_mask_by_mode,
     bodyparts_from_dataframe,
     discover_videos,
+    infer_pixel_scale,
 )
 from tab_mixins import ChamberTabMixin, CircleTabMixin, OcclusionTabMixin, PinTabMixin, SquareTabMixin
 
 
 class TrajectoryPreviewDialog(QDialog):
-    def __init__(self, df: pd.DataFrame, bodyparts: list[str], parent: QWidget | None = None) -> None:
+    TRACK_COLUMN_CANDIDATES = ("track", "track_id", "track id")
+    FRAME_COLUMN_CANDIDATES = ("frame idx", "frame_idx", "frame index", "frame_index", "frame")
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        bodyparts: list[str],
+        normalized: bool,
+        frame_width: int | None,
+        frame_height: int | None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"{APP_NAME} - Normalized Trajectory Preview")
+        mode_label = "Normalized" if normalized else "Raw"
+        self.setWindowTitle(f"{APP_NAME} - {mode_label} Trajectory Preview")
         self.resize(1100, 760)
 
         layout = QVBoxLayout(self)
@@ -89,15 +102,92 @@ class TrajectoryPreviewDialog(QDialog):
         colors = ["#2563eb", "#ea580c", "#16a34a", "#dc2626", "#7c3aed", "#0891b2", "#4f46e5", "#a16207"]
         columns = min(3, max(1, len(bodyparts)))
         rows = math.ceil(len(bodyparts) / columns)
+        track_col = self._find_matching_column(df, self.TRACK_COLUMN_CANDIDATES)
+        frame_col = self._find_matching_column(df, self.FRAME_COLUMN_CANDIDATES)
+        x_limit, y_limit = self._plot_limits(df, bodyparts, normalized, frame_width, frame_height)
 
         for index, bodypart in enumerate(bodyparts, start=1):
             ax = figure.add_subplot(rows, columns, index)
-            ax.plot(pd.to_numeric(df[f"{bodypart}.x"], errors="coerce"), pd.to_numeric(df[f"{bodypart}.y"], errors="coerce"), color=colors[(index - 1) % len(colors)], linewidth=1.1)
+            self._plot_bodypart(ax, df, bodypart, track_col, frame_col, colors)
             ax.set_title(bodypart, fontsize=10)
-            ax.set_xlim(0, 1)
-            ax.set_ylim(1, 0)
+            ax.set_xlim(0, x_limit)
+            ax.set_ylim(y_limit, 0)
             ax.set_aspect("equal", adjustable="box")
             ax.grid(alpha=0.2)
+
+    @staticmethod
+    def _canonical_column_name(name: str) -> str:
+        return "".join(character.lower() for character in str(name) if character.isalnum())
+
+    @classmethod
+    def _find_matching_column(cls, df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
+        lookup = {cls._canonical_column_name(column): column for column in df.columns}
+        for candidate in candidates:
+            match = lookup.get(cls._canonical_column_name(candidate))
+            if match is not None:
+                return match
+        return None
+
+    @staticmethod
+    def _plot_limits(
+        df: pd.DataFrame,
+        bodyparts: list[str],
+        normalized: bool,
+        frame_width: int | None,
+        frame_height: int | None,
+    ) -> tuple[float, float]:
+        if normalized or frame_width is None or frame_height is None:
+            return 1.0, 1.0
+        x_columns = [f"{bodypart}.x" for bodypart in bodyparts if f"{bodypart}.x" in df.columns]
+        y_columns = [f"{bodypart}.y" for bodypart in bodyparts if f"{bodypart}.y" in df.columns]
+        return (
+            TrajectoryPreviewDialog._axis_extent(df, x_columns, frame_width),
+            TrajectoryPreviewDialog._axis_extent(df, y_columns, frame_height),
+        )
+
+    @staticmethod
+    def _axis_extent(df: pd.DataFrame, columns: list[str], frame_extent: int) -> float:
+        if not columns:
+            return float(frame_extent)
+        has_pixel_scale = any(infer_pixel_scale(df[column], frame_extent) == 1.0 for column in columns)
+        return float(frame_extent if has_pixel_scale else 1.0)
+
+    @staticmethod
+    def _track_groups(df: pd.DataFrame, track_col: str | None, frame_col: str | None) -> list[tuple[str | None, pd.DataFrame]]:
+        if track_col is None:
+            return [(None, df)]
+
+        groups: list[tuple[str | None, pd.DataFrame]] = []
+        for track_value, group_df in df.groupby(track_col, dropna=False, sort=False):
+            if frame_col is not None:
+                group_df = (
+                    group_df.assign(_trajectory_order=pd.to_numeric(group_df[frame_col], errors="coerce"))
+                    .sort_values("_trajectory_order", kind="stable")
+                    .drop(columns="_trajectory_order")
+                )
+            groups.append((None if pd.isna(track_value) else str(track_value), group_df))
+        return groups
+
+    def _plot_bodypart(
+        self,
+        ax,
+        df: pd.DataFrame,
+        bodypart: str,
+        track_col: str | None,
+        frame_col: str | None,
+        colors: list[str],
+    ) -> None:
+        groups = self._track_groups(df, track_col, frame_col)
+        for index, (track_label, group_df) in enumerate(groups):
+            ax.plot(
+                pd.to_numeric(group_df[f"{bodypart}.x"], errors="coerce"),
+                pd.to_numeric(group_df[f"{bodypart}.y"], errors="coerce"),
+                color=colors[index % len(colors)],
+                linewidth=1.1,
+                label=track_label,
+            )
+        if track_col is not None and len(groups) > 1:
+            ax.legend(fontsize=7, loc="best")
 
 
 class FrameViewer(QWidget):
@@ -1260,8 +1350,10 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
     def _mask_export_folder(self) -> Path:
         return self.save_folder / "masks"
 
-    def _show_normalized_preview(self, normalized_df: pd.DataFrame) -> None:
-        TrajectoryPreviewDialog(normalized_df, self.bodyparts, self).exec()
+    def _show_normalized_preview(self, preview_df: pd.DataFrame, normalized: bool) -> None:
+        frame_width = self.video_state.width if self.video_state is not None else None
+        frame_height = self.video_state.height if self.video_state is not None else None
+        TrajectoryPreviewDialog(preview_df, self.bodyparts, normalized, frame_width, frame_height, self).exec()
 
     def _refresh_output_ui(self) -> None:
         current_index = self.mode_tabs.currentIndex() if hasattr(self, "mode_tabs") else 0
