@@ -1,6 +1,6 @@
 # happycold
 
-`happycold` is a set of tools required for a behavioral analysis pipeline, including coordinate normalization, location detection, and occlusion detection. For happy CoLD!
+`happycold` is a set of tools required for a behavioral analysis pipeline, including coordinate normalization, location detection, and occlusion detection. **For happy CoLD!**
 
 It currently supports:
 
@@ -17,14 +17,26 @@ It currently supports:
 
 Install:
 
-```powershell
+```
+git clone https://github.com/coldlabkaist/happycold.git
+# git clone -b v1.0.0 https://github.com/coldlabkaist/happycold.git  # for specific version
+conda create -n happycold python=3.11 -y
+conda activate happycold
 pip install -r requirements.txt
 ```
 
 ## Run
 
-```powershell
+```
+conda activate happycold
 python happycold.py
+```
+
+## Update
+
+```
+git fetch --tags
+git checkout (version) # git checkout v1.0.0
 ```
 
 ## Basic Workflow
