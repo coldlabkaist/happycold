@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QRadioButton,
@@ -82,16 +83,21 @@ class TrajectoryPreviewDialog(QDialog):
         normalized: bool,
         frame_width: int | None,
         frame_height: int | None,
+        video_name: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         mode_label = "Normalized" if normalized else "Raw"
         self.setWindowTitle(f"{APP_NAME} - {mode_label} Trajectory Preview")
         self.resize(1100, 760)
+        self._default_export_name = f"{video_name or 'trajectory'}_trajectory"
 
         layout = QVBoxLayout(self)
-        figure = Figure(figsize=(10, 7), tight_layout=True)
-        layout.addWidget(FigureCanvasQTAgg(figure))
+        self.figure = Figure(figsize=(10, 7), tight_layout=True)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.canvas.customContextMenuRequested.connect(self._show_context_menu)
+        layout.addWidget(self.canvas)
 
         if not bodyparts:
             empty_label = QLabel("No bodyparts found in this CSV.")
@@ -107,13 +113,44 @@ class TrajectoryPreviewDialog(QDialog):
         x_limit, y_limit = self._plot_limits(df, bodyparts, normalized, frame_width, frame_height)
 
         for index, bodypart in enumerate(bodyparts, start=1):
-            ax = figure.add_subplot(rows, columns, index)
+            ax = self.figure.add_subplot(rows, columns, index)
             self._plot_bodypart(ax, df, bodypart, track_col, frame_col, colors)
             ax.set_title(bodypart, fontsize=10)
             ax.set_xlim(0, x_limit)
             ax.set_ylim(y_limit, 0)
             ax.set_aspect("equal", adjustable="box")
             ax.grid(alpha=0.2)
+        self.canvas.draw_idle()
+
+    def _show_context_menu(self, position: QPoint) -> None:
+        menu = QMenu(self)
+        save_action = menu.addAction("Save As...")
+        selected_action = menu.exec(self.canvas.mapToGlobal(position))
+        if selected_action == save_action:
+            self._save_figure_as()
+
+    def _save_figure_as(self) -> None:
+        start_dir = str(Path.cwd() / f"{self._default_export_name}.png")
+        file_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save Trajectory Image",
+            start_dir,
+            "PNG Image (*.png);;JPEG Image (*.jpg *.jpeg);;SVG Image (*.svg);;PDF Document (*.pdf)",
+        )
+        if not file_path:
+            return
+
+        output_path = Path(file_path)
+        if output_path.suffix == "" and selected_filter:
+            if "PNG" in selected_filter:
+                output_path = output_path.with_suffix(".png")
+            elif "JPEG" in selected_filter:
+                output_path = output_path.with_suffix(".jpg")
+            elif "SVG" in selected_filter:
+                output_path = output_path.with_suffix(".svg")
+            elif "PDF" in selected_filter:
+                output_path = output_path.with_suffix(".pdf")
+        self.figure.savefig(output_path)
 
     @staticmethod
     def _canonical_column_name(name: str) -> str:
@@ -1353,7 +1390,8 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
     def _show_normalized_preview(self, preview_df: pd.DataFrame, normalized: bool) -> None:
         frame_width = self.video_state.width if self.video_state is not None else None
         frame_height = self.video_state.height if self.video_state is not None else None
-        TrajectoryPreviewDialog(preview_df, self.bodyparts, normalized, frame_width, frame_height, self).exec()
+        video_name = self.video_state.path.stem if self.video_state is not None else None
+        TrajectoryPreviewDialog(preview_df, self.bodyparts, normalized, frame_width, frame_height, video_name, self).exec()
 
     def _refresh_output_ui(self) -> None:
         current_index = self.mode_tabs.currentIndex() if hasattr(self, "mode_tabs") else 0
@@ -1419,33 +1457,34 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         self.video_list.setCurrentRow(0)
         self.statusBar().showMessage(f"Loaded {len(videos)} videos.")
 
+    @staticmethod
+    def _csv_candidate_patterns(video_name: str) -> list[tuple[str, int]]:
+        return [
+            (video_name, 0),
+            (f"predict_{video_name}", 1),
+            (f"predict__{video_name}", 1),
+        ]
+
     def _csv_candidate_sort_key(self, path: Path, video_name: str) -> tuple[int, str, str]:
         stem = path.stem
-        predict_name = f"predict_{video_name}"
-        if stem == video_name:
-            return (0, "", stem)
-        if stem == predict_name:
-            return (1, "", stem)
-        if stem.startswith(f"{video_name}_"):
-            suffix = stem[len(video_name) + 1 :]
-            return (2, suffix.lower(), stem)
-        if stem.startswith(f"{predict_name}_"):
-            suffix = stem[len(predict_name) + 1 :]
-            return (3, suffix.lower(), stem)
+        for prefix, exact_rank in self._csv_candidate_patterns(video_name):
+            if stem == prefix:
+                return (exact_rank, "", stem)
+            if stem.startswith(f"{prefix}_"):
+                suffix = stem[len(prefix) + 1 :]
+                return (exact_rank + 2, suffix.lower(), stem)
         return (4, stem.lower(), stem)
 
     def _matching_csv_candidates(self, video_path: Path) -> list[Path]:
         search_dir = video_path.parent
         video_name = video_path.stem
-        predict_name = f"predict_{video_name}"
         candidates: list[Path] = []
         for path in search_dir.glob("*.csv"):
             stem = path.stem
-            if stem == video_name or stem == predict_name:
-                candidates.append(path)
-                continue
-            if stem.startswith(f"{video_name}_") or stem.startswith(f"{predict_name}_"):
-                candidates.append(path)
+            for prefix, _ in self._csv_candidate_patterns(video_name):
+                if stem == prefix or stem.startswith(f"{prefix}_"):
+                    candidates.append(path)
+                    break
         return sorted(candidates, key=lambda path: self._csv_candidate_sort_key(path, video_name))
 
     def _set_csv_auto_candidates(self, candidates: list[Path], selected_path: Path | None = None, allow_default: bool = True) -> None:
@@ -1538,7 +1577,8 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
             self.csv_df = None
             self.bodyparts = []
             self._update_csv_path_label(None)
-            self._refresh_output_ui()
+            self._refresh_square_ui()
+            self._refresh_circle_ui()
 
     def choose_csv(self) -> None:
         start_dir = self.current_folder if self.current_folder.exists() else Path.cwd()
@@ -1561,7 +1601,8 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
             current_candidates = getattr(self, "csv_auto_candidates", [])
             selected = csv_path if csv_path in current_candidates else None
             self._set_csv_auto_candidates(current_candidates, selected, allow_default=selected is not None)
-        self._refresh_output_ui()
+        self._refresh_square_ui()
+        self._refresh_circle_ui()
 
     def _load_frame(self, frame_number: int) -> None:
         if self.video_state is None:

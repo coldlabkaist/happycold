@@ -22,12 +22,14 @@ git clone https://github.com/coldlabkaist/happycold.git
 # git clone -b v1.0.0 https://github.com/coldlabkaist/happycold.git  # for specific version
 conda create -n happycold python=3.11 -y
 conda activate happycold
+cd happycold
 pip install -r requirements.txt
 ```
 
 ## Run
 
 ```
+cd (happycold directory)
 conda activate happycold
 python happycold.py
 ```
@@ -35,6 +37,7 @@ python happycold.py
 ## Update
 
 ```
+cd (happycold directory)
 git fetch --tags
 git checkout (version) # git checkout v1.0.0
 ```
