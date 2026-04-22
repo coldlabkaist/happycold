@@ -9,6 +9,7 @@ from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -41,9 +42,16 @@ class OcclusionTabMixin:
         tooltip = "Create named masks for occlusion detection. You can draw, erase, transform masks, and choose simple or perspective-aware geometric margin."
         tab.setToolTip(tooltip)
         layout = QVBoxLayout(tab)
+        header_row = QHBoxLayout()
+        header_label = QLabel("Object Mask Controls")
+        self.occlusion_help_button = QPushButton("?")
+        self.occlusion_help_button.setFixedWidth(30)
+        self.occlusion_help_button.setToolTip("Open occlusion controls help.")
+        header_row.addWidget(header_label)
+        header_row.addStretch(1)
+        header_row.addWidget(self.occlusion_help_button)
         info = QLabel(
-            "Create named masks for occlusion detection. Rectangle uses four clicks, circle uses drag, "
-            "and free drawing uses the current brush mode."
+            "Create named masks for occlusion detection."
         )
         info.setWordWrap(True)
         info.setToolTip(tooltip)
@@ -166,6 +174,7 @@ class OcclusionTabMixin:
         import_row.addWidget(self.import_mask_folder_button)
         import_row.addWidget(self.export_masks_button)
 
+        layout.addLayout(header_row)
         layout.addWidget(info)
         layout.addWidget(self.mask_combo)
         layout.addLayout(name_row)
@@ -173,6 +182,38 @@ class OcclusionTabMixin:
         layout.addLayout(import_row)
         layout.addWidget(self.mask_summary_label)
         return tab
+
+    def show_occlusion_controls_help(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Occlusion Controls")
+        dialog.setModal(True)
+        dialog.resize(520, 360)
+        layout = QVBoxLayout(dialog)
+
+        title = QLabel("Object Mask Controls")
+        title.setStyleSheet("font-size: 15px; font-weight: 700;")
+        text = QLabel(
+            "Transform mode:\n"
+            "- Left drag: move mask\n"
+            "- Ctrl + left click / drag: erase with current brush size\n"
+            "- [: scale down\n"
+            "- ]: scale up\n"
+            "- Ctrl + [: rotate -4 degrees\n"
+            "- Ctrl + ]: rotate +4 degrees\n\n"
+            "Viewer:\n"
+            "- Mouse wheel: zoom viewer\n"
+            "- Right drag: pan viewer\n\n"
+            "Tips:\n"
+            "- This help is available from the ? button in Occlusion tab.\n"
+            "- Press F1 to open this dialog while using Occlusion."
+        )
+        text.setWordWrap(True)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(title)
+        layout.addWidget(text, stretch=1)
+        layout.addWidget(close_button, alignment=Qt.AlignmentFlag.AlignRight)
+        dialog.exec()
 
     def _sync_occlusion_mode(self) -> None:
         if self.mode_tabs.currentIndex() != 4:
@@ -447,6 +488,24 @@ class OcclusionTabMixin:
             self._last_mask_preview_refresh = 0.0
             self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
         self._refresh_mask_ui()
+
+    def erase_occ_transform_point(self, point: tuple[float, float]) -> None:
+        current = self._selected_mask()
+        if current is None or not self.mask_transform_radio.isChecked():
+            return
+        brush_radius = max(1, int(self.mask_brush_slider.value()))
+        paint_brush(current.mask, point, point, brush_radius, 0)
+        self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
+        self._refresh_mask_ui()
+
+    def erase_occ_transform_segment(self, payload: tuple[tuple[float, float], tuple[float, float]]) -> None:
+        current = self._selected_mask()
+        if current is None or not self.mask_transform_radio.isChecked():
+            return
+        start, end = payload
+        brush_radius = max(1, int(self.mask_brush_slider.value()))
+        paint_brush(current.mask, start, end, brush_radius, 0)
+        self.frame_viewer.refresh_mask_record(current.name, include_margin=False)
 
     def apply_occ_rect_mask(self, points: list[tuple[float, float]]) -> None:
         current = self._selected_mask()

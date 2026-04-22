@@ -17,6 +17,7 @@ from matplotlib.figure import Figure
 from PyQt6.QtCore import QPoint, QPointF, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QKeySequence, QMouseEvent, QPainter, QPen, QPixmap, QPolygonF, QShortcut
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QButtonGroup,
     QComboBox,
@@ -65,6 +66,10 @@ from happycold_shared import (
     RoomRecord,
     VideoState,
     adjust_mask_by_mode,
+    build_chamber_mark_dataframe,
+    build_circle_detection_dataframe,
+    build_normalized_dataframe,
+    build_occlusion_dataframe,
     bodyparts_from_dataframe,
     discover_videos,
     infer_pixel_scale,
@@ -245,6 +250,8 @@ class FrameViewer(QWidget):
     free_draw_finished = pyqtSignal()
     occ_transform_requested = pyqtSignal(object)
     occ_scale_requested = pyqtSignal(float)
+    occ_transform_erase_requested = pyqtSignal(object)
+    occ_transform_erase_segment_requested = pyqtSignal(object)
     occ_transform_finished = pyqtSignal()
 
     def __init__(self) -> None:
@@ -290,6 +297,8 @@ class FrameViewer(QWidget):
         self.occ_transform_mode = False
         self._occ_transform_dragging = False
         self._occ_transform_last_point: tuple[float, float] | None = None
+        self._occ_transform_erase_dragging = False
+        self._occ_transform_erase_last_point: tuple[float, float] | None = None
 
         self._pan_dragging = False
         self._pan_drag_start = QPoint()
@@ -598,12 +607,6 @@ class FrameViewer(QWidget):
     def wheelEvent(self, event) -> None:
         if not self.has_frame():
             return
-        if self.mode.startswith("occ_") and self.occ_transform_mode:
-            steps = event.angleDelta().y() / 120.0
-            if steps != 0:
-                self.occ_scale_requested.emit(1.0 + 0.04 * steps)
-                event.accept()
-                return
         anchor_widget = event.position()
         anchor_image = self._widget_to_image(anchor_widget)
         factor = 1.15 if event.angleDelta().y() > 0 else (1 / 1.15)
@@ -658,6 +661,11 @@ class FrameViewer(QWidget):
                 self.update()
                 self.occ_margin_points_changed.emit()
         elif self.mode.startswith("occ_") and self.occ_transform_mode:
+            if bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                self._occ_transform_erase_dragging = True
+                self._occ_transform_erase_last_point = image_point
+                self.occ_transform_erase_requested.emit(image_point)
+                return
             self._occ_transform_dragging = True
             self._occ_transform_last_point = image_point
         elif self.mode == "pin":
@@ -736,6 +744,9 @@ class FrameViewer(QWidget):
             self._occ_transform_dragging = False
             self._occ_transform_last_point = None
             self.occ_transform_finished.emit()
+        if self._occ_transform_erase_dragging and not (event.buttons() & Qt.MouseButton.LeftButton):
+            self._occ_transform_erase_dragging = False
+            self._occ_transform_erase_last_point = None
 
         if self._pan_dragging:
             delta = event.position().toPoint() - self._pan_drag_start
@@ -780,6 +791,12 @@ class FrameViewer(QWidget):
             self.square_points[self._square_drag_index] = image_point
             self.update()
             self.square_points_changed.emit()
+        elif self.mode.startswith("occ_") and self.occ_transform_mode and self._occ_transform_erase_dragging:
+            if self._occ_transform_erase_last_point is not None:
+                self.occ_transform_erase_segment_requested.emit((self._occ_transform_erase_last_point, image_point))
+            else:
+                self.occ_transform_erase_requested.emit(image_point)
+            self._occ_transform_erase_last_point = image_point
         elif self.mode.startswith("occ_") and self.occ_transform_mode and self._occ_transform_dragging and self._occ_transform_last_point is not None:
             dx = int(round(image_point[0] - self._occ_transform_last_point[0]))
             dy = int(round(image_point[1] - self._occ_transform_last_point[1]))
@@ -834,6 +851,8 @@ class FrameViewer(QWidget):
         elif self.mode.startswith("occ_") and self.occ_transform_mode and event.button() == Qt.MouseButton.LeftButton:
             self._occ_transform_dragging = False
             self._occ_transform_last_point = None
+            self._occ_transform_erase_dragging = False
+            self._occ_transform_erase_last_point = None
             self.occ_transform_finished.emit()
 
     def leaveEvent(self, event) -> None:
@@ -852,6 +871,8 @@ class FrameViewer(QWidget):
         self._occ_circle_current = None
         self._occ_transform_dragging = False
         self._occ_transform_last_point = None
+        self._occ_transform_erase_dragging = False
+        self._occ_transform_erase_last_point = None
         super().leaveEvent(event)
 
     def paintEvent(self, event) -> None:
@@ -1058,6 +1079,12 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         self._loading_slider = False
         self.settings = self._load_settings()
         self.csv_auto_candidates: list[Path] = []
+        csv_manual_dir = str(self.settings.get("csv_manual_dir", "")).strip()
+        self.csv_manual_folder: Path | None = None
+        if csv_manual_dir:
+            candidate = Path(csv_manual_dir)
+            if candidate.exists():
+                self.csv_manual_folder = candidate
         self._last_mask_preview_refresh = 0.0
 
         self.pins: list[PinRecord] = []
@@ -1075,6 +1102,7 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
             self.default_mask_margin_mode = "simple"
 
         self._build_ui()
+        self._refresh_csv_search_folder_ui()
         self._connect_signals()
         self._register_shortcuts()
         self._initialize_directories()
@@ -1161,10 +1189,13 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         self.csv_auto_combo = QComboBox()
         self.csv_auto_combo.setEnabled(False)
         self.csv_auto_combo.setToolTip("Automatically discovered CSV candidates for the selected video.")
+        self.load_csv_folder_button = QPushButton("Load Folder Manually")
+        self.load_csv_folder_button.setToolTip("Select an additional CSV folder for persistent auto-detection.")
         self.load_csv_button = QPushButton("Load CSV Manually")
         self.load_csv_button.setToolTip("Choose any CSV file manually.")
         csv_row = QHBoxLayout()
         csv_row.addWidget(self.csv_auto_combo, stretch=1)
+        csv_row.addWidget(self.load_csv_folder_button)
         csv_row.addWidget(self.load_csv_button)
         self.csv_path_label = QLabel("Select a video first.")
         self.csv_path_label.setWordWrap(True)
@@ -1192,8 +1223,8 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         self.mode_tabs.setTabToolTip(4, "Create and adjust occlusion masks, including simple and geometric margins.")
 
         save_group = QGroupBox("Save Options And Save")
-        save_group.setMinimumHeight(150)
-        save_group.setMaximumHeight(190)
+        save_group.setMinimumHeight(180)
+        save_group.setMaximumHeight(240)
         save_group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         save_layout = QFormLayout(save_group)
         self.save_folder_label = QLabel("-")
@@ -1202,10 +1233,13 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         self.current_output_label = QLabel("-")
         self.current_output_label.setWordWrap(True)
         self.save_current_button = QPushButton("Save Current Result")
+        self.save_multiple_button = QPushButton("Save Multiple CSVs")
+        self.save_multiple_button.setToolTip("Apply current mode settings to multiple selected videos at once.")
         save_layout.addRow("Save Folder", self.save_folder_label)
         save_layout.addRow(self.choose_save_folder_button)
         save_layout.addRow("Current Output", self.current_output_label)
         save_layout.addRow(self.save_current_button)
+        save_layout.addRow(self.save_multiple_button)
 
         right_layout.addWidget(file_group, stretch=6)
         right_layout.addWidget(csv_group, stretch=2)
@@ -1221,6 +1255,7 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
     def _connect_signals(self) -> None:
         self.choose_folder_button.clicked.connect(self.choose_folder)
         self.choose_save_folder_button.clicked.connect(self.choose_save_folder)
+        self.load_csv_folder_button.clicked.connect(self.choose_csv_folder)
         self.load_csv_button.clicked.connect(self.choose_csv)
         self.csv_auto_combo.currentIndexChanged.connect(self._on_csv_auto_selection_changed)
         self.video_list.currentItemChanged.connect(self._on_video_item_changed)
@@ -1266,8 +1301,10 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         self.mask_margin_spinbox.valueChanged.connect(self._on_mask_margin_changed)
         self.import_mask_button.clicked.connect(self.import_mask_png)
         self.import_mask_folder_button.clicked.connect(self.import_mask_folder)
+        self.occlusion_help_button.clicked.connect(self.show_occlusion_controls_help)
 
         self.save_current_button.clicked.connect(self.save_current_mode_output)
+        self.save_multiple_button.clicked.connect(self.save_multiple_mode_outputs)
         self.export_masks_button.clicked.connect(self.export_masks)
 
         self.frame_viewer.square_points_changed.connect(self._on_square_points_changed)
@@ -1287,11 +1324,22 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         self.frame_viewer.free_draw_finished.connect(self._finalize_mask_draw)
         self.frame_viewer.occ_transform_requested.connect(self.translate_selected_mask)
         self.frame_viewer.occ_scale_requested.connect(self.scale_selected_mask)
+        self.frame_viewer.occ_transform_erase_requested.connect(self.erase_occ_transform_point)
+        self.frame_viewer.occ_transform_erase_segment_requested.connect(self.erase_occ_transform_segment)
         self.frame_viewer.occ_transform_finished.connect(self._refresh_mask_ui)
 
     def _register_shortcuts(self) -> None:
         QShortcut(QKeySequence("Left"), self, activated=lambda: self.step_frame(-1))
         QShortcut(QKeySequence("Right"), self, activated=lambda: self.step_frame(1))
+        QShortcut(QKeySequence("["), self, activated=lambda: self._scale_selected_mask_shortcut(0.96))
+        QShortcut(QKeySequence("]"), self, activated=lambda: self._scale_selected_mask_shortcut(1.04))
+        QShortcut(QKeySequence("Ctrl+["), self, activated=lambda: self._rotate_selected_mask_shortcut(-4.0))
+        QShortcut(QKeySequence("Ctrl+]"), self, activated=lambda: self._rotate_selected_mask_shortcut(4.0))
+        QShortcut(QKeySequence("F1"), self, activated=self._open_context_help)
+
+    def _open_context_help(self) -> None:
+        if self.mode_tabs.currentIndex() == 4:
+            self.show_occlusion_controls_help()
 
     def _ensure_save_folder(self) -> None:
         self.save_folder.mkdir(parents=True, exist_ok=True)
@@ -1345,6 +1393,7 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
             "circle_detection_margin": int(getattr(self, "default_circle_margin", 0)),
             "input_dir": str(self.current_folder) if getattr(self, "current_folder", None) and str(self.current_folder) not in {"", "."} else "",
             "output_dir": str(self.save_folder) if getattr(self, "save_folder", None) else "",
+            "csv_manual_dir": str(self.csv_manual_folder) if getattr(self, "csv_manual_folder", None) else "",
         }
         try:
             SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1352,8 +1401,24 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         except Exception:
             pass
 
+    def _refresh_csv_search_folder_ui(self) -> None:
+        if not hasattr(self, "load_csv_folder_button"):
+            return
+        if self.csv_manual_folder is None:
+            self.load_csv_folder_button.setToolTip(
+                "Select an additional CSV folder for persistent auto-detection. "
+                "Default mapping search uses the selected video's folder."
+            )
+        else:
+            self.load_csv_folder_button.setToolTip(
+                f"Additional CSV auto-detection folder: {self.csv_manual_folder}"
+            )
+
     def _normalized_output_path(self) -> Path | None:
-        return None if self.csv_path is None else self.save_folder / f"{self.csv_path.stem}_normalized.csv"
+        return None if self.csv_path is None else self._normalized_output_path_for(self.csv_path)
+
+    def _normalized_output_path_for(self, csv_path: Path) -> Path:
+        return self.save_folder / f"{csv_path.stem}_normalized.csv"
 
     def _chamber_output_stem(self) -> str | None:
         if self.csv_path is not None:
@@ -1364,7 +1429,10 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
 
     def _chamber_csv_output_path(self) -> Path | None:
         stem = self._chamber_output_stem()
-        return None if stem is None or self.csv_path is None else self.save_folder / f"{stem}_chamber_mark.csv"
+        return None if stem is None or self.csv_path is None else self._chamber_csv_output_path_for(self.csv_path)
+
+    def _chamber_csv_output_path_for(self, csv_path: Path) -> Path:
+        return self.save_folder / f"{csv_path.stem}_chamber_mark.csv"
 
     def _chamber_mask_output_path(self) -> Path | None:
         stem = self._chamber_output_stem()
@@ -1379,13 +1447,259 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         return None if stem is None else self.save_folder / f"{stem}_chamber_mask.json"
 
     def _circle_output_path(self) -> Path | None:
-        return None if self.csv_path is None else self.save_folder / f"{self.csv_path.stem}_detection.csv"
+        return None if self.csv_path is None else self._circle_output_path_for(self.csv_path)
+
+    def _circle_output_path_for(self, csv_path: Path) -> Path:
+        return self.save_folder / f"{csv_path.stem}_detection.csv"
 
     def _occlusion_output_path(self) -> Path | None:
-        return None if self.csv_path is None else self.save_folder / f"{self.csv_path.stem}_occlusion.csv"
+        return None if self.csv_path is None else self._occlusion_output_path_for(self.csv_path)
+
+    def _occlusion_output_path_for(self, csv_path: Path) -> Path:
+        return self.save_folder / f"{csv_path.stem}_occlusion.csv"
 
     def _mask_export_folder(self) -> Path:
         return self.save_folder / "masks"
+
+    @staticmethod
+    def _video_size(video_path: Path) -> tuple[int, int] | None:
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            return None
+        try:
+            width = max(1, int(round(capture.get(cv2.CAP_PROP_FRAME_WIDTH))))
+            height = max(1, int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))))
+        finally:
+            capture.release()
+        return width, height
+
+    def _select_videos_for_batch(self) -> list[Path]:
+        if self.video_list.count() == 0:
+            QMessageBox.information(self, "Batch Save", "No videos in the list. Open a video folder first.")
+            return []
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select Videos For Batch CSV Save")
+        dialog.resize(620, 560)
+        layout = QVBoxLayout(dialog)
+
+        info = QLabel("Select videos using click, Ctrl/Shift-click, or drag.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        warning_label = QLabel(
+            "Warning:\n"
+            "- Only videos with auto-detected CSV candidates are converted.\n"
+            "- The top auto-detected CSV candidate is used for each video.\n"
+            "- The same condition is applied to all selected videos."
+        )
+        warning_label.setWordWrap(True)
+        layout.addWidget(warning_label)
+
+        list_widget = QListWidget()
+        list_widget.setAlternatingRowColors(True)
+        list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        list_widget.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        list_widget.setSelectionRectVisible(True)
+        layout.addWidget(list_widget, stretch=1)
+
+        any_selected = False
+        current_path = self.video_state.path if self.video_state is not None else None
+        for index in range(self.video_list.count()):
+            source_item = self.video_list.item(index)
+            item = QListWidgetItem(source_item.text())
+            item.setData(Qt.ItemDataRole.UserRole, source_item.data(Qt.ItemDataRole.UserRole))
+            list_widget.addItem(item)
+            if source_item.isSelected():
+                item.setSelected(True)
+                any_selected = True
+            elif not any_selected and current_path is not None and source_item.data(Qt.ItemDataRole.UserRole) == str(current_path):
+                item.setSelected(True)
+                any_selected = True
+
+        controls = QHBoxLayout()
+        select_all_button = QPushButton("Select All")
+        clear_button = QPushButton("Clear Selection")
+        cancel_button = QPushButton("Cancel")
+        start_button = QPushButton("Start Batch Save")
+        controls.addWidget(select_all_button)
+        controls.addWidget(clear_button)
+        controls.addStretch(1)
+        controls.addWidget(cancel_button)
+        controls.addWidget(start_button)
+        layout.addLayout(controls)
+
+        select_all_button.clicked.connect(list_widget.selectAll)
+        clear_button.clicked.connect(list_widget.clearSelection)
+        cancel_button.clicked.connect(dialog.reject)
+
+        def _accept_if_selected() -> None:
+            if not list_widget.selectedItems():
+                QMessageBox.information(dialog, "Batch Save", "Select at least one video.")
+                return
+            dialog.accept()
+
+        start_button.clicked.connect(_accept_if_selected)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return []
+        selected_paths: list[Path] = []
+        for item in list_widget.selectedItems():
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if data:
+                selected_paths.append(Path(data))
+        return selected_paths
+
+    def save_multiple_mode_outputs(self) -> None:
+        mode_index = self.mode_tabs.currentIndex()
+        if mode_index not in {0, 1, 2, 4}:
+            QMessageBox.information(self, "Batch Save", "Batch CSV save is not available in Pin tab.")
+            return
+        if self.video_state is None:
+            QMessageBox.warning(self, "Batch Save", "Load a reference video first.")
+            return
+
+        selected_videos = self._select_videos_for_batch()
+        if not selected_videos:
+            return
+
+        source_width = max(1, int(self.video_state.width))
+        source_height = max(1, int(self.video_state.height))
+        source_square_points = [tuple(point) for point in self.frame_viewer.square_points]
+        source_chamber_mask = None if self.chamber_mask is None else self.chamber_mask.copy().astype(np.uint8)
+        source_rooms = [
+            RoomRecord(
+                name=room.name,
+                color=QColor(room.color),
+                mask=room.mask.copy().astype(np.uint8),
+            )
+            for room in self.room_records.values()
+        ]
+        source_circle_geometry = self.frame_viewer.circle_geometry()
+        source_occ_margin_points = [tuple(point) for point in self.frame_viewer.occ_margin_points]
+        source_masks = [
+            MaskRecord(
+                name=record.name,
+                color=QColor(record.color),
+                mask=record.mask.copy().astype(np.uint8),
+                margin=int(record.margin),
+                margin_mode=str(record.margin_mode),
+            )
+            for record in self.mask_records.values()
+        ]
+
+        if mode_index == 0 and len(source_square_points) != 4:
+            QMessageBox.warning(self, "Batch Save", "Square mode needs four points.")
+            return
+        if mode_index == 1:
+            if source_chamber_mask is None or not np.any(source_chamber_mask):
+                QMessageBox.warning(self, "Batch Save", "Chamber mode needs a chamber mask.")
+                return
+            if not source_rooms:
+                QMessageBox.warning(self, "Batch Save", "Chamber mode needs at least one room.")
+                return
+        if mode_index == 2 and source_circle_geometry is None:
+            QMessageBox.warning(self, "Batch Save", "Circle mode needs a circle.")
+            return
+        if mode_index == 4:
+            if not source_masks:
+                QMessageBox.warning(self, "Batch Save", "Occlusion mode needs at least one mask.")
+                return
+            if any(record.margin_mode == "geometric" for record in source_masks) and len(source_occ_margin_points) != 4:
+                QMessageBox.warning(self, "Batch Save", "Geometric margin mode needs four occlusion geometric points.")
+                return
+
+        saved_count = 0
+        skipped_auto_missing: list[Path] = []
+        failed: list[tuple[Path, str]] = []
+        total = len(selected_videos)
+        for index, video_path in enumerate(selected_videos, start=1):
+            self.statusBar().showMessage(f"Batch saving... {index}/{total} ({video_path.name})")
+            QApplication.processEvents()
+            try:
+                csv_candidates = self._matching_csv_candidates(video_path)
+                if not csv_candidates:
+                    skipped_auto_missing.append(video_path)
+                    continue
+                csv_path = csv_candidates[0]
+
+                video_size = self._video_size(video_path)
+                if video_size is None:
+                    raise ValueError("Could not read video size.")
+                width, height = video_size
+                scale_x = width / source_width
+                scale_y = height / source_height
+
+                source_df = pd.read_csv(csv_path)
+                bodyparts = bodyparts_from_dataframe(source_df)
+                if mode_index == 0:
+                    quad_points = [(x * scale_x, y * scale_y) for x, y in source_square_points]
+                    result_df = build_normalized_dataframe(source_df, bodyparts, quad_points, width, height)
+                    output_path = self._normalized_output_path_for(csv_path)
+                elif mode_index == 1:
+                    chamber_mask = cv2.resize(source_chamber_mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST)
+                    scaled_rooms: list[RoomRecord] = []
+                    for room in source_rooms:
+                        resized_mask = cv2.resize(room.mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST)
+                        room_mask = np.logical_and(resized_mask > 0, chamber_mask > 0).astype(np.uint8)
+                        scaled_rooms.append(RoomRecord(name=room.name, color=QColor(room.color), mask=room_mask))
+                    result_df = build_chamber_mark_dataframe(source_df, bodyparts, scaled_rooms, width, height)
+                    output_path = self._chamber_csv_output_path_for(csv_path)
+                elif mode_index == 2:
+                    center, _, adjusted_radius = source_circle_geometry
+                    scaled_center = (center[0] * scale_x, center[1] * scale_y)
+                    scaled_radius = max(1.0, adjusted_radius * ((scale_x + scale_y) / 2.0))
+                    result_df = build_circle_detection_dataframe(source_df, bodyparts, scaled_center, scaled_radius, width, height)
+                    output_path = self._circle_output_path_for(csv_path)
+                else:
+                    scaled_quad_points = [(x * scale_x, y * scale_y) for x, y in source_occ_margin_points]
+                    scaled_masks: list[MaskRecord] = []
+                    for record in source_masks:
+                        resized_mask = cv2.resize(record.mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST)
+                        scaled_masks.append(
+                            MaskRecord(
+                                name=record.name,
+                                color=QColor(record.color),
+                                mask=(resized_mask > 0).astype(np.uint8),
+                                margin=record.margin,
+                                margin_mode=record.margin_mode,
+                            )
+                        )
+                    result_df = build_occlusion_dataframe(source_df, bodyparts, scaled_masks, width, height, scaled_quad_points)
+                    output_path = self._occlusion_output_path_for(csv_path)
+
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                result_df.to_csv(output_path, index=False)
+                saved_count += 1
+            except Exception as exc:
+                failed.append((video_path, str(exc)))
+
+        lines = [
+            f"Saved: {saved_count}",
+            f"Skipped (no auto detection CSV): {len(skipped_auto_missing)}",
+            f"Failed: {len(failed)}",
+        ]
+        if skipped_auto_missing:
+            lines.append("")
+            lines.append("Skipped videos:")
+            lines.extend(f"- {path.name}" for path in skipped_auto_missing[:10])
+            if len(skipped_auto_missing) > 10:
+                lines.append(f"- ... and {len(skipped_auto_missing) - 10} more")
+        if failed:
+            lines.append("")
+            lines.append("Failed videos:")
+            lines.extend(f"- {path.name}: {reason}" for path, reason in failed[:10])
+            if len(failed) > 10:
+                lines.append(f"- ... and {len(failed) - 10} more")
+
+        message = "\n".join(lines)
+        if failed:
+            QMessageBox.warning(self, "Batch Save Completed With Warnings", message)
+        else:
+            QMessageBox.information(self, "Batch Save Completed", message)
+        self.statusBar().showMessage(
+            f"Batch save finished: saved={saved_count}, skipped={len(skipped_auto_missing)}, failed={len(failed)}"
+        )
 
     def _show_normalized_preview(self, preview_df: pd.DataFrame, normalized: bool) -> None:
         frame_width = self.video_state.width if self.video_state is not None else None
@@ -1395,23 +1709,28 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
 
     def _refresh_output_ui(self) -> None:
         current_index = self.mode_tabs.currentIndex() if hasattr(self, "mode_tabs") else 0
+        batch_text = "Save Multiple CSVs"
         if current_index == 0:
             output = self._normalized_output_path()
             self.save_current_button.setText("Save Normalized CSV")
             self.save_current_button.setEnabled(output is not None and len(self.frame_viewer.square_points) == 4)
+            batch_text = "Save Multiple Normalized CSVs"
         elif current_index == 1:
             output = self._chamber_csv_output_path()
             chamber_ready = self.chamber_mask is not None and bool(np.any(self.chamber_mask)) and bool(self.room_records)
             self.save_current_button.setText("Save Chamber Outputs")
             self.save_current_button.setEnabled(output is not None and chamber_ready and self.csv_df is not None and bool(self.bodyparts))
+            batch_text = "Save Multiple Chamber CSVs"
         elif current_index == 2:
             output = self._circle_output_path()
             self.save_current_button.setText("Save Detection CSV")
             self.save_current_button.setEnabled(output is not None and self.frame_viewer.circle_geometry() is not None and bool(self.bodyparts))
+            batch_text = "Save Multiple Detection CSVs"
         elif current_index == 3:
             output = None
             self.save_current_button.setText("Pin Mode Does Not Save")
             self.save_current_button.setEnabled(False)
+            batch_text = "Batch CSV Save Not Available In Pin"
         else:
             output = self._occlusion_output_path()
             geometric_ready = all(
@@ -1420,7 +1739,16 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
             )
             self.save_current_button.setText("Save Occlusion CSV")
             self.save_current_button.setEnabled(output is not None and bool(self.mask_records) and self.csv_df is not None and geometric_ready)
+            batch_text = "Save Multiple Occlusion CSVs"
+        batch_enabled = self.save_current_button.isEnabled()
         self.current_output_label.setText(str(output) if output is not None else "-")
+        if hasattr(self, "save_multiple_button"):
+            self.save_multiple_button.setText(batch_text)
+            self.save_multiple_button.setEnabled(batch_enabled)
+            if current_index == 3:
+                self.save_multiple_button.setToolTip("Batch CSV save is not available in Pin tab.")
+            else:
+                self.save_multiple_button.setToolTip("Apply current mode settings to multiple selected videos at once.")
         if hasattr(self, "export_masks_button"):
             self.export_masks_button.setEnabled(bool(self.mask_records))
 
@@ -1476,15 +1804,24 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         return (4, stem.lower(), stem)
 
     def _matching_csv_candidates(self, video_path: Path) -> list[Path]:
-        search_dir = video_path.parent
         video_name = video_path.stem
+        search_dirs: list[Path] = [video_path.parent]
+        if self.csv_manual_folder is not None and self.csv_manual_folder.exists():
+            if self.csv_manual_folder != video_path.parent:
+                search_dirs.append(self.csv_manual_folder)
         candidates: list[Path] = []
-        for path in search_dir.glob("*.csv"):
-            stem = path.stem
-            for prefix, _ in self._csv_candidate_patterns(video_name):
-                if stem == prefix or stem.startswith(f"{prefix}_"):
-                    candidates.append(path)
-                    break
+        seen_paths: set[str] = set()
+        for search_dir in search_dirs:
+            for path in search_dir.glob("*.csv"):
+                unique_key = str(path.resolve())
+                if unique_key in seen_paths:
+                    continue
+                stem = path.stem
+                for prefix, _ in self._csv_candidate_patterns(video_name):
+                    if stem == prefix or stem.startswith(f"{prefix}_"):
+                        candidates.append(path)
+                        seen_paths.add(unique_key)
+                        break
         return sorted(candidates, key=lambda path: self._csv_candidate_sort_key(path, video_name))
 
     def _set_csv_auto_candidates(self, candidates: list[Path], selected_path: Path | None = None, allow_default: bool = True) -> None:
@@ -1581,10 +1918,24 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
             self._refresh_circle_ui()
 
     def choose_csv(self) -> None:
-        start_dir = self.current_folder if self.current_folder.exists() else Path.cwd()
+        start_dir = self.video_state.path.parent if self.video_state is not None else (self.current_folder if self.current_folder.exists() else Path.cwd())
         csv_file, _ = QFileDialog.getOpenFileName(self, "Select CSV file", str(start_dir), "CSV Files (*.csv)")
         if csv_file:
             self.load_csv(Path(csv_file), auto_matched=False)
+
+    def choose_csv_folder(self) -> None:
+        start_dir = self.csv_manual_folder if self.csv_manual_folder is not None and self.csv_manual_folder.exists() else (
+            self.video_state.path.parent if self.video_state is not None else (self.current_folder if self.current_folder.exists() else Path.cwd())
+        )
+        folder = QFileDialog.getExistingDirectory(self, "Select CSV Auto-Detection Folder", str(start_dir))
+        if not folder:
+            return
+        self.csv_manual_folder = Path(folder)
+        self._refresh_csv_search_folder_ui()
+        self._save_settings()
+        if self.video_state is not None:
+            self._load_matching_csv(self.video_state.path)
+        self.statusBar().showMessage(f"CSV auto-detection folder set: {self.csv_manual_folder}")
 
     def load_csv(self, csv_path: Path, auto_matched: bool) -> None:
         try:
@@ -1666,25 +2017,10 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
             pin.x *= scale_x
             pin.y *= scale_y
 
-        if self.chamber_mask is not None:
-            self.chamber_mask = cv2.resize(self.chamber_mask.astype(np.uint8), (new_width, new_height), interpolation=cv2.INTER_NEAREST)
-        resized_rooms: dict[str, RoomRecord] = {}
-        for name, record in self.room_records.items():
-            resized_mask = cv2.resize(record.mask.astype(np.uint8), (new_width, new_height), interpolation=cv2.INTER_NEAREST)
-            resized_rooms[name] = RoomRecord(name=record.name, color=record.color, mask=resized_mask)
-        self.room_records = resized_rooms
-
-        resized_masks: dict[str, MaskRecord] = {}
-        for name, record in self.mask_records.items():
-            resized_mask = cv2.resize(record.mask.astype(np.uint8), (new_width, new_height), interpolation=cv2.INTER_NEAREST)
-            resized_masks[name] = MaskRecord(
-                name=record.name,
-                color=record.color,
-                mask=resized_mask,
-                margin=record.margin,
-                margin_mode=record.margin_mode,
-            )
-        self.mask_records = resized_masks
+        # Different video resolutions can invalidate mask arrays, so clear masks instead of resizing.
+        self.reset_chamber()
+        self.reset_masks()
+        self.frame_viewer.clear_occ_margin_points()
         self.frame_viewer.set_chamber_records(self.chamber_mask, self.room_records, self.selected_room_name, refresh=True)
         self.frame_viewer.set_pin_records(self.pins)
         self.frame_viewer.set_mask_records(self.mask_records, self.selected_mask_name, refresh=True)
@@ -1766,6 +2102,47 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
             current.mask = cv2.morphologyEx(new_mask, cv2.MORPH_CLOSE, kernel)
             self.frame_viewer.set_mask_records(self.mask_records, self.selected_mask_name, refresh=True)
+
+    def rotate_selected_mask(self, angle_degrees: float) -> None:
+        current = self._selected_mask()
+        if current is None or abs(angle_degrees) < 1e-6:
+            return
+        ys, xs = np.where(current.mask > 0)
+        if len(xs) == 0 or len(ys) == 0:
+            return
+        center_x = float(xs.mean())
+        center_y = float(ys.mean())
+        matrix = cv2.getRotationMatrix2D((center_x, center_y), angle_degrees, 1.0)
+        new_mask = cv2.warpAffine(
+            current.mask.astype(np.uint8),
+            matrix,
+            (current.mask.shape[1], current.mask.shape[0]),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        if new_mask.any():
+            current.mask = new_mask.astype(np.uint8)
+            self.frame_viewer.set_mask_records(self.mask_records, self.selected_mask_name, refresh=True)
+
+    def _mask_transform_shortcuts_enabled(self) -> bool:
+        return (
+            self.mode_tabs.currentIndex() == 4
+            and self.mask_transform_radio.isChecked()
+            and self._selected_mask() is not None
+        )
+
+    def _scale_selected_mask_shortcut(self, scale_factor: float) -> None:
+        if not self._mask_transform_shortcuts_enabled():
+            return
+        self.scale_selected_mask(scale_factor)
+        self._refresh_mask_ui()
+
+    def _rotate_selected_mask_shortcut(self, angle_degrees: float) -> None:
+        if not self._mask_transform_shortcuts_enabled():
+            return
+        self.rotate_selected_mask(angle_degrees)
+        self._refresh_mask_ui()
 
     def save_current_mode_output(self) -> None:
         index = self.mode_tabs.currentIndex()
