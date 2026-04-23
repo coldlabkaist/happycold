@@ -198,8 +198,20 @@ class OcclusionTabMixin:
             "- Ctrl + left click / drag: erase with current brush size\n"
             "- [: scale down\n"
             "- ]: scale up\n"
+            "- A: scale down\n"
+            "- D: scale up (in Transform mode)\n"
             "- Ctrl + [: rotate -4 degrees\n"
             "- Ctrl + ]: rotate +4 degrees\n\n"
+            "- Ctrl + A: rotate -4 degrees\n"
+            "- Ctrl + D: rotate +4 degrees\n\n"
+            "Mode and selection:\n"
+            "- Press D: switch to Draw mode\n"
+            "- Press T: switch to Transform mode\n"
+            "- Press 1..0: select mask #1..#10 in the list\n"
+            "- Double-click near a mask object: select that mask\n"
+            "- Mask move is clamped to frame bounds (cannot move outside)\n\n"
+            "Draw mode:\n"
+            "- Hold Ctrl while drawing to erase (Rectangle, Circle, Free Drawing)\n\n"
             "Viewer:\n"
             "- Mouse wheel: zoom viewer\n"
             "- Right drag: pan viewer\n\n"
@@ -507,22 +519,41 @@ class OcclusionTabMixin:
         paint_brush(current.mask, start, end, brush_radius, 0)
         self.frame_viewer.refresh_mask_record(current.name, include_margin=False)
 
-    def apply_occ_rect_mask(self, points: list[tuple[float, float]]) -> None:
+    def apply_occ_rect_mask(self, payload: object) -> None:
         current = self._selected_mask()
         if current is None or self.mask_transform_radio.isChecked():
             return
-        fill_polygon(current.mask, order_quad_points(points).tolist(), 1 if self.mask_add_radio.isChecked() else 0)
+        add = self.mask_add_radio.isChecked()
+        points: list[tuple[float, float]]
+        if (
+            isinstance(payload, tuple)
+            and len(payload) == 2
+            and isinstance(payload[0], list)
+            and isinstance(payload[1], bool)
+        ):
+            points = payload[0]
+            add = payload[1]
+        elif isinstance(payload, list):
+            points = payload
+        else:
+            return
+        fill_polygon(current.mask, order_quad_points(points).tolist(), 1 if add else 0)
         self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
         self._refresh_mask_ui()
 
-    def apply_occ_circle_mask(self, payload: tuple[tuple[float, float], float, tuple[float, float], tuple[float, float]]) -> None:
+    def apply_occ_circle_mask(self, payload: object) -> None:
         current = self._selected_mask()
         if current is None or self.mask_transform_radio.isChecked():
             return
-        _, _, start, end = payload
+        if not isinstance(payload, tuple) or len(payload) < 4:
+            return
+        _, _, start, end = payload[:4]
+        add = self.mask_add_radio.isChecked()
+        if len(payload) >= 5 and isinstance(payload[4], bool):
+            add = payload[4]
         if start is None or end is None:
             return
-        fill_circle_from_diameter(current.mask, start, end, 1 if self.mask_add_radio.isChecked() else 0)
+        fill_circle_from_diameter(current.mask, start, end, 1 if add else 0)
         self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
         self.frame_viewer.clear_occ_circle()
         self._refresh_mask_ui()

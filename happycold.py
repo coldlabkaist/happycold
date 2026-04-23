@@ -15,7 +15,7 @@ import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from PyQt6.QtCore import QPoint, QPointF, QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QImage, QKeySequence, QMouseEvent, QPainter, QPen, QPixmap, QPolygonF, QShortcut
+from PyQt6.QtGui import QColor, QIcon, QImage, QKeySequence, QMouseEvent, QPainter, QPen, QPixmap, QPolygonF, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -47,6 +47,7 @@ from PyQt6.QtWidgets import (
 
 APP_NAME = "happycold"
 DEFAULT_SAVE_DIR = Path.cwd() / "output"
+APP_ICON_PATH = Path(__file__).resolve().parent / "CoLD_icon.png"
 
 
 def get_settings_path() -> Path:
@@ -253,6 +254,7 @@ class FrameViewer(QWidget):
     occ_transform_erase_requested = pyqtSignal(object)
     occ_transform_erase_segment_requested = pyqtSignal(object)
     occ_transform_finished = pyqtSignal()
+    occ_mask_double_clicked = pyqtSignal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -294,6 +296,8 @@ class FrameViewer(QWidget):
         self._occ_margin_drag_index: int | None = None
         self._free_dragging = False
         self._free_last_point: tuple[float, float] | None = None
+        self._occ_rect_draw_override_add: bool | None = None
+        self._occ_circle_draw_override_add: bool | None = None
         self.occ_transform_mode = False
         self._occ_transform_dragging = False
         self._occ_transform_last_point: tuple[float, float] | None = None
@@ -511,6 +515,7 @@ class FrameViewer(QWidget):
 
     def clear_occ_rect_points(self) -> None:
         self.occ_rect_points.clear()
+        self._occ_rect_draw_override_add = None
         self.update()
         self.occ_rect_points_changed.emit()
 
@@ -525,6 +530,7 @@ class FrameViewer(QWidget):
         self.occ_circle_end = None
         self._occ_circle_current = None
         self._occ_circle_dragging = False
+        self._occ_circle_draw_override_add = None
         self.update()
         self.occ_circle_changed.emit()
 
@@ -603,6 +609,66 @@ class FrameViewer(QWidget):
                 best_distance = distance
                 best_index = index
         return best_index
+
+    @staticmethod
+    def _mask_hit_distance(mask: np.ndarray, point: tuple[float, float], margin: int) -> float | None:
+        if mask.ndim != 2 or not np.any(mask):
+            return None
+        height, width = mask.shape
+        x = int(round(point[0]))
+        y = int(round(point[1]))
+        if not (0 <= x < width and 0 <= y < height):
+            return None
+        if mask[y, x] > 0:
+            return 0.0
+        radius = max(0, int(margin))
+        if radius == 0:
+            return None
+        x0 = max(0, x - radius)
+        x1 = min(width, x + radius + 1)
+        y0 = max(0, y - radius)
+        y1 = min(height, y + radius + 1)
+        roi = mask[y0:y1, x0:x1]
+        ys, xs = np.where(roi > 0)
+        if len(xs) == 0:
+            return None
+        dx = (xs + x0).astype(np.float32) - float(x)
+        dy = (ys + y0).astype(np.float32) - float(y)
+        min_distance_sq = float(np.min(dx * dx + dy * dy))
+        if min_distance_sq <= float(radius * radius):
+            return math.sqrt(min_distance_sq)
+        return None
+
+    def _mask_name_at_point(self, point: tuple[float, float], margin: int = 8) -> str | None:
+        if not self.mask_records:
+            return None
+        best_name: str | None = None
+        best_distance = float("inf")
+        ordered_names = list(self.mask_records.keys())
+        if self.selected_mask_name in self.mask_records:
+            ordered_names = [self.selected_mask_name] + [name for name in ordered_names if name != self.selected_mask_name]
+        for name in ordered_names:
+            record = self.mask_records.get(name)
+            if record is None:
+                continue
+            distance = self._mask_hit_distance(record.mask.astype(np.uint8), point, margin)
+            if distance is None:
+                continue
+            if distance < best_distance:
+                best_distance = distance
+                best_name = name
+                if distance <= 0.0:
+                    break
+        return best_name
+
+    @staticmethod
+    def _control_pressed(modifiers: Qt.KeyboardModifiers) -> bool:
+        return bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+
+    def _effective_draw_add_with_modifiers(self, modifiers: Qt.KeyboardModifiers) -> bool:
+        if self._control_pressed(modifiers):
+            return False
+        return self.free_draw_add
 
     def wheelEvent(self, event) -> None:
         if not self.has_frame():
@@ -709,12 +775,18 @@ class FrameViewer(QWidget):
             self.update()
             self.circle_changed.emit()
         elif self.mode == "occ_rect":
+            if len(self.occ_rect_points) == 0:
+                self._occ_rect_draw_override_add = False if self._control_pressed(event.modifiers()) else None
+            elif self._occ_rect_draw_override_add is None and self._control_pressed(event.modifiers()):
+                self._occ_rect_draw_override_add = False
             self.occ_rect_points.append(image_point)
             self.update()
             self.occ_rect_points_changed.emit()
             if len(self.occ_rect_points) == 4:
-                self.occ_rect_completed.emit(list(self.occ_rect_points))
+                add_value = self.free_draw_add if self._occ_rect_draw_override_add is None else self._occ_rect_draw_override_add
+                self.occ_rect_completed.emit((list(self.occ_rect_points), bool(add_value)))
                 self.occ_rect_points.clear()
+                self._occ_rect_draw_override_add = None
                 self.update()
                 self.occ_rect_points_changed.emit()
         elif self.mode == "occ_circle":
@@ -722,12 +794,13 @@ class FrameViewer(QWidget):
             self.occ_circle_start = image_point
             self.occ_circle_end = None
             self._occ_circle_current = image_point
+            self._occ_circle_draw_override_add = False if self._control_pressed(event.modifiers()) else None
             self.update()
             self.occ_circle_changed.emit()
         elif self.mode == "occ_free":
             self._free_dragging = True
             self._free_last_point = image_point
-            self.free_draw_segment.emit((image_point, image_point, self.free_draw_add))
+            self.free_draw_segment.emit((image_point, image_point, self._effective_draw_add_with_modifiers(event.modifiers())))
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self._circle_move_dragging and not (event.buttons() & Qt.MouseButton.LeftButton):
@@ -785,7 +858,7 @@ class FrameViewer(QWidget):
             self.update()
             self.occ_circle_changed.emit()
         elif self.mode == "occ_free" and self._free_dragging and self._free_last_point is not None:
-            self.free_draw_segment.emit((self._free_last_point, image_point, self.free_draw_add))
+            self.free_draw_segment.emit((self._free_last_point, image_point, self._effective_draw_add_with_modifiers(event.modifiers())))
             self._free_last_point = image_point
         elif self.mode == "square" and self._square_drag_index is not None:
             self.square_points[self._square_drag_index] = image_point
@@ -839,7 +912,9 @@ class FrameViewer(QWidget):
             self.occ_circle_changed.emit()
             if geometry is not None:
                 center, base_radius, _ = geometry
-                self.occ_circle_completed.emit((center, base_radius, self.occ_circle_start, self.occ_circle_end))
+                add_value = self.free_draw_add if self._occ_circle_draw_override_add is None else self._occ_circle_draw_override_add
+                self.occ_circle_completed.emit((center, base_radius, self.occ_circle_start, self.occ_circle_end, bool(add_value)))
+            self._occ_circle_draw_override_add = None
         elif self.mode == "occ_free" and event.button() == Qt.MouseButton.LeftButton:
             self._free_dragging = False
             self._free_last_point = None
@@ -867,13 +942,45 @@ class FrameViewer(QWidget):
         self._occ_margin_drag_index = None
         self._free_dragging = False
         self._free_last_point = None
+        self._occ_rect_draw_override_add = None
         self._occ_circle_dragging = False
         self._occ_circle_current = None
+        self._occ_circle_draw_override_add = None
         self._occ_transform_dragging = False
         self._occ_transform_last_point = None
         self._occ_transform_erase_dragging = False
         self._occ_transform_erase_last_point = None
         super().leaveEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self.has_frame()
+            and self.mode.startswith("occ_")
+            and not self.occ_margin_pick_mode
+        ):
+            image_point = self._widget_to_image(event.position())
+            if image_point is not None:
+                name = self._mask_name_at_point(image_point, margin=8)
+                if name is not None:
+                    self._square_drag_index = None
+                    self._occ_margin_drag_index = None
+                    self._occ_transform_dragging = False
+                    self._occ_transform_last_point = None
+                    self._occ_transform_erase_dragging = False
+                    self._occ_transform_erase_last_point = None
+                    self._free_dragging = False
+                    self._free_last_point = None
+                    self._occ_rect_draw_override_add = None
+                    self._occ_circle_draw_override_add = None
+                    if self.occ_rect_points:
+                        self.occ_rect_points.clear()
+                        self._occ_rect_draw_override_add = None
+                        self.occ_rect_points_changed.emit()
+                    self.occ_mask_double_clicked.emit(name)
+                    event.accept()
+                    return
+        super().mouseDoubleClickEvent(event)
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
@@ -1065,6 +1172,8 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
+        if APP_ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.resize(1820, 1000)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
@@ -1086,6 +1195,7 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
             if candidate.exists():
                 self.csv_manual_folder = candidate
         self._last_mask_preview_refresh = 0.0
+        self._trajectory_preview_windows: list[TrajectoryPreviewDialog] = []
 
         self.pins: list[PinRecord] = []
         self.pin_counter = 0
@@ -1211,7 +1321,7 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         self.circle_tab = self._build_circle_tab()
         self.pin_tab = self._build_pin_tab()
         self.occlusion_tab = self._build_occlusion_tab()
-        self.mode_tabs.addTab(self.square_tab, "Square Normalize")
+        self.mode_tabs.addTab(self.square_tab, "Square Norm/Trajectory")
         self.mode_tabs.addTab(self.chamber_tab, "Chamber Mark")
         self.mode_tabs.addTab(self.circle_tab, "Circle Detection")
         self.mode_tabs.addTab(self.pin_tab, "Pin Coordinates")
@@ -1327,15 +1437,71 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         self.frame_viewer.occ_transform_erase_requested.connect(self.erase_occ_transform_point)
         self.frame_viewer.occ_transform_erase_segment_requested.connect(self.erase_occ_transform_segment)
         self.frame_viewer.occ_transform_finished.connect(self._refresh_mask_ui)
+        self.frame_viewer.occ_mask_double_clicked.connect(self._on_occ_mask_double_clicked)
 
     def _register_shortcuts(self) -> None:
         QShortcut(QKeySequence("Left"), self, activated=lambda: self.step_frame(-1))
         QShortcut(QKeySequence("Right"), self, activated=lambda: self.step_frame(1))
+        QShortcut(QKeySequence("A"), self, activated=self._handle_a_shortcut)
+        QShortcut(QKeySequence("D"), self, activated=self._handle_d_shortcut)
+        QShortcut(QKeySequence("T"), self, activated=lambda: self._switch_occlusion_mode_shortcut(transform_mode=True))
+        QShortcut(QKeySequence("Ctrl+A"), self, activated=self._handle_ctrl_a_shortcut)
+        QShortcut(QKeySequence("Ctrl+D"), self, activated=self._handle_ctrl_d_shortcut)
         QShortcut(QKeySequence("["), self, activated=lambda: self._scale_selected_mask_shortcut(0.96))
         QShortcut(QKeySequence("]"), self, activated=lambda: self._scale_selected_mask_shortcut(1.04))
         QShortcut(QKeySequence("Ctrl+["), self, activated=lambda: self._rotate_selected_mask_shortcut(-4.0))
         QShortcut(QKeySequence("Ctrl+]"), self, activated=lambda: self._rotate_selected_mask_shortcut(4.0))
         QShortcut(QKeySequence("F1"), self, activated=self._open_context_help)
+        QShortcut(QKeySequence("1"), self, activated=lambda: self._select_mask_by_slot(0))
+        QShortcut(QKeySequence("2"), self, activated=lambda: self._select_mask_by_slot(1))
+        QShortcut(QKeySequence("3"), self, activated=lambda: self._select_mask_by_slot(2))
+        QShortcut(QKeySequence("4"), self, activated=lambda: self._select_mask_by_slot(3))
+        QShortcut(QKeySequence("5"), self, activated=lambda: self._select_mask_by_slot(4))
+        QShortcut(QKeySequence("6"), self, activated=lambda: self._select_mask_by_slot(5))
+        QShortcut(QKeySequence("7"), self, activated=lambda: self._select_mask_by_slot(6))
+        QShortcut(QKeySequence("8"), self, activated=lambda: self._select_mask_by_slot(7))
+        QShortcut(QKeySequence("9"), self, activated=lambda: self._select_mask_by_slot(8))
+        QShortcut(QKeySequence("0"), self, activated=lambda: self._select_mask_by_slot(9))
+
+    def _switch_occlusion_mode_shortcut(self, transform_mode: bool) -> None:
+        if self.mode_tabs.currentIndex() != 4:
+            return
+        if transform_mode:
+            self.mask_transform_radio.setChecked(True)
+        else:
+            self.mask_draw_radio.setChecked(True)
+
+    def _handle_a_shortcut(self) -> None:
+        if self._mask_transform_shortcuts_enabled():
+            self._scale_selected_mask_shortcut(0.96)
+
+    def _handle_d_shortcut(self) -> None:
+        if self._mask_transform_shortcuts_enabled():
+            self._scale_selected_mask_shortcut(1.04)
+            return
+        self._switch_occlusion_mode_shortcut(transform_mode=False)
+
+    def _handle_ctrl_a_shortcut(self) -> None:
+        if self._mask_transform_shortcuts_enabled():
+            self._rotate_selected_mask_shortcut(-4.0)
+
+    def _handle_ctrl_d_shortcut(self) -> None:
+        if self._mask_transform_shortcuts_enabled():
+            self._rotate_selected_mask_shortcut(4.0)
+
+    def _select_mask_by_slot(self, slot_index: int) -> None:
+        if self.mode_tabs.currentIndex() != 4:
+            return
+        if slot_index < 0 or slot_index >= min(10, self.mask_combo.count()):
+            return
+        self.mask_combo.setCurrentIndex(slot_index)
+
+    def _on_occ_mask_double_clicked(self, name: str) -> None:
+        if not name:
+            return
+        index = self.mask_combo.findData(name)
+        if index >= 0:
+            self.mask_combo.setCurrentIndex(index)
 
     def _open_context_help(self) -> None:
         if self.mode_tabs.currentIndex() == 4:
@@ -1705,7 +1871,19 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         frame_width = self.video_state.width if self.video_state is not None else None
         frame_height = self.video_state.height if self.video_state is not None else None
         video_name = self.video_state.path.stem if self.video_state is not None else None
-        TrajectoryPreviewDialog(preview_df, self.bodyparts, normalized, frame_width, frame_height, video_name, self).exec()
+        preview_dialog = TrajectoryPreviewDialog(preview_df, self.bodyparts, normalized, frame_width, frame_height, video_name, self)
+        preview_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        preview_dialog.finished.connect(lambda _result, dialog=preview_dialog: self._on_trajectory_preview_closed(dialog))
+        self._trajectory_preview_windows.append(preview_dialog)
+        preview_dialog.show()
+        preview_dialog.raise_()
+        preview_dialog.activateWindow()
+
+    def _on_trajectory_preview_closed(self, dialog: QDialog) -> None:
+        try:
+            self._trajectory_preview_windows.remove(dialog)  # keep refs only for open windows
+        except ValueError:
+            pass
 
     def _refresh_output_ui(self) -> None:
         current_index = self.mode_tabs.currentIndex() if hasattr(self, "mode_tabs") else 0
@@ -1974,6 +2152,8 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         self._refresh_chamber_ui()
         self._refresh_pin_ui()
         self._update_frame_label(frame_number)
+        if hasattr(self, "_refresh_square_current_buttons"):
+            self._refresh_square_current_buttons()
 
     def _on_slider_changed(self, value: int) -> None:
         if not self._loading_slider:
@@ -2037,6 +2217,8 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         if index == 0:
             self.frame_viewer.set_mode("square")
             self.frame_viewer.set_margin_value(0.0)
+            if hasattr(self, "square_preview_button") and self.square_preview_button.isEnabled():
+                self.square_preview_button.setFocus()
         elif index == 1:
             self._sync_chamber_mode()
         elif index == 2:
@@ -2053,11 +2235,34 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
     def _refresh_mask_draft_ui(self) -> None:
         self._refresh_output_ui()
 
+    @staticmethod
+    def _clamp_mask_shift(mask: np.ndarray, dx: int, dy: int) -> tuple[int, int]:
+        if mask.ndim != 2:
+            return 0, 0
+        ys, xs = np.where(mask > 0)
+        if len(xs) == 0 or len(ys) == 0:
+            return 0, 0
+        height, width = mask.shape
+        min_x = int(xs.min())
+        max_x = int(xs.max())
+        min_y = int(ys.min())
+        max_y = int(ys.max())
+        min_dx = -min_x
+        max_dx = (width - 1) - max_x
+        min_dy = -min_y
+        max_dy = (height - 1) - max_y
+        clamped_dx = int(max(min_dx, min(max_dx, int(dx))))
+        clamped_dy = int(max(min_dy, min(max_dy, int(dy))))
+        return clamped_dx, clamped_dy
+
     def translate_selected_mask(self, shift: tuple[int, int]) -> None:
         current = self._selected_mask()
         if current is None:
             return
         dx, dy = shift
+        if dx == 0 and dy == 0:
+            return
+        dx, dy = self._clamp_mask_shift(current.mask.astype(np.uint8), dx, dy)
         if dx == 0 and dy == 0:
             return
         translated = np.zeros_like(current.mask)
@@ -2163,6 +2368,8 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
 
 def main() -> int:
     app = QApplication(sys.argv)
+    if APP_ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     app.setStyle("Fusion")
     window = MainWindow()
     window.show()
