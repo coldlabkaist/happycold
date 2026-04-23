@@ -1195,6 +1195,7 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
             if candidate.exists():
                 self.csv_manual_folder = candidate
         self._last_mask_preview_refresh = 0.0
+        self._last_transform_preview_refresh = 0.0
         self._trajectory_preview_windows: list[TrajectoryPreviewDialog] = []
 
         self.pins: list[PinRecord] = []
@@ -1436,17 +1437,18 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         self.frame_viewer.occ_scale_requested.connect(self.scale_selected_mask)
         self.frame_viewer.occ_transform_erase_requested.connect(self.erase_occ_transform_point)
         self.frame_viewer.occ_transform_erase_segment_requested.connect(self.erase_occ_transform_segment)
-        self.frame_viewer.occ_transform_finished.connect(self._refresh_mask_ui)
+        self.frame_viewer.occ_transform_finished.connect(self._finalize_occ_transform)
         self.frame_viewer.occ_mask_double_clicked.connect(self._on_occ_mask_double_clicked)
 
     def _register_shortcuts(self) -> None:
         QShortcut(QKeySequence("Left"), self, activated=lambda: self.step_frame(-1))
         QShortcut(QKeySequence("Right"), self, activated=lambda: self.step_frame(1))
-        QShortcut(QKeySequence("A"), self, activated=self._handle_a_shortcut)
-        QShortcut(QKeySequence("D"), self, activated=self._handle_d_shortcut)
+        QShortcut(QKeySequence("D"), self, activated=lambda: self._switch_occlusion_mode_shortcut(transform_mode=False))
         QShortcut(QKeySequence("T"), self, activated=lambda: self._switch_occlusion_mode_shortcut(transform_mode=True))
-        QShortcut(QKeySequence("Ctrl+A"), self, activated=self._handle_ctrl_a_shortcut)
-        QShortcut(QKeySequence("Ctrl+D"), self, activated=self._handle_ctrl_d_shortcut)
+        QShortcut(QKeySequence("E"), self, activated=self._handle_e_shortcut)
+        QShortcut(QKeySequence("R"), self, activated=self._handle_r_shortcut)
+        QShortcut(QKeySequence("Ctrl+E"), self, activated=self._handle_ctrl_e_shortcut)
+        QShortcut(QKeySequence("Ctrl+R"), self, activated=self._handle_ctrl_r_shortcut)
         QShortcut(QKeySequence("["), self, activated=lambda: self._scale_selected_mask_shortcut(0.96))
         QShortcut(QKeySequence("]"), self, activated=lambda: self._scale_selected_mask_shortcut(1.04))
         QShortcut(QKeySequence("Ctrl+["), self, activated=lambda: self._rotate_selected_mask_shortcut(-4.0))
@@ -1471,21 +1473,19 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         else:
             self.mask_draw_radio.setChecked(True)
 
-    def _handle_a_shortcut(self) -> None:
+    def _handle_e_shortcut(self) -> None:
         if self._mask_transform_shortcuts_enabled():
             self._scale_selected_mask_shortcut(0.96)
 
-    def _handle_d_shortcut(self) -> None:
+    def _handle_r_shortcut(self) -> None:
         if self._mask_transform_shortcuts_enabled():
             self._scale_selected_mask_shortcut(1.04)
-            return
-        self._switch_occlusion_mode_shortcut(transform_mode=False)
 
-    def _handle_ctrl_a_shortcut(self) -> None:
+    def _handle_ctrl_e_shortcut(self) -> None:
         if self._mask_transform_shortcuts_enabled():
             self._rotate_selected_mask_shortcut(-4.0)
 
-    def _handle_ctrl_d_shortcut(self) -> None:
+    def _handle_ctrl_r_shortcut(self) -> None:
         if self._mask_transform_shortcuts_enabled():
             self._rotate_selected_mask_shortcut(4.0)
 
@@ -2277,7 +2277,11 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         if src_x1 > src_x0 and src_y1 > src_y0:
             translated[dst_y0:dst_y1, dst_x0:dst_x1] = current.mask[src_y0:src_y1, src_x0:src_x1]
             current.mask = translated
-            self.frame_viewer.set_mask_records(self.mask_records, self.selected_mask_name, refresh=True)
+            # During dragging, refresh only the active mask fill at a capped rate.
+            now = time.monotonic()
+            if now - getattr(self, "_last_transform_preview_refresh", 0.0) >= 0.02:
+                self._last_transform_preview_refresh = now
+                self.frame_viewer.refresh_mask_record(current.name, include_margin=False)
 
     def scale_selected_mask(self, scale_factor: float) -> None:
         current = self._selected_mask()
@@ -2306,7 +2310,7 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         if new_mask.any():
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
             current.mask = cv2.morphologyEx(new_mask, cv2.MORPH_CLOSE, kernel)
-            self.frame_viewer.set_mask_records(self.mask_records, self.selected_mask_name, refresh=True)
+            self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
 
     def rotate_selected_mask(self, angle_degrees: float) -> None:
         current = self._selected_mask()
@@ -2328,7 +2332,7 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         )
         if new_mask.any():
             current.mask = new_mask.astype(np.uint8)
-            self.frame_viewer.set_mask_records(self.mask_records, self.selected_mask_name, refresh=True)
+            self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
 
     def _mask_transform_shortcuts_enabled(self) -> bool:
         return (

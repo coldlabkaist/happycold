@@ -198,12 +198,12 @@ class OcclusionTabMixin:
             "- Ctrl + left click / drag: erase with current brush size\n"
             "- [: scale down\n"
             "- ]: scale up\n"
-            "- A: scale down\n"
-            "- D: scale up (in Transform mode)\n"
+            "- E: scale down\n"
+            "- R: scale up\n"
             "- Ctrl + [: rotate -4 degrees\n"
             "- Ctrl + ]: rotate +4 degrees\n\n"
-            "- Ctrl + A: rotate -4 degrees\n"
-            "- Ctrl + D: rotate +4 degrees\n\n"
+            "- Ctrl + E: rotate -4 degrees\n"
+            "- Ctrl + R: rotate +4 degrees\n\n"
             "Mode and selection:\n"
             "- Press D: switch to Draw mode\n"
             "- Press T: switch to Transform mode\n"
@@ -501,14 +501,21 @@ class OcclusionTabMixin:
             self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
         self._refresh_mask_ui()
 
+    def _finalize_occ_transform(self) -> None:
+        current = self._selected_mask()
+        if current is not None:
+            # Rebuild margin only once after drag/erase transform interaction ends.
+            self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
+        self._last_transform_preview_refresh = 0.0
+        self._refresh_mask_ui()
+
     def erase_occ_transform_point(self, point: tuple[float, float]) -> None:
         current = self._selected_mask()
         if current is None or not self.mask_transform_radio.isChecked():
             return
         brush_radius = max(1, int(self.mask_brush_slider.value()))
         paint_brush(current.mask, point, point, brush_radius, 0)
-        self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
-        self._refresh_mask_ui()
+        self.frame_viewer.refresh_mask_record(current.name, include_margin=False)
 
     def erase_occ_transform_segment(self, payload: tuple[tuple[float, float], tuple[float, float]]) -> None:
         current = self._selected_mask()
@@ -517,7 +524,10 @@ class OcclusionTabMixin:
         start, end = payload
         brush_radius = max(1, int(self.mask_brush_slider.value()))
         paint_brush(current.mask, start, end, brush_radius, 0)
-        self.frame_viewer.refresh_mask_record(current.name, include_margin=False)
+        now = time.monotonic()
+        if now - getattr(self, "_last_mask_preview_refresh", 0.0) >= 0.03:
+            self._last_mask_preview_refresh = now
+            self.frame_viewer.refresh_mask_record(current.name, include_margin=False)
 
     def apply_occ_rect_mask(self, payload: object) -> None:
         current = self._selected_mask()
