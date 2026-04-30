@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -1291,6 +1292,22 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         self.choose_folder_button = QPushButton("Open Video Folder")
         self.video_list = QListWidget()
         self.video_list.setAlternatingRowColors(True)
+        self.video_list.setStyleSheet(
+            """
+            QListWidget::item:selected {
+                background: #2563eb;
+                color: white;
+            }
+            QListWidget::item:selected:active {
+                background: #2563eb;
+                color: white;
+            }
+            QListWidget::item:selected:!active {
+                background: #3b82f6;
+                color: white;
+            }
+            """
+        )
         file_layout.addWidget(self.folder_label)
         file_layout.addWidget(self.choose_folder_button)
         file_layout.addWidget(self.video_list, stretch=1)
@@ -1356,7 +1373,12 @@ class MainWindow(SquareTabMixin, ChamberTabMixin, CircleTabMixin, PinTabMixin, O
         right_layout.addWidget(csv_group, stretch=2)
         right_layout.addWidget(self.mode_tabs, stretch=4)
         right_layout.addWidget(save_group, stretch=0)
-        splitter.addWidget(right_panel)
+        right_layout.addStretch(1)
+
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setWidget(right_panel)
+        splitter.addWidget(right_scroll)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
         splitter.setSizes([1180, 640])
