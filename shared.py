@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 from PyQt6.QtGui import QColor
 
+from trajectory import bodypart_coordinate_columns, bodyparts_from_dataframe, infer_pixel_scale
+
 
 VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".m4v"}
 MASK_PALETTE = [
@@ -52,6 +54,52 @@ class MaskRecord:
 
 
 @dataclass
+class MaskTransformSource:
+    """Stable source data for repeated affine transforms of a binary mask."""
+
+    mask: np.ndarray
+    signed_distance: np.ndarray
+    center: tuple[float, float]
+
+    @classmethod
+    def from_mask(cls, mask: np.ndarray) -> "MaskTransformSource":
+        binary = (np.asarray(mask) > 0).astype(np.uint8)
+        if binary.ndim != 2 or not np.any(binary):
+            raise ValueError("A non-empty 2D mask is required.")
+        ys, xs = np.where(binary > 0)
+        center = (float(xs.mean()), float(ys.mean()))
+        inside = cv2.distanceTransform(binary, cv2.DIST_L2, cv2.DIST_MASK_5)
+        outside = cv2.distanceTransform(1 - binary, cv2.DIST_L2, cv2.DIST_MASK_5)
+        return cls(
+            mask=np.ascontiguousarray(binary),
+            signed_distance=np.ascontiguousarray(inside - outside, dtype=np.float32),
+            center=center,
+        )
+
+    def render(self, angle_degrees: float, scale_factor: float) -> np.ndarray:
+        if scale_factor <= 0:
+            raise ValueError("Scale factor must be positive.")
+        normalized_angle = math.fmod(float(angle_degrees), 360.0)
+        if abs(normalized_angle) < 1e-7 and abs(float(scale_factor) - 1.0) < 1e-7:
+            return self.mask.copy()
+        matrix = cv2.getRotationMatrix2D(
+            self.center,
+            normalized_angle,
+            float(scale_factor),
+        )
+        height, width = self.mask.shape
+        transformed_distance = cv2.warpAffine(
+            self.signed_distance,
+            matrix,
+            (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=-float(max(width, height)),
+        )
+        return (transformed_distance > 0.0).astype(np.uint8)
+
+
+@dataclass
 class RoomRecord:
     name: str
     color: QColor
@@ -67,16 +115,6 @@ def discover_videos(folder: Path) -> list[Path]:
     )
 
 
-def bodyparts_from_dataframe(df: pd.DataFrame) -> list[str]:
-    columns = set(df.columns)
-    return [column[:-2] for column in df.columns if column.endswith(".x") and f"{column[:-2]}.y" in columns]
-
-
-def infer_pixel_scale(series: pd.Series, frame_extent: float) -> float:
-    numeric = pd.to_numeric(series, errors="coerce").dropna()
-    if numeric.empty:
-        return frame_extent
-    return frame_extent if numeric.max() <= 1.5 else 1.0
 
 
 def dataframe_points_to_pixels(df: pd.DataFrame, x_col: str, y_col: str, width: int, height: int) -> np.ndarray:
@@ -191,15 +229,19 @@ def fill_circle_from_diameter(mask: np.ndarray, start: tuple[float, float], end:
 
 def paint_brush(mask: np.ndarray, start: tuple[float, float], end: tuple[float, float], radius: int, value: int) -> None:
     radius = max(1, int(radius))
-    x0, y0 = start
-    x1, y1 = end
-    distance = max(1.0, math.dist(start, end))
-    steps = max(1, int(distance / max(1, radius / 2)))
-    for index in range(steps + 1):
-        t = index / steps
-        x = int(round(x0 + (x1 - x0) * t))
-        y = int(round(y0 + (y1 - y0) * t))
-        cv2.circle(mask, (x, y), radius, int(value), -1)
+    start_point = (int(round(start[0])), int(round(start[1])))
+    end_point = (int(round(end[0])), int(round(end[1])))
+    brush_value = int(value)
+    cv2.line(
+        mask,
+        start_point,
+        end_point,
+        brush_value,
+        thickness=radius * 2,
+        lineType=cv2.LINE_8,
+    )
+    cv2.circle(mask, start_point, radius, brush_value, -1, lineType=cv2.LINE_8)
+    cv2.circle(mask, end_point, radius, brush_value, -1, lineType=cv2.LINE_8)
 
 
 def build_normalized_dataframe(
@@ -209,6 +251,7 @@ def build_normalized_dataframe(
     width: int,
     height: int,
 ) -> pd.DataFrame:
+    """Append perspective-normalized coordinates while preserving every source column."""
     ordered = order_quad_points(quad_points)
     if polygon_area(ordered) < 10:
         raise ValueError("Selected square area is too small.")
@@ -220,13 +263,14 @@ def build_normalized_dataframe(
     for bodypart in bodyparts:
         x_col = f"{bodypart}.x"
         y_col = f"{bodypart}.y"
+        normalized_x_col, normalized_y_col = bodypart_coordinate_columns(bodypart, normalized=True)
         points = dataframe_points_to_pixels(df, x_col, y_col, width, height)
         valid_mask = ~np.isnan(points).any(axis=1)
         transformed = np.full_like(points, np.nan, dtype=np.float32)
         if valid_mask.any():
             transformed[valid_mask] = cv2.perspectiveTransform(points[valid_mask].reshape(-1, 1, 2), matrix).reshape(-1, 2)
-        normalized_df[x_col] = transformed[:, 0]
-        normalized_df[y_col] = transformed[:, 1]
+        normalized_df[normalized_x_col] = transformed[:, 0]
+        normalized_df[normalized_y_col] = transformed[:, 1]
 
     return normalized_df
 

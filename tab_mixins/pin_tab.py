@@ -2,7 +2,7 @@ from string import ascii_lowercase, ascii_uppercase
 
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QListWidget, QPushButton, QVBoxLayout, QWidget
 
-from happycold_shared import PinRecord
+from shared import PinRecord
 
 
 class PinTabMixin:

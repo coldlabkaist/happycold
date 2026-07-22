@@ -1,51 +1,47 @@
-# happycold
+# Happy CoLD
 
-`happycold` is a set of tools required for a behavioral analysis pipeline, including coordinate normalization, location detection, and occlusion detection. **For happy CoLD!**
+Happy CoLD is a desktop application for reviewing and post-processing animal-tracking CSV data alongside video.
 
-It currently supports:
+Main features:
 
-- `Square Normalize`: pick 4 points and export a perspective-normalized CSV
-- `Chamber Mark`: define a chamber and named rooms, then export room membership by frame
-- `Circle Detection`: draw a circle and classify each keypoint as `in` or `out`
-- `Pin Coordinates`: inspect frame coordinates manually
-- `Occlusion Detect`: draw named masks and export occlusion flags
+- Duplicate and Z-score tracking repair, region-based removal, and interpolation
+- Perspective normalization with separate normalized coordinate columns
+- Chamber, circle, and occlusion annotations
+- Trajectory, heatmap, and coordinate inspection
+- Batch saving and multi-stage pipeline export
 
-## Requirements
+## Install
 
-- Python 3.11+ recommended
-- Packages from [requirements.txt](C:/cold_yj/Programs/happycold/requirements.txt)
+Python 3.11 or newer is recommended.
 
-Install:
-
-```
+```bash
 git clone https://github.com/coldlabkaist/happycold.git
-# git clone -b v1.0.0 https://github.com/coldlabkaist/happycold.git  # for specific version
-conda create -n happycold python=3.11 -y
-conda activate happycold
 cd happycold
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+
+# macOS / Linux
+source .venv/bin/activate
+
 pip install -r requirements.txt
 ```
 
 ## Run
 
-```
-cd (happycold directory)
-conda activate happycold
-python happycold.py
+```bash
+python main.py
 ```
 
-## Update
+Open a video folder, select or load a matching CSV, configure the desired tools, and save the result from the output panel.
 
+## Tests
+
+```bash
+python -m unittest discover -s tests
 ```
-cd (happycold directory)
-git fetch --tags
-git checkout (version) # git checkout v1.0.0
-```
 
-## Basic Workflow
+## License
 
-1. Open a folder containing videos.
-2. Select a video from the list.
-3. Let the app auto-match a CSV, or load one manually.
-4. Choose a tab depending on the task.
-5. Save the current result with the button at the bottom right.
+See [LICENSE](LICENSE).

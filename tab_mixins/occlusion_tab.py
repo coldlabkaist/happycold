@@ -8,23 +8,25 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QButtonGroup,
-    QComboBox,
     QDialog,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QScrollArea,
+    QSizePolicy,
     QSlider,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
-from happycold_shared import (
+from shared import (
     MASK_PALETTE,
     MaskRecord,
     adjust_mask_by_mode,
@@ -34,201 +36,293 @@ from happycold_shared import (
     order_quad_points,
     paint_brush,
 )
+from ui_controls import NoWheelComboBox, NoWheelSpinBox
 
 
 class OcclusionTabMixin:
     def _build_occlusion_tab(self) -> QWidget:
         tab = QWidget()
-        tooltip = "Create named masks for occlusion detection. You can draw, erase, transform masks, and choose simple or perspective-aware geometric margin."
+        tooltip = (
+            "Create named masks for occlusion detection, then draw, transform, and adjust them."
+        )
         tab.setToolTip(tooltip)
-        layout = QVBoxLayout(tab)
-        header_row = QHBoxLayout()
-        header_label = QLabel("Object Mask Controls")
-        self.occlusion_help_button = QPushButton("?")
-        self.occlusion_help_button.setFixedWidth(30)
-        self.occlusion_help_button.setToolTip("Open occlusion controls help.")
-        header_row.addWidget(header_label)
-        header_row.addStretch(1)
-        header_row.addWidget(self.occlusion_help_button)
+        outer_layout = QVBoxLayout(tab)
+        outer_layout.setContentsMargins(10, 10, 10, 10)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("occlusionControlsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setMinimumWidth(0)
+        content = QWidget()
+        content.setMinimumWidth(0)
+        content.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
         info = QLabel(
-            "Create named masks for occlusion detection."
+            "Add or import a mask, choose how to edit it, configure "
+            "its margin, and check the summary before saving."
         )
         info.setWordWrap(True)
         info.setToolTip(tooltip)
+        layout.addWidget(info)
 
-        self.mask_combo = QComboBox()
-        self.mask_combo.setToolTip("Choose which named mask is currently active.")
+        self.mask_combo = NoWheelComboBox()
+        self.mask_combo.setMinimumWidth(0)
+        self.mask_combo.setToolTip("Choose the mask that receives edits.")
         self.mask_name_button = QPushButton("Add Mask")
-        self.mask_name_button.setToolTip("Create a new empty occlusion mask.")
         self.mask_rename_button = QPushButton("Rename Mask")
-        self.mask_rename_button.setToolTip("Rename the selected mask.")
         self.mask_delete_button = QPushButton("Delete Mask")
-        self.mask_delete_button.setToolTip("Delete the selected mask.")
         self.mask_clear_button = QPushButton("Clear Mask")
-        self.mask_clear_button.setToolTip("Erase all painted pixels in the selected mask.")
+        self.mask_name_button.setToolTip("Create a new empty mask.")
+        self.mask_rename_button.setToolTip("Rename the selected mask.")
+        self.mask_delete_button.setToolTip("Delete the selected mask.")
+        self.mask_clear_button.setToolTip("Clear the selected mask only.")
+        mask_actions = QGridLayout()
+        mask_actions.setHorizontalSpacing(6)
+        mask_actions.setVerticalSpacing(6)
+        mask_actions.addWidget(self.mask_name_button, 0, 0)
+        mask_actions.addWidget(self.mask_rename_button, 0, 1)
+        mask_actions.addWidget(self.mask_delete_button, 1, 0)
+        mask_actions.addWidget(self.mask_clear_button, 1, 1)
 
-        name_row = QHBoxLayout()
-        name_row.addWidget(self.mask_name_button)
-        name_row.addWidget(self.mask_rename_button)
-        name_row.addWidget(self.mask_delete_button)
-        name_row.addWidget(self.mask_clear_button)
+        target_group = QGroupBox("1. Create or Select Mask")
+        target_layout = QVBoxLayout(target_group)
+        target_form = QFormLayout()
+        target_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        target_form.addRow("Current Mask", self.mask_combo)
+        target_layout.addLayout(target_form)
+        target_layout.addLayout(mask_actions)
+        layout.addWidget(target_group)
 
-        self.mask_shape_combo = QComboBox()
-        self.mask_shape_combo.addItems(["Rectangle 4 Points", "Circle Drag", "Free Drawing"])
-        self.mask_shape_combo.setToolTip("Choose how new mask strokes are created on the frame.")
+        self.mask_shape_combo = NoWheelComboBox()
+        self.mask_shape_combo.addItems(
+            ["Rectangle 4 Points", "Circle Drag", "Free Drawing"]
+        )
+        self.mask_shape_combo.setMinimumWidth(0)
+        self.mask_shape_combo.setToolTip("Choose how mask pixels are drawn in the viewer.")
         self.mask_draw_radio = QRadioButton("Draw")
         self.mask_transform_radio = QRadioButton("Transform")
         self.mask_draw_radio.setChecked(True)
-        self.mask_draw_radio.setToolTip("Paint or erase pixels into the selected mask.")
-        self.mask_transform_radio.setToolTip("Move or scale the selected mask instead of painting.")
+        self.mask_draw_radio.setToolTip("Draw or erase mask pixels.")
+        self.mask_transform_radio.setToolTip("Move, scale, or rotate the selected mask.")
         self.mask_mode_group = QButtonGroup(self)
         self.mask_mode_group.addButton(self.mask_draw_radio)
         self.mask_mode_group.addButton(self.mask_transform_radio)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(self.mask_draw_radio)
+        mode_row.addWidget(self.mask_transform_radio)
+        mode_row.addStretch(1)
+
         self.mask_add_radio = QRadioButton("Add")
         self.mask_erase_radio = QRadioButton("Erase")
         self.mask_add_radio.setChecked(True)
-        self.mask_add_radio.setToolTip("New strokes add pixels to the mask.")
-        self.mask_erase_radio.setToolTip("New strokes remove pixels from the mask.")
+        self.mask_add_radio.setToolTip("New strokes add pixels.")
+        self.mask_erase_radio.setToolTip("New strokes remove pixels.")
         self.mask_action_group = QButtonGroup(self)
         self.mask_action_group.addButton(self.mask_add_radio)
         self.mask_action_group.addButton(self.mask_erase_radio)
+        action_row = QHBoxLayout()
+        action_row.addWidget(self.mask_add_radio)
+        action_row.addWidget(self.mask_erase_radio)
+        action_row.addStretch(1)
+
         self.mask_brush_slider = QSlider(Qt.Orientation.Horizontal)
         self.mask_brush_slider.setRange(1, 60)
         self.mask_brush_slider.setValue(12)
-        self.mask_brush_slider.setToolTip("Brush radius for free drawing mode.")
-        self.mask_brush_spinbox = QSpinBox()
+        self.mask_brush_slider.setToolTip("Brush radius for Free Drawing.")
+        self.mask_brush_spinbox = NoWheelSpinBox()
         self.mask_brush_spinbox.setRange(1, 60)
         self.mask_brush_spinbox.setSuffix(" px")
-        self.mask_brush_spinbox.setFixedWidth(96)
-        self.mask_brush_spinbox.setToolTip("Precise brush radius for free drawing mode.")
+        self.mask_brush_spinbox.setFixedWidth(88)
+        self.mask_brush_spinbox.setToolTip("Exact brush radius.")
         self.mask_brush_label = QLabel("Brush Size")
-        self.mask_brush_label.setToolTip("Brush radius used while free drawing.")
+        brush_row = QHBoxLayout()
+        brush_row.addWidget(self.mask_brush_slider, stretch=1)
+        brush_row.addWidget(self.mask_brush_spinbox)
+
+        edit_group = QGroupBox("2. Draw or Transform")
+        edit_form = QFormLayout(edit_group)
+        edit_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        edit_form.addRow("Edit Mode", mode_row)
+        edit_form.addRow("Mask Tool", self.mask_shape_combo)
+        edit_form.addRow("Draw Action", action_row)
+        edit_form.addRow(self.mask_brush_label, brush_row)
+        layout.addWidget(edit_group)
+
         self.mask_margin_simple_radio = QRadioButton("Simple")
         self.mask_margin_geometric_radio = QRadioButton("Geometric")
         self.mask_margin_simple_radio.setChecked(True)
         self.mask_margin_mode_group = QButtonGroup(self)
         self.mask_margin_mode_group.addButton(self.mask_margin_simple_radio)
         self.mask_margin_mode_group.addButton(self.mask_margin_geometric_radio)
-        self.mask_margin_slider = QSlider(Qt.Orientation.Horizontal)
-        self.mask_margin_slider.setRange(-300, 300)
-        self.mask_margin_slider.setValue(0)
-        self.mask_margin_spinbox = QSpinBox()
-        self.mask_margin_spinbox.setRange(-300, 300)
-        self.mask_margin_spinbox.setSuffix(" px")
-        self.mask_margin_spinbox.setFixedWidth(96)
-        self.mask_margin_label = QLabel("Mask Margin")
-        self.occ_margin_points_label = QLabel("Geometric Points: 0 / 4")
-        self.occ_margin_points_label.setWordWrap(True)
-        self.occ_margin_set_button = QPushButton("Set Square")
-        self.mask_summary_label = QLabel("Select or create a mask.")
-        self.mask_summary_label.setWordWrap(True)
-        self.mask_summary_label.setToolTip("Shows base mask size, adjusted mask size, current margin mode, and edit mode.")
-        self.import_mask_button = QPushButton("Import Mask PNG")
-        self.import_mask_button.setToolTip("Load a single saved mask PNG.")
-        self.import_mask_folder_button = QPushButton("Import Mask Folder")
-        self.import_mask_folder_button.setToolTip("Load every mask PNG and saved metadata from a folder.")
-        self.export_masks_button = QPushButton("Export Masks PNG")
-        self.export_masks_button.setToolTip("Save the current masks and their margin settings to disk.")
-        brush_row = QHBoxLayout()
-        brush_row.addWidget(self.mask_brush_slider, stretch=1)
-        brush_row.addWidget(self.mask_brush_spinbox)
         margin_mode_row = QHBoxLayout()
         margin_mode_row.addWidget(self.mask_margin_simple_radio)
         margin_mode_row.addWidget(self.mask_margin_geometric_radio)
-        occ_margin_points_row = QHBoxLayout()
-        occ_margin_points_row.addWidget(self.occ_margin_set_button)
+        margin_mode_row.addStretch(1)
+
+        self.mask_margin_slider = QSlider(Qt.Orientation.Horizontal)
+        self.mask_margin_slider.setRange(-300, 300)
+        self.mask_margin_slider.setValue(0)
+        self.mask_margin_spinbox = NoWheelSpinBox()
+        self.mask_margin_spinbox.setRange(-300, 300)
+        self.mask_margin_spinbox.setSuffix(" px")
+        self.mask_margin_spinbox.setFixedWidth(88)
+        self.mask_margin_label = QLabel("Mask Margin")
         margin_row = QHBoxLayout()
         margin_row.addWidget(self.mask_margin_slider, stretch=1)
         margin_row.addWidget(self.mask_margin_spinbox)
 
-        form = QFormLayout()
-        form.addRow("Shape Tool", self.mask_shape_combo)
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(self.mask_draw_radio)
-        mode_row.addWidget(self.mask_transform_radio)
-        form.addRow("Mode", mode_row)
-        action_row = QHBoxLayout()
-        action_row.addWidget(self.mask_add_radio)
-        action_row.addWidget(self.mask_erase_radio)
-        form.addRow("Action", action_row)
-        form.addRow(self.mask_brush_label, brush_row)
-        form.addRow("Margin Mode", margin_mode_row)
-        form.addRow(self.occ_margin_points_label, occ_margin_points_row)
-        form.addRow(self.mask_margin_label, margin_row)
+        self.occ_margin_points_label = QLabel("Geometric Points")
+        self.occ_margin_points_label.setWordWrap(True)
+        self.occ_margin_set_button = QPushButton("Set Square")
+        points_row = QVBoxLayout()
+        points_row.addWidget(self.occ_margin_set_button)
 
-        mask_margin_tooltip = (
-            "Simple: expand or shrink the mask directly in the current frame.\n"
-            "Geometric: apply the same margin after 4-point perspective rectification, then project it back.\n"
-            "Geometric mode needs four reference points set inside Occlusion."
+        margin_group = QGroupBox("3. Configure Margin")
+        margin_form = QFormLayout(margin_group)
+        margin_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        margin_form.addRow("Margin Mode", margin_mode_row)
+        margin_form.addRow(self.occ_margin_points_label, points_row)
+        margin_form.addRow(self.mask_margin_label, margin_row)
+        layout.addWidget(margin_group)
+
+        margin_tooltip = (
+            "Simple changes the mask directly. Geometric applies the margin after "
+            "four-point perspective rectification."
         )
-        self.mask_margin_label.setToolTip(mask_margin_tooltip)
-        self.mask_margin_slider.setToolTip(mask_margin_tooltip)
-        self.mask_margin_spinbox.setToolTip(mask_margin_tooltip)
-        self.mask_margin_simple_radio.setToolTip(mask_margin_tooltip)
-        self.mask_margin_geometric_radio.setToolTip(mask_margin_tooltip)
-        self.occ_margin_points_label.setToolTip("Four perspective reference points used only by occlusion geometric margin.")
-        self.occ_margin_set_button.setToolTip("Start picking four geometric reference points, or reset an existing square.")
+        for control in (
+            self.mask_margin_label,
+            self.mask_margin_slider,
+            self.mask_margin_spinbox,
+            self.mask_margin_simple_radio,
+            self.mask_margin_geometric_radio,
+        ):
+            control.setToolTip(margin_tooltip)
+        self.occ_margin_points_label.setToolTip(
+            "Four perspective points used by Geometric margin."
+        )
+        self.occ_margin_set_button.setToolTip(
+            "Pick or reset four perspective reference points."
+        )
 
-        import_row = QHBoxLayout()
-        import_row.addWidget(self.import_mask_button)
-        import_row.addWidget(self.import_mask_folder_button)
-        import_row.addWidget(self.export_masks_button)
+        self.mask_summary_label = QLabel("Add or import a mask first.")
+        self.mask_summary_label.setWordWrap(True)
+        self.mask_summary_label.setToolTip(
+            "Shows selected mask, pixel counts, margin, and edit mode."
+        )
+        review_group = QGroupBox("4. Review")
+        review_layout = QVBoxLayout(review_group)
+        review_layout.addWidget(self.mask_summary_label)
+        layout.addWidget(review_group)
+        layout.addStretch(1)
+        scroll.setWidget(content)
+        outer_layout.addWidget(scroll, stretch=1)
 
-        layout.addLayout(header_row)
-        layout.addWidget(info)
-        layout.addWidget(self.mask_combo)
-        layout.addLayout(name_row)
-        layout.addLayout(form)
-        layout.addLayout(import_row)
-        layout.addWidget(self.mask_summary_label)
+        self.import_mask_button = QPushButton("Import Mask")
+        self.import_mask_button.setToolTip("Load one mask PNG.")
+        self.import_mask_folder_button = QPushButton("Import Mask Folder")
+        self.import_mask_folder_button.setToolTip(
+            "Load all mask PNGs and metadata from a folder."
+        )
+        self.export_masks_button = QPushButton("Export Masks")
+        self.export_masks_button.setToolTip("Save masks and margin metadata.")
+        file_actions = QGridLayout()
+        file_actions.setHorizontalSpacing(6)
+        file_actions.setVerticalSpacing(6)
+        file_actions.addWidget(self.import_mask_button, 0, 0)
+        file_actions.addWidget(self.import_mask_folder_button, 0, 1)
+        file_actions.addWidget(self.export_masks_button, 1, 0, 1, 2)
+        outer_layout.addLayout(file_actions)
         return tab
 
-    def show_occlusion_controls_help(self) -> None:
+    def show_annotate_controls_help(self) -> None:
         dialog = QDialog(self)
-        dialog.setWindowTitle("Occlusion Controls")
+        dialog.setObjectName("annotateControlsDialog")
+        dialog.setWindowTitle("Annotate Shortcuts")
         dialog.setModal(True)
-        dialog.resize(520, 360)
-        layout = QVBoxLayout(dialog)
+        dialog.resize(560, 440)
+        dialog.setMinimumSize(440, 320)
+        if self.styleSheet():
+            dialog.setStyleSheet(self.styleSheet())
 
-        title = QLabel("Object Mask Controls")
-        title.setStyleSheet("font-size: 15px; font-weight: 700;")
-        text = QLabel(
-            "Transform mode:\n"
-            "- Left drag: move mask\n"
-            "- Ctrl + left click / drag: erase with current brush size\n"
-            "- [: scale down\n"
-            "- ]: scale up\n"
-            "- E: scale down\n"
-            "- R: scale up\n"
-            "- Ctrl + [: rotate -4 degrees\n"
-            "- Ctrl + ]: rotate +4 degrees\n\n"
-            "- Ctrl + E: rotate -4 degrees\n"
-            "- Ctrl + R: rotate +4 degrees\n\n"
-            "Mode and selection:\n"
-            "- Press D: switch to Draw mode\n"
-            "- Press T: switch to Transform mode\n"
-            "- Press 1..0: select mask #1..#10 in the list\n"
-            "- Double-click near a mask object: select that mask\n"
-            "- Mask move is clamped to frame bounds (cannot move outside)\n\n"
-            "Draw mode:\n"
-            "- Hold Ctrl while drawing to erase (Rectangle, Circle, Free Drawing)\n\n"
-            "Viewer:\n"
-            "- Mouse wheel: zoom viewer\n"
-            "- Right drag: pan viewer\n\n"
-            "Tips:\n"
-            "- This help is available from the ? button in Occlusion tab.\n"
-            "- Press F1 to open this dialog while using Occlusion."
-        )
-        text.setWordWrap(True)
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(dialog.accept)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        title = QLabel("Annotate Shortcuts")
+        title.setObjectName("annotateHelpTitle")
         layout.addWidget(title)
-        layout.addWidget(text, stretch=1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 6, 0)
+        content_layout.setSpacing(10)
+
+        def add_shortcut_group(
+            section_title: str,
+            rows: list[tuple[str, str]],
+        ) -> None:
+            section = QGroupBox(section_title)
+            section.setObjectName("annotateShortcutGroup")
+            grid = QGridLayout(section)
+            grid.setContentsMargins(14, 12, 14, 13)
+            grid.setHorizontalSpacing(12)
+            grid.setVerticalSpacing(8)
+            for row_index, (shortcut, description) in enumerate(rows):
+                shortcut_label = QLabel(shortcut)
+                shortcut_label.setProperty("shortcutKey", True)
+                shortcut_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                shortcut_label.setMinimumWidth(120)
+                description_label = QLabel(description)
+                description_label.setWordWrap(True)
+                description_label.setProperty("shortcutDescription", True)
+                grid.addWidget(shortcut_label, row_index, 0)
+                grid.addWidget(description_label, row_index, 1)
+            grid.setColumnStretch(1, 1)
+            content_layout.addWidget(section)
+
+        add_shortcut_group(
+            "Shared",
+            [
+                ("D", "Draw mode"),
+                ("T", "Transform mode"),
+                ("E  or  [", "Scale down"),
+                ("R  or  ]", "Scale up"),
+                ("Ctrl+E  or  Ctrl+[", "Rotate left (Chamber / Occlusion)"),
+                ("Ctrl+R  or  Ctrl+]", "Rotate right (Chamber / Occlusion)"),
+                ("F1", "Open this shortcut guide"),
+            ],
+        )
+        add_shortcut_group(
+            "Occlusion only",
+            [
+                ("1 - 9", "Select mask 1 - 9"),
+                ("0", "Select mask 10"),
+            ],
+        )
+        content_layout.addStretch(1)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, stretch=1)
+
+        close_button = QPushButton("Close")
+        close_button.setProperty("primary", True)
+        close_button.setMinimumWidth(96)
+        close_button.setDefault(True)
+        close_button.clicked.connect(dialog.accept)
         layout.addWidget(close_button, alignment=Qt.AlignmentFlag.AlignRight)
         dialog.exec()
 
+    def show_occlusion_controls_help(self) -> None:
+        """Compatibility wrapper for older callers."""
+        self.show_annotate_controls_help()
+
     def _sync_occlusion_mode(self) -> None:
-        if self.mode_tabs.currentIndex() != 4:
+        if self.mode_tabs.currentIndex() != self.TAB_OCCLUSION:
             self.frame_viewer.set_occ_margin_pick_mode(False)
             return
         mapping = {0: "occ_rect", 1: "occ_circle", 2: "occ_free"}
@@ -248,6 +342,7 @@ class OcclusionTabMixin:
         self.frame_viewer.free_draw_add = self.mask_add_radio.isChecked()
 
     def reset_masks(self) -> None:
+        self._invalidate_mask_transform_source()
         self.mask_records.clear()
         self.selected_mask_name = None
         self.mask_combo.blockSignals(True)
@@ -341,11 +436,13 @@ class OcclusionTabMixin:
     def clear_selected_mask(self) -> None:
         current = self._selected_mask()
         if current is not None:
+            self._invalidate_mask_transform_source(current.name)
             current.mask.fill(0)
             self.frame_viewer.set_mask_records(self.mask_records, self.selected_mask_name, refresh=True)
             self._refresh_mask_ui()
 
     def _rebuild_mask_list(self) -> None:
+        self._invalidate_mask_transform_source()
         self.mask_combo.blockSignals(True)
         self.mask_combo.clear()
         for name in sorted(self.mask_records):
@@ -365,6 +462,7 @@ class OcclusionTabMixin:
         self._refresh_mask_ui()
 
     def _on_mask_selection_changed(self, index: int) -> None:
+        self._invalidate_mask_transform_source()
         self.selected_mask_name = self.mask_combo.itemData(index) if index >= 0 else None
         selected = self._selected_mask()
         if selected is not None:
@@ -399,7 +497,7 @@ class OcclusionTabMixin:
         current = self._selected_mask()
         if current is not None:
             current.margin = value
-        if self.mode_tabs.currentIndex() == 4:
+        if self.mode_tabs.currentIndex() == self.TAB_OCCLUSION:
             self.frame_viewer.set_margin_value(float(value))
         self.frame_viewer.set_mask_records(self.mask_records, self.selected_mask_name, refresh=True)
         self._save_settings()
@@ -513,6 +611,7 @@ class OcclusionTabMixin:
         current = self._selected_mask()
         if current is None or not self.mask_transform_radio.isChecked():
             return
+        self._invalidate_mask_transform_source(current.name)
         brush_radius = max(1, int(self.mask_brush_slider.value()))
         paint_brush(current.mask, point, point, brush_radius, 0)
         self.frame_viewer.refresh_mask_record(current.name, include_margin=False)
@@ -521,6 +620,7 @@ class OcclusionTabMixin:
         current = self._selected_mask()
         if current is None or not self.mask_transform_radio.isChecked():
             return
+        self._invalidate_mask_transform_source(current.name)
         start, end = payload
         brush_radius = max(1, int(self.mask_brush_slider.value()))
         paint_brush(current.mask, start, end, brush_radius, 0)
@@ -547,6 +647,7 @@ class OcclusionTabMixin:
             points = payload
         else:
             return
+        self._invalidate_mask_transform_source(current.name)
         fill_polygon(current.mask, order_quad_points(points).tolist(), 1 if add else 0)
         self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
         self._refresh_mask_ui()
@@ -563,6 +664,7 @@ class OcclusionTabMixin:
             add = payload[4]
         if start is None or end is None:
             return
+        self._invalidate_mask_transform_source(current.name)
         fill_circle_from_diameter(current.mask, start, end, 1 if add else 0)
         self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
         self.frame_viewer.clear_occ_circle()
@@ -573,6 +675,7 @@ class OcclusionTabMixin:
         if current is None or self.mask_transform_radio.isChecked():
             return
         start, end, add = payload
+        self._invalidate_mask_transform_source(current.name)
         paint_brush(current.mask, start, end, self.mask_brush_slider.value(), 1 if add else 0)
         now = time.monotonic()
         if now - getattr(self, "_last_mask_preview_refresh", 0.0) >= 0.03:
