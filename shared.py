@@ -156,6 +156,72 @@ def adjust_mask(mask: np.ndarray, margin: int) -> np.ndarray:
     return cv2.erode(mask.astype(np.uint8), kernel)
 
 
+def smooth_binary_mask_low(mask: np.ndarray, *, max_area_change_ratio: float = 0.06) -> np.ndarray:
+    """Return a lightly polished binary mask for committed brush/transform edits.
+
+    The result is meant to become the actual mask used by display, export, and
+    analysis. It therefore keeps the operation conservative: tiny masks are left
+    alone, holes are preserved by contour hierarchy, and excessive area changes
+    fall back to the safer candidate or the original binary mask.
+    """
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    if binary.ndim != 2:
+        return binary.copy()
+    original_area = int(np.count_nonzero(binary))
+    if original_area == 0 or min(binary.shape) < 3 or original_area < 24:
+        return binary.copy()
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    morph_candidate = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    morph_candidate = cv2.morphologyEx(morph_candidate, cv2.MORPH_OPEN, kernel)
+
+    contours, hierarchy = cv2.findContours(
+        morph_candidate,
+        cv2.RETR_TREE,
+        cv2.CHAIN_APPROX_NONE,
+    )
+    if hierarchy is None or not contours:
+        return morph_candidate.astype(np.uint8)
+
+    approximated: list[np.ndarray] = []
+    for contour in contours:
+        if len(contour) < 3:
+            approximated.append(contour)
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        epsilon = min(1.15, max(0.45, perimeter * 0.0025))
+        simplified = cv2.approxPolyDP(contour, epsilon, True)
+        approximated.append(simplified if len(simplified) >= 3 else contour)
+
+    hierarchy_rows = hierarchy[0]
+    depths: list[int] = []
+    for index, row in enumerate(hierarchy_rows):
+        depth = 0
+        parent = int(row[3])
+        guard = 0
+        while parent != -1 and guard < len(hierarchy_rows):
+            depth += 1
+            parent = int(hierarchy_rows[parent][3])
+            guard += 1
+        depths.append(depth)
+
+    smoothed = np.zeros_like(binary)
+    for contour_index in sorted(range(len(approximated)), key=lambda i: depths[i]):
+        fill_value = 1 if depths[contour_index] % 2 == 0 else 0
+        cv2.drawContours(smoothed, approximated, contour_index, fill_value, cv2.FILLED)
+    smoothed = (smoothed > 0).astype(np.uint8)
+
+    smoothed_area = int(np.count_nonzero(smoothed))
+    allowed_delta = max(12, int(round(original_area * float(max_area_change_ratio))))
+    if smoothed_area > 0 and abs(smoothed_area - original_area) <= allowed_delta:
+        return smoothed
+
+    morph_area = int(np.count_nonzero(morph_candidate))
+    if morph_area > 0 and abs(morph_area - original_area) <= allowed_delta:
+        return morph_candidate.astype(np.uint8)
+    return binary.copy()
+
+
 def build_rectified_geometry(quad_points: list[tuple[float, float]]) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
     if len(quad_points) != 4:
         raise ValueError("Four square points are required for geometric margin.")

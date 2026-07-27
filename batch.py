@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -7,6 +8,48 @@ from typing import Callable
 import pandas as pd
 
 from trajectory import bodyparts_from_dataframe
+
+
+class ExportCancelled(Exception):
+    """Raised by export tasks when a user-requested cancel can be honored safely."""
+
+
+def raise_if_cancelled(should_cancel: Callable[[], bool] | None) -> None:
+    if should_cancel is not None and should_cancel():
+        raise ExportCancelled()
+
+
+def _callable_accepts_cancel(callback: Callable[..., object]) -> bool:
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return False
+    return (
+        "should_cancel" in signature.parameters
+        or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+    )
+
+
+def call_export_item(
+    export_item: Callable[..., Path],
+    item: "BatchItem",
+    should_cancel: Callable[[], bool] | None = None,
+) -> Path:
+    if _callable_accepts_cancel(export_item):
+        return Path(export_item(item, should_cancel=should_cancel))
+    return Path(export_item(item))
+
+
+def call_single_export(
+    export_item: Callable[..., Path],
+    should_cancel: Callable[[], bool] | None = None,
+) -> Path:
+    if _callable_accepts_cancel(export_item):
+        return Path(export_item(should_cancel=should_cancel))
+    return Path(export_item())
 
 
 @dataclass(frozen=True)
@@ -92,8 +135,13 @@ def run_batch_exports(
                 scale_x=width / safe_source_width,
                 scale_y=height / safe_source_height,
             )
-            result.saved_paths.append(Path(export_item(item)))
+            raise_if_cancelled(should_cancel)
+            result.saved_paths.append(call_export_item(export_item, item, should_cancel))
             outcome = "saved"
+        except ExportCancelled:
+            result.cancelled = True
+            outcome = "cancelled"
+            break
         except Exception as exc:
             result.failed.append((video_path, str(exc)))
             outcome = "failed"

@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from shared import MASK_PALETTE, MaskTransformSource, RoomRecord, build_chamber_mark_dataframe, fill_circle_from_diameter, fill_polygon, order_quad_points
+from shared import MASK_PALETTE, MaskTransformSource, RoomRecord, build_chamber_mark_dataframe, fill_circle_from_diameter, fill_polygon, order_quad_points, smooth_binary_mask_low
 from ui_controls import NoWheelComboBox
 
 
@@ -237,6 +237,8 @@ class ChamberTabMixin:
             return
         if self.chamber_mask is not None and np.any(self.chamber_mask):
             self._commit_effective_room_masks()
+        if hasattr(self, "_push_chamber_undo"):
+            self._push_chamber_undo("set full-frame chamber")
         self._invalidate_chamber_transform_source()
         self.chamber_mask = mask
         self._set_chamber_boundary_mode("full_frame")
@@ -320,8 +322,10 @@ class ChamberTabMixin:
             return None
         return f"room:{room.name}", room.mask
 
-    def _set_selected_chamber_layer_mask(self, mask: np.ndarray) -> None:
+    def _set_selected_chamber_layer_mask(self, mask: np.ndarray, *, smooth: bool = False) -> None:
         normalized = (mask > 0).astype(np.uint8)
+        if smooth:
+            normalized = smooth_binary_mask_low(normalized)
         if self.chamber_edit_chamber_radio.isChecked():
             self.chamber_mask = normalized
             self._mark_chamber_boundary_custom()
@@ -382,9 +386,11 @@ class ChamberTabMixin:
         transformed = source.render(next_angle, next_scale)
         if not np.any(transformed):
             return
+        if hasattr(self, "_push_chamber_undo"):
+            self._push_chamber_undo("transform chamber mask")
         self._chamber_transform_angle = next_angle
         self._chamber_transform_scale = next_scale
-        self._set_selected_chamber_layer_mask(transformed)
+        self._set_selected_chamber_layer_mask(transformed, smooth=True)
 
     def translate_selected_chamber_layer(self, shift: tuple[int, int]) -> None:
         selected = self._selected_chamber_layer()
@@ -406,8 +412,10 @@ class ChamberTabMixin:
         translated[dst_y0:dst_y1, dst_x0:dst_x1] = mask[
             src_y0:src_y1, src_x0:src_x1
         ]
+        if hasattr(self, "_push_chamber_undo"):
+            self._push_chamber_undo("move chamber mask")
         self._invalidate_chamber_transform_source()
-        self._set_selected_chamber_layer_mask(translated)
+        self._set_selected_chamber_layer_mask(translated, smooth=True)
 
     def scale_selected_chamber_layer(self, scale_factor: float) -> None:
         self._apply_chamber_affine_transform(scale_multiplier=scale_factor)
@@ -528,6 +536,8 @@ class ChamberTabMixin:
         current = self._selected_room()
         if current is None:
             return
+        if hasattr(self, "_push_chamber_undo"):
+            self._push_chamber_undo("clear room mask")
         self._invalidate_chamber_transform_source()
         current.mask.fill(0)
         self._refresh_chamber_viewer(refresh=True)
@@ -560,6 +570,8 @@ class ChamberTabMixin:
     def _apply_chamber_shape_mask(self, shape_mask: np.ndarray) -> None:
         if self.video_state is None:
             return
+        if hasattr(self, "_push_chamber_undo"):
+            self._push_chamber_undo("draw chamber mask")
         self._invalidate_chamber_transform_source()
         if self.chamber_edit_chamber_radio.isChecked():
             if self.chamber_mask is None:

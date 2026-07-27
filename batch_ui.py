@@ -23,7 +23,19 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from batch import BatchItem, BatchRunResult, run_batch_exports
+from batch import (
+    BatchItem,
+    BatchRunResult,
+    ExportCancelled,
+    call_single_export,
+    run_batch_exports,
+)
+
+
+@dataclass(frozen=True)
+class SingleSaveResult:
+    output_path: Path | None = None
+    cancelled: bool = False
 
 
 @dataclass(frozen=True)
@@ -324,6 +336,36 @@ class BatchVideoSelectionDialog(QDialog):
         ]
 
 
+class SingleExportWorker(QObject):
+    """Run one current-output save without touching UI objects."""
+
+    completed = pyqtSignal(object)
+    crashed = pyqtSignal(str)
+
+    def __init__(self, *, export_item: Callable[..., Path]) -> None:
+        super().__init__()
+        self._export_item = export_item
+        self._cancel_event = threading.Event()
+
+    def request_cancel(self) -> None:
+        self._cancel_event.set()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            output_path = call_single_export(
+                self._export_item,
+                should_cancel=self._cancel_event.is_set,
+            )
+        except ExportCancelled:
+            self.completed.emit(SingleSaveResult(cancelled=True))
+            return
+        except Exception as exc:
+            self.crashed.emit(str(exc))
+            return
+        self.completed.emit(SingleSaveResult(output_path=Path(output_path)))
+
+
 class BatchExportWorker(QObject):
     """Run one shared batch export without touching UI objects."""
 
@@ -354,6 +396,9 @@ class BatchExportWorker(QObject):
         self._cancel_event = threading.Event()
 
     def request_cancel(self) -> None:
+        self._cancel_event.set()
+
+    def request_cancel_now(self) -> None:
         self._cancel_event.set()
 
     @pyqtSlot()
@@ -389,8 +434,134 @@ class BatchExportWorker(QObject):
         self.completed.emit(result)
 
 
+class SingleSaveProgressDialog(QDialog):
+    cancel_requested = pyqtSignal()
+
+    def __init__(
+        self,
+        title: str,
+        activity_text: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._running = True
+        self._activity_text = activity_text
+        self.setWindowTitle(title)
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.setMinimumWidth(540)
+        self.resize(620, 330)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        header = QFrame()
+        header.setObjectName("saveProgressHeader")
+        header_layout = QVBoxLayout(header)
+        header_layout.setContentsMargins(12, 10, 12, 10)
+        header_layout.setSpacing(5)
+
+        self.status_label = QLabel(activity_text)
+        self.status_label.setObjectName("saveProgressTitle")
+        self.status_label.setWordWrap(True)
+        header_layout.addWidget(self.status_label)
+
+        self.current_file_label = QLabel("Preparing the background save worker...")
+        self.current_file_label.setWordWrap(True)
+        self.current_file_label.setProperty("muted", True)
+        header_layout.addWidget(self.current_file_label)
+        layout.addWidget(header)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setFormat("Saving...")
+        layout.addWidget(self.progress_bar)
+
+        self.counter_label = QLabel("Saved 0  ·  Cancelled 0  ·  Failed 0")
+        self.counter_label.setObjectName("saveProgressCounter")
+        layout.addWidget(self.counter_label)
+
+        self.details = QPlainTextEdit()
+        self.details.setObjectName("saveProgressDetails")
+        self.details.setReadOnly(True)
+        self.details.setPlaceholderText("Save results will appear here.")
+        self.details.setMaximumBlockCount(80)
+        layout.addWidget(self.details, stretch=1)
+
+        footer = QFrame()
+        footer.setObjectName("saveProgressFooter")
+        button_row = QHBoxLayout(footer)
+        button_row.setContentsMargins(10, 8, 10, 8)
+        button_row.setSpacing(8)
+        button_row.addStretch(1)
+        self.cancel_button = QPushButton("Cancel now")
+        self.close_button = QPushButton("Close")
+        self.close_button.setEnabled(False)
+        button_row.addWidget(self.cancel_button)
+        button_row.addWidget(self.close_button)
+        layout.addWidget(footer)
+
+        self.cancel_button.clicked.connect(self._request_cancel)
+        self.close_button.clicked.connect(self.accept)
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    def _request_cancel(self) -> None:
+        if not self._running:
+            return
+        self.cancel_button.setEnabled(False)
+        self.status_label.setText("Cancelling as soon as the current step can stop safely...")
+        self.current_file_label.setText(
+            "The CSV will not be written if cancellation reaches it before the file write starts."
+        )
+        self.details.appendPlainText("      Cancel requested · waiting for a safe checkpoint")
+        self.cancel_requested.emit()
+
+    def mark_completed(self, result: SingleSaveResult) -> None:
+        self._running = False
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(1)
+        if result.cancelled:
+            self.status_label.setText("Save cancelled")
+            self.current_file_label.setText("No further output will be written for this save request.")
+            self.counter_label.setText("Saved 0  ·  Cancelled 1  ·  Failed 0")
+            self.details.appendPlainText("  1/1  Cancelled  ·  current save")
+        else:
+            output_path = Path(result.output_path) if result.output_path is not None else None
+            output_name = output_path.name if output_path is not None else "output"
+            self.status_label.setText("Save completed")
+            self.current_file_label.setText(f"Saved: {result.output_path}")
+            self.counter_label.setText("Saved 1  ·  Cancelled 0  ·  Failed 0")
+            self.details.appendPlainText(f"  1/1  Saved  ·  {output_name}")
+        self.cancel_button.setEnabled(False)
+        self.close_button.setEnabled(True)
+        self.close_button.setProperty("primary", True)
+        self.close_button.setFocus()
+
+    def mark_crashed(self, message: str) -> None:
+        self._running = False
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(1)
+        self.status_label.setText("Save stopped unexpectedly")
+        self.current_file_label.setText(message or "Unknown worker error")
+        self.counter_label.setText("Saved 0  ·  Cancelled 0  ·  Failed 1")
+        self.details.appendPlainText(f"      Error · {message}")
+        self.cancel_button.setEnabled(False)
+        self.close_button.setEnabled(True)
+
+    def closeEvent(self, event) -> None:
+        if self._running:
+            self.status_label.setText("Save is still running. Use Cancel now to stop it safely.")
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
 class BatchProgressDialog(QDialog):
     cancel_requested = pyqtSignal()
+    cancel_now_requested = pyqtSignal()
 
     def __init__(
         self,
@@ -411,15 +582,22 @@ class BatchProgressDialog(QDialog):
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
+        header = QFrame()
+        header.setObjectName("saveProgressHeader")
+        header_layout = QVBoxLayout(header)
+        header_layout.setContentsMargins(12, 10, 12, 10)
+        header_layout.setSpacing(5)
+
         self.status_label = QLabel(activity_text)
-        self.status_label.setStyleSheet("font-size: 15px; font-weight: 700;")
+        self.status_label.setObjectName("saveProgressTitle")
         self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
+        header_layout.addWidget(self.status_label)
 
         self.current_file_label = QLabel("Preparing the background worker...")
         self.current_file_label.setWordWrap(True)
         self.current_file_label.setProperty("muted", True)
-        layout.addWidget(self.current_file_label)
+        header_layout.addWidget(self.current_file_label)
+        layout.addWidget(header)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, max(1, int(total)))
@@ -428,25 +606,33 @@ class BatchProgressDialog(QDialog):
         layout.addWidget(self.progress_bar)
 
         self.counter_label = QLabel("Saved 0  ·  Skipped 0  ·  Failed 0")
-        self.counter_label.setStyleSheet("font-weight: 600;")
+        self.counter_label.setObjectName("saveProgressCounter")
         layout.addWidget(self.counter_label)
 
         self.details = QPlainTextEdit()
+        self.details.setObjectName("saveProgressDetails")
         self.details.setReadOnly(True)
         self.details.setPlaceholderText("Per-file results will appear here.")
         self.details.setMaximumBlockCount(500)
         layout.addWidget(self.details, stretch=1)
 
-        button_row = QHBoxLayout()
+        footer = QFrame()
+        footer.setObjectName("saveProgressFooter")
+        button_row = QHBoxLayout(footer)
+        button_row.setContentsMargins(10, 8, 10, 8)
+        button_row.setSpacing(8)
         button_row.addStretch(1)
         self.cancel_button = QPushButton("Cancel after current file")
+        self.cancel_now_button = QPushButton("Cancel now")
         self.close_button = QPushButton("Close")
         self.close_button.setEnabled(False)
         button_row.addWidget(self.cancel_button)
+        button_row.addWidget(self.cancel_now_button)
         button_row.addWidget(self.close_button)
-        layout.addLayout(button_row)
+        layout.addWidget(footer)
 
         self.cancel_button.clicked.connect(self._request_cancel)
+        self.cancel_now_button.clicked.connect(self._request_cancel_now)
         self.close_button.clicked.connect(self.accept)
 
     @property
@@ -459,6 +645,18 @@ class BatchProgressDialog(QDialog):
         self.cancel_button.setEnabled(False)
         self.status_label.setText("Cancelling after the current file finishes...")
         self.cancel_requested.emit()
+
+    def _request_cancel_now(self) -> None:
+        if not self._running:
+            return
+        self.cancel_button.setEnabled(False)
+        self.cancel_now_button.setEnabled(False)
+        self.status_label.setText("Cancelling as soon as the current step can stop safely...")
+        self.current_file_label.setText(
+            "The current CSV will not be written if cancellation reaches it before the file write starts."
+        )
+        self.details.appendPlainText("      Cancel requested · waiting for a safe checkpoint")
+        self.cancel_now_requested.emit()
 
     def update_item_started(self, index: int, total: int, path_text: str) -> None:
         path = Path(path_text)
@@ -487,6 +685,7 @@ class BatchProgressDialog(QDialog):
             "saved": "Saved",
             "skipped": "Skipped — no matching CSV",
             "failed": "Failed",
+            "cancelled": "Cancelled",
         }
         self.details.appendPlainText(
             f"{index:>3}/{total}  {outcome_labels.get(outcome, outcome)}  ·  {path.name}"
@@ -497,7 +696,7 @@ class BatchProgressDialog(QDialog):
         if result.cancelled:
             self.status_label.setText("Batch cancelled")
             self.current_file_label.setText(
-                "The current file was allowed to finish safely; remaining files were not started."
+                "The job stopped at a safe checkpoint; remaining files were not started."
             )
         elif result.failed:
             self.status_label.setText("Batch completed with warnings")
@@ -514,6 +713,7 @@ class BatchProgressDialog(QDialog):
         for path, reason in result.failed:
             self.details.appendPlainText(f"      Error · {path.name}: {reason}")
         self.cancel_button.setEnabled(False)
+        self.cancel_now_button.setEnabled(False)
         self.close_button.setEnabled(True)
         self.close_button.setProperty("primary", True)
         self.close_button.setFocus()
@@ -524,12 +724,13 @@ class BatchProgressDialog(QDialog):
         self.current_file_label.setText(message or "Unknown worker error")
         self.details.appendPlainText(f"Worker error · {message}")
         self.cancel_button.setEnabled(False)
+        self.cancel_now_button.setEnabled(False)
         self.close_button.setEnabled(True)
 
     def closeEvent(self, event) -> None:
         if self._running:
             self.status_label.setText(
-                "Batch is still running. Use Cancel to stop after the current file."
+                "Batch is still running. Use Cancel after current file or Cancel now."
             )
             event.ignore()
             return

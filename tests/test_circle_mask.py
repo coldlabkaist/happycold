@@ -7,6 +7,7 @@ import cv2
 from tab_mixins.circle_tab import (
     build_circle_mask,
     infer_circle_geometry_from_mask,
+    infer_circular_mask_geometry,
     load_circle_mask_bundle,
     write_circle_mask_bundle,
 )
@@ -63,6 +64,26 @@ class CircleMaskTests(unittest.TestCase):
             self.assertAlmostEqual(center[1], 25.0, delta=0.5)
             self.assertAlmostEqual(base_radius, 10.0, delta=0.6)
             self.assertEqual(margin, 0)
+
+
+    def test_strict_circle_paste_accepts_circle_mask(self) -> None:
+        mask = build_circle_mask(100, 80, (40.0, 30.0), 12.0)
+
+        geometry = infer_circular_mask_geometry(mask)
+
+        self.assertIsNotNone(geometry)
+        center, radius = geometry
+        self.assertAlmostEqual(center[0], 40.0, delta=0.5)
+        self.assertAlmostEqual(center[1], 30.0, delta=0.5)
+        self.assertAlmostEqual(radius, 12.0, delta=0.8)
+
+    def test_strict_circle_paste_rejects_rectangular_mask(self) -> None:
+        import numpy as np
+
+        mask = np.zeros((80, 100), dtype=np.uint8)
+        mask[20:55, 25:75] = 1
+
+        self.assertIsNone(infer_circular_mask_geometry(mask))
 
 
 if __name__ == "__main__":

@@ -403,6 +403,8 @@ class InterpolationTabMixin:
         translated[dst_y0:dst_y1, dst_x0:dst_x1] = self.interpolation_mask[
             src_y0:src_y1, src_x0:src_x1
         ]
+        if hasattr(self, "_push_interpolation_undo"):
+            self._push_interpolation_undo("move interpolation region")
         self._set_interpolation_mask(translated)
 
     def scale_interpolation_region(self, scale_factor: float) -> None:
@@ -417,6 +419,8 @@ class InterpolationTabMixin:
         transformed = source.render(0.0, next_scale)
         if not np.any(transformed):
             return
+        if hasattr(self, "_push_interpolation_undo"):
+            self._push_interpolation_undo("scale interpolation region")
         self._interpolation_transform_scale = next_scale
         self._set_interpolation_mask(
             transformed,
@@ -424,6 +428,10 @@ class InterpolationTabMixin:
         )
 
     def apply_interpolation_rect(self, points: list[tuple[float, float]]) -> None:
+        if hasattr(self, "video_state") and self.video_state is None:
+            return
+        if hasattr(self, "_push_interpolation_undo"):
+            self._push_interpolation_undo("draw interpolation rectangle")
         mask = self._merge_interpolation_polygon(points)
         if mask is not None:
             self._set_interpolation_mask(mask)
@@ -436,6 +444,10 @@ class InterpolationTabMixin:
         return mask
 
     def apply_interpolation_circle(self, payload: tuple[tuple[float, float], float]) -> None:
+        if hasattr(self, "video_state") and self.video_state is None:
+            return
+        if hasattr(self, "_push_interpolation_undo"):
+            self._push_interpolation_undo("draw interpolation circle")
         mask = self._ensure_interpolation_mask()
         if mask is None:
             return
@@ -454,6 +466,12 @@ class InterpolationTabMixin:
         self,
         payload: tuple[tuple[float, float], tuple[float, float], bool],
     ) -> None:
+        if hasattr(self, "video_state") and self.video_state is None:
+            return
+        if not getattr(self, "_interpolation_free_undo_open", False):
+            if hasattr(self, "_push_interpolation_undo"):
+                self._push_interpolation_undo("brush interpolation region")
+            self._interpolation_free_undo_open = True
         mask = self._ensure_interpolation_mask()
         if mask is None:
             return
@@ -472,8 +490,11 @@ class InterpolationTabMixin:
 
     def _finalize_interpolation_free_draw(self) -> None:
         self._set_interpolation_mask(self.interpolation_mask)
+        self._interpolation_free_undo_open = False
 
     def reset_interpolation_region(self) -> None:
+        if self._has_interpolation_region() and hasattr(self, "_push_interpolation_undo"):
+            self._push_interpolation_undo("clear interpolation region")
         self._clear_interpolation_region()
         self._set_interpolation_removal_mode("none")
         self._refresh_interpolation_ui()

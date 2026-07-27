@@ -70,6 +70,26 @@ class NodeOverlayPoint:
     review_role: str = ""
 
 
+@dataclass(frozen=True)
+class MaskClipboardItem:
+    label: str
+    source: str
+    mask: np.ndarray
+    color_name: str = "#06b6d4"
+    margin: int = 0
+    margin_mode: str = "simple"
+    circle_center: tuple[float, float] | None = None
+    circle_base_radius: float | None = None
+    circle_margin: int = 0
+
+
+@dataclass(frozen=True)
+class MaskUndoSnapshot:
+    tab_key: str
+    label: str
+    payload: object
+
+
 def get_settings_path() -> Path:
     local_appdata = os.environ.get("LOCALAPPDATA")
     if local_appdata:
@@ -81,14 +101,17 @@ def get_settings_path() -> Path:
 
 SETTINGS_PATH = get_settings_path()
 
-from batch import BatchItem, BatchRunResult
+from batch import BatchItem, BatchRunResult, raise_if_cancelled
 from batch_ui import (
     BatchExportWorker,
     BatchProgressDialog,
     BatchVideoChoice,
     BatchVideoSelectionDialog,
+    SingleExportWorker,
+    SingleSaveProgressDialog,
 )
 from shared import (
+    MASK_PALETTE,
     MaskRecord,
     MaskTransformSource,
     PinRecord,
@@ -103,6 +126,7 @@ from shared import (
     bodyparts_from_dataframe,
     discover_videos,
     infer_pixel_scale,
+    smooth_binary_mask_low,
 )
 from interpolation import build_interpolation_pipeline_dataframe
 from trajectory import resolve_bodypart_coordinate_columns
@@ -117,6 +141,10 @@ from tab_mixins import (
     PipelinePanelMixin,
     SquareTabMixin,
     TrackingRepairTabMixin,
+)
+from tab_mixins.circle_tab import (
+    build_circle_mask,
+    infer_circular_mask_geometry,
 )
 
 
@@ -322,6 +350,7 @@ class FrameViewer(QWidget):
     chamber_transform_requested = pyqtSignal(object)
     chamber_transform_finished = pyqtSignal()
     circle_changed = pyqtSignal()
+    circle_edit_started = pyqtSignal()
     view_changed = pyqtSignal()
     pin_added = pyqtSignal(object)
     occ_rect_points_changed = pyqtSignal()
@@ -337,6 +366,7 @@ class FrameViewer(QWidget):
     occ_transform_erase_segment_requested = pyqtSignal(object)
     occ_transform_finished = pyqtSignal()
     occ_mask_double_clicked = pyqtSignal(str)
+    annotate_context_menu_requested = pyqtSignal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -421,6 +451,7 @@ class FrameViewer(QWidget):
         self._pan_dragging = False
         self._pan_drag_start = QPoint()
         self._pan_start_offset = QPointF(0.0, 0.0)
+        self._right_button_drag_moved = False
 
         self.pin_records: list[PinRecord] = []
         self.mask_records: dict[str, MaskRecord] = {}
@@ -1291,6 +1322,7 @@ class FrameViewer(QWidget):
 
         if event.button() == Qt.MouseButton.RightButton:
             self._pan_dragging = True
+            self._right_button_drag_moved = False
             self._pan_drag_start = event.position().toPoint()
             self._pan_start_offset = QPointF(self.pan_offset)
             return
@@ -1376,9 +1408,11 @@ class FrameViewer(QWidget):
         elif self.mode == "circle":
             geometry = self.circle_geometry()
             if self.circle_transform_mode and geometry is not None:
+                self.circle_edit_started.emit()
                 self._circle_move_dragging = True
                 self._circle_move_last_point = image_point
                 return
+            self.circle_edit_started.emit()
             self._circle_dragging = True
             self.circle_start = image_point
             self.circle_end = None
@@ -1450,6 +1484,8 @@ class FrameViewer(QWidget):
 
         if self._pan_dragging:
             delta = event.position().toPoint() - self._pan_drag_start
+            if delta.manhattanLength() > 4:
+                self._right_button_drag_moved = True
             self.pan_offset = self._clamped_pan_offset(self._pan_start_offset + QPointF(delta.x(), delta.y()))
             self.update()
             self.view_changed.emit()
@@ -1531,7 +1567,17 @@ class FrameViewer(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.RightButton:
+            was_context_click = self._pan_dragging and not self._right_button_drag_moved
             self._pan_dragging = False
+            self._right_button_drag_moved = False
+            if was_context_click:
+                self.annotate_context_menu_requested.emit(
+                    (
+                        self.mapToGlobal(event.position().toPoint()),
+                        self._widget_to_image(event.position()),
+                    )
+                )
+                event.accept()
             return
 
         image_point = self._widget_to_image(event.position())
@@ -2192,6 +2238,18 @@ class MainWindow(
         self.selected_room_name: str | None = None
         self.mask_records: dict[str, MaskRecord] = {}
         self.selected_mask_name: str | None = None
+        self._mask_clipboard: MaskClipboardItem | None = None
+        self._mask_undo_limit = 10
+        self._mask_undo_stacks: dict[str, list[MaskUndoSnapshot]] = {
+            "interpolation": [],
+            "chamber": [],
+            "circle": [],
+            "occlusion": [],
+        }
+        self._mask_undo_restoring = False
+        self._interpolation_free_undo_open = False
+        self._occlusion_free_undo_open = False
+        self._occlusion_transform_undo_open = False
         self.default_mask_margin = int(self.settings.get("occlusion_mask_margin", 0))
         self.default_circle_margin = int(self.settings.get("circle_detection_margin", 0))
         self.default_mask_brush = int(self.settings.get("occlusion_mask_brush", 12))
@@ -2958,7 +3016,7 @@ class MainWindow(
         self.circle_transform_radio.toggled.connect(self._sync_circle_mode)
         self.circle_margin_slider.valueChanged.connect(self._on_circle_margin_changed)
         self.circle_margin_spinbox.valueChanged.connect(self._on_circle_margin_changed)
-        self.circle_reset_button.clicked.connect(self.frame_viewer.clear_circle)
+        self.circle_reset_button.clicked.connect(self.clear_circle_with_undo)
         self.import_circle_mask_button.clicked.connect(self.import_circle_mask)
         self.export_circle_mask_button.clicked.connect(self.export_circle_mask)
         self.pin_reset_button.clicked.connect(self.reset_pins)
@@ -3007,7 +3065,11 @@ class MainWindow(
             self.translate_selected_chamber_layer
         )
         self.frame_viewer.circle_changed.connect(self._refresh_circle_ui)
+        self.frame_viewer.circle_edit_started.connect(self._push_circle_undo)
         self.frame_viewer.view_changed.connect(self._refresh_view_ui)
+        self.frame_viewer.annotate_context_menu_requested.connect(
+            self._show_annotate_mask_context_menu
+        )
         self.frame_viewer.pin_added.connect(self.add_pin)
         self.frame_viewer.occ_rect_completed.connect(self.apply_occ_rect_mask)
         self.frame_viewer.occ_rect_points_changed.connect(self._refresh_mask_draft_ui)
@@ -3025,6 +3087,7 @@ class MainWindow(
 
     def _register_shortcuts(self) -> None:
         QShortcut(QKeySequence("Ctrl+B"), self, activated=self._toggle_file_sidebar)
+        QShortcut(QKeySequence("Ctrl+Z"), self, activated=self.undo_active_mask_edit)
         QShortcut(QKeySequence("Left"), self, activated=lambda: self.step_frame(-1))
         QShortcut(QKeySequence("Right"), self, activated=lambda: self.step_frame(1))
         QShortcut(QKeySequence("D"), self, activated=lambda: self._switch_region_edit_mode_shortcut(transform_mode=False))
@@ -3317,6 +3380,13 @@ class MainWindow(
         active_thread = getattr(self, "_active_batch_thread", None)
         return active_thread is not None and active_thread.isRunning()
 
+    def _single_save_job_is_running(self) -> bool:
+        active_thread = getattr(self, "_active_single_save_thread", None)
+        return active_thread is not None and active_thread.isRunning()
+
+    def _save_job_is_running(self) -> bool:
+        return self._single_save_job_is_running() or self._batch_job_is_running()
+
     def _focus_active_batch_progress(self) -> bool:
         if not self._batch_job_is_running():
             return False
@@ -3327,6 +3397,19 @@ class MainWindow(
             dialog.activateWindow()
         return True
 
+    def _focus_active_single_save_progress(self) -> bool:
+        if not self._single_save_job_is_running():
+            return False
+        dialog = getattr(self, "_active_single_save_dialog", None)
+        if dialog is not None:
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+        return True
+
+    def _focus_active_save_progress(self) -> bool:
+        return self._focus_active_single_save_progress() or self._focus_active_batch_progress()
+
     def _batch_action_controls(self) -> tuple[QPushButton, ...]:
         return tuple(
             control
@@ -3334,14 +3417,115 @@ class MainWindow(
             if bool(control.property("batchAction"))
         )
 
-    def _set_batch_controls_busy(self, busy: bool) -> None:
+    def _save_action_controls(self) -> tuple[QPushButton, ...]:
+        controls: list[QPushButton] = list(self._batch_action_controls())
+        for name in (
+            "save_current_button",
+            "save_multiple_button",
+            "pipeline_run_current_button",
+            "pipeline_run_batch_button",
+        ):
+            control = getattr(self, name, None)
+            if control is not None:
+                controls.append(control)
+        unique_controls: list[QPushButton] = []
+        seen: set[int] = set()
+        for control in controls:
+            marker = id(control)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            unique_controls.append(control)
+        return tuple(unique_controls)
+
+    def _set_save_controls_busy(self, busy: bool) -> None:
         if busy:
-            for control in self._batch_action_controls():
+            for control in self._save_action_controls():
                 control.setEnabled(False)
             return
         self._refresh_output_ui()
         if hasattr(self, "square_batch_heatmap_overlay_button"):
             self._refresh_square_ui()
+
+    def _set_batch_controls_busy(self, busy: bool) -> None:
+        self._set_save_controls_busy(busy)
+
+    def _start_single_save_export(
+        self,
+        *,
+        title: str,
+        activity_text: str,
+        export_item,
+        on_completed=None,
+    ) -> bool:
+        if self._focus_active_save_progress():
+            return False
+
+        dialog = SingleSaveProgressDialog(
+            title,
+            activity_text,
+            parent=self,
+        )
+        worker = SingleExportWorker(export_item=export_item)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+
+        self._active_single_save_dialog = dialog
+        self._active_single_save_worker = worker
+        self._active_single_save_thread = thread
+        self._active_single_save_completion = on_completed
+
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._on_single_save_completed)
+        worker.crashed.connect(self._on_single_save_crashed)
+        worker.completed.connect(thread.quit)
+        worker.crashed.connect(thread.quit)
+        worker.completed.connect(worker.deleteLater)
+        worker.crashed.connect(worker.deleteLater)
+        thread.finished.connect(self._on_single_save_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        dialog.cancel_requested.connect(self._request_active_single_save_cancel)
+
+        self._set_save_controls_busy(True)
+        self.statusBar().showMessage(f"{activity_text} The main window remains available.")
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        thread.start()
+        return True
+
+    def _request_active_single_save_cancel(self) -> None:
+        worker = getattr(self, "_active_single_save_worker", None)
+        if worker is not None:
+            worker.request_cancel()
+            self.statusBar().showMessage(
+                "Save cancellation requested; the current step will stop before writing if possible."
+            )
+
+    def _on_single_save_completed(self, result) -> None:
+        dialog = getattr(self, "_active_single_save_dialog", None)
+        if dialog is not None:
+            dialog.mark_completed(result)
+        callback = getattr(self, "_active_single_save_completion", None)
+        self._active_single_save_completion = None
+        if callback is not None:
+            callback(result)
+        elif getattr(result, "cancelled", False):
+            self.statusBar().showMessage("Save cancelled.")
+        else:
+            self.statusBar().showMessage(f"CSV saved: {getattr(result, 'output_path', '')}")
+
+    def _on_single_save_crashed(self, message: str) -> None:
+        dialog = getattr(self, "_active_single_save_dialog", None)
+        if dialog is not None:
+            dialog.mark_crashed(message)
+        self._active_single_save_completion = None
+        self.statusBar().showMessage(f"Save worker stopped: {message}")
+
+    def _on_single_save_thread_finished(self) -> None:
+        self._active_single_save_thread = None
+        self._active_single_save_worker = None
+        self._set_save_controls_busy(False)
 
     def _start_batch_export(
         self,
@@ -3355,7 +3539,7 @@ class MainWindow(
         on_completed,
         require_bodyparts: bool = True,
     ) -> bool:
-        if self._focus_active_batch_progress():
+        if self._focus_active_save_progress():
             return False
 
         dialog = BatchProgressDialog(
@@ -3393,8 +3577,9 @@ class MainWindow(
         thread.finished.connect(self._on_batch_thread_finished)
         thread.finished.connect(thread.deleteLater)
         dialog.cancel_requested.connect(self._request_active_batch_cancel)
+        dialog.cancel_now_requested.connect(self._request_active_batch_cancel_now)
 
-        self._set_batch_controls_busy(True)
+        self._set_save_controls_busy(True)
         self.statusBar().showMessage(f"{activity_text} The main window remains available.")
         dialog.show()
         dialog.raise_()
@@ -3408,6 +3593,17 @@ class MainWindow(
             worker.request_cancel()
             self.statusBar().showMessage(
                 "Batch cancellation requested; the current file will finish safely."
+            )
+
+    def _request_active_batch_cancel_now(self) -> None:
+        worker = getattr(self, "_active_batch_worker", None)
+        if worker is not None:
+            if hasattr(worker, "request_cancel_now"):
+                worker.request_cancel_now()
+            else:
+                worker.request_cancel()
+            self.statusBar().showMessage(
+                "Batch cancellation requested; the current file will stop before writing if possible."
             )
 
     def _on_batch_export_completed(self, result: BatchRunResult) -> None:
@@ -3429,7 +3625,7 @@ class MainWindow(
     def _on_batch_thread_finished(self) -> None:
         self._active_batch_thread = None
         self._active_batch_worker = None
-        self._set_batch_controls_busy(False)
+        self._set_save_controls_busy(False)
 
     def _select_videos_for_batch(
         self,
@@ -3493,7 +3689,7 @@ class MainWindow(
         return dialog.selected_paths()
 
     def save_multiple_mode_outputs(self) -> None:
-        if self._focus_active_batch_progress():
+        if self._focus_active_save_progress():
             return
         mode_index = self.mode_tabs.currentIndex()
         supported_modes = {
@@ -3591,7 +3787,8 @@ class MainWindow(
             base_path = save_folder / f"{csv_path.stem}_{analysis_suffix}.csv"
             return self._apply_output_affixes(base_path, output_prefix, output_suffix)
 
-        def _export_item(item: BatchItem) -> Path:
+        def _export_item(item: BatchItem, should_cancel=None) -> Path:
+            raise_if_cancelled(should_cancel)
             if mode_index == self.TAB_TRACKING_REPAIR:
                 repair_result = self._run_tracking_repair_for(
                     item.source_df,
@@ -3708,7 +3905,9 @@ class MainWindow(
                 )
                 output_path = _batch_csv_output_path(item.csv_path, "occlusion")
 
+            raise_if_cancelled(should_cancel)
             output_path.parent.mkdir(parents=True, exist_ok=True)
+            raise_if_cancelled(should_cancel)
             result_df.to_csv(output_path, index=False)
             return output_path
 
@@ -3859,8 +4058,8 @@ class MainWindow(
         if hasattr(self, "export_masks_button"):
             self.export_masks_button.setEnabled(bool(self.mask_records))
         self._refresh_pipeline_ui()
-        if self._batch_job_is_running():
-            self._set_batch_controls_busy(True)
+        if self._save_job_is_running():
+            self._set_save_controls_busy(True)
 
     def choose_folder(self) -> None:
         start_dir = str(self.current_folder) if str(self.current_folder) not in {"", "."} and self.current_folder.exists() else str(Path.cwd())
@@ -4021,6 +4220,8 @@ class MainWindow(
         self._load_matching_csv(video_path)
         self._load_frame(1)
         self._update_frame_label(1)
+        if previous_state is not None and previous_state.path != video_path:
+            self._clear_mask_undo_stacks()
         if cleared_mask_layers:
             self._show_video_mask_reset_notice(
                 previous_state.width,
@@ -4394,6 +4595,514 @@ class MainWindow(
         self._save_settings()
         self._refresh_output_ui()
 
+
+    @staticmethod
+    def _copy_mask_payload(mask: np.ndarray | None) -> np.ndarray | None:
+        return None if mask is None else mask.copy().astype(np.uint8)
+
+    def _clear_mask_undo_stacks(self) -> None:
+        for stack in self._mask_undo_stacks.values():
+            stack.clear()
+        self._interpolation_free_undo_open = False
+        self._occlusion_free_undo_open = False
+        self._occlusion_transform_undo_open = False
+
+    def _active_mask_undo_key(self) -> str | None:
+        return {
+            self.TAB_INTERPOLATION: "interpolation",
+            self.TAB_CHAMBER: "chamber",
+            self.TAB_CIRCLE: "circle",
+            self.TAB_OCCLUSION: "occlusion",
+        }.get(self.mode_tabs.currentIndex())
+
+    def _push_mask_undo_snapshot(self, tab_key: str, label: str, payload: object) -> None:
+        if self._mask_undo_restoring:
+            return
+        stack = self._mask_undo_stacks.get(tab_key)
+        if stack is None:
+            return
+        stack.append(MaskUndoSnapshot(tab_key=tab_key, label=label, payload=payload))
+        overflow = len(stack) - self._mask_undo_limit
+        if overflow > 0:
+            del stack[:overflow]
+
+    def _push_interpolation_undo(self, label: str = "edit interpolation region") -> None:
+        self._push_mask_undo_snapshot(
+            "interpolation",
+            label,
+            self._copy_mask_payload(self.interpolation_mask),
+        )
+
+    def _push_chamber_undo(self, label: str = "edit chamber mask") -> None:
+        self._push_mask_undo_snapshot(
+            "chamber",
+            label,
+            {
+                "chamber_mask": self._copy_mask_payload(self.chamber_mask),
+                "boundary_mode": getattr(self, "chamber_boundary_mode", "unset"),
+                "selected_room_name": self.selected_room_name,
+                "rooms": {
+                    name: room.mask.copy().astype(np.uint8)
+                    for name, room in self.room_records.items()
+                },
+            },
+        )
+
+    def _circle_undo_payload(self) -> dict[str, object]:
+        return {
+            "circle_start": None if self.frame_viewer.circle_start is None else tuple(self.frame_viewer.circle_start),
+            "circle_end": None if self.frame_viewer.circle_end is None else tuple(self.frame_viewer.circle_end),
+            "margin": int(self.circle_margin_slider.value()),
+        }
+
+    def _push_circle_undo(self, label: str = "edit circle mask") -> None:
+        self._push_mask_undo_snapshot("circle", label, self._circle_undo_payload())
+
+    def _push_occlusion_undo(self, label: str = "edit occlusion mask") -> None:
+        self._push_mask_undo_snapshot(
+            "occlusion",
+            label,
+            {
+                "selected_mask_name": self.selected_mask_name,
+                "masks": {
+                    name: record.mask.copy().astype(np.uint8)
+                    for name, record in self.mask_records.items()
+                },
+            },
+        )
+
+    def _restore_interpolation_undo(self, payload: object) -> None:
+        mask = None if payload is None else np.asarray(payload).copy().astype(np.uint8)
+        self._set_interpolation_mask(mask, refresh=True, reset_transform_source=True)
+
+    def _restore_chamber_undo(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        chamber_mask = payload.get("chamber_mask")
+        self.chamber_mask = (
+            None
+            if chamber_mask is None
+            else (np.asarray(chamber_mask) > 0).astype(np.uint8)
+        )
+        self._set_chamber_boundary_mode(str(payload.get("boundary_mode", "unset")))
+        rooms = payload.get("rooms", {})
+        if isinstance(rooms, dict):
+            for name, mask in rooms.items():
+                room = self.room_records.get(str(name))
+                if room is not None:
+                    room.mask = (np.asarray(mask) > 0).astype(np.uint8)
+        selected_name = payload.get("selected_room_name")
+        if isinstance(selected_name, str) and selected_name in self.room_records:
+            self.selected_room_name = selected_name
+        elif self.selected_room_name not in self.room_records:
+            self.selected_room_name = sorted(self.room_records)[0] if self.room_records else None
+        self._invalidate_chamber_transform_source()
+        self._rebuild_room_list()
+        self._refresh_chamber_viewer(refresh=True)
+        self._refresh_chamber_ui()
+        if self.mode_tabs.currentIndex() == self.TAB_CHAMBER:
+            self._sync_chamber_mode()
+
+    def _restore_circle_undo(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        margin = int(payload.get("margin", 0))
+        margin = max(
+            self.circle_margin_slider.minimum(),
+            min(self.circle_margin_slider.maximum(), margin),
+        )
+        self._set_circle_margin_value(margin)
+        start = payload.get("circle_start")
+        end = payload.get("circle_end")
+        self.frame_viewer.circle_start = None if start is None else tuple(start)
+        self.frame_viewer.circle_end = None if end is None else tuple(end)
+        self.frame_viewer._circle_current = None
+        self.frame_viewer._circle_dragging = False
+        self.frame_viewer._circle_move_dragging = False
+        self.frame_viewer._circle_move_last_point = None
+        self.frame_viewer.update()
+        self.frame_viewer.circle_changed.emit()
+        self._refresh_circle_ui()
+        self._save_settings()
+
+    def _restore_occlusion_undo(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        masks = payload.get("masks", {})
+        if isinstance(masks, dict):
+            for name, mask in masks.items():
+                record = self.mask_records.get(str(name))
+                if record is not None:
+                    record.mask = (np.asarray(mask) > 0).astype(np.uint8)
+        selected_name = payload.get("selected_mask_name")
+        if isinstance(selected_name, str) and selected_name in self.mask_records:
+            self.selected_mask_name = selected_name
+        elif self.selected_mask_name not in self.mask_records:
+            self.selected_mask_name = sorted(self.mask_records)[0] if self.mask_records else None
+        self._invalidate_mask_transform_source()
+        self._rebuild_mask_list()
+        self.frame_viewer.set_mask_records(self.mask_records, self.selected_mask_name, refresh=True)
+        self._refresh_mask_ui()
+
+    def undo_active_mask_edit(self) -> None:
+        tab_key = self._active_mask_undo_key()
+        if tab_key is None:
+            self.statusBar().showMessage("Undo is available in Interpolation, Chamber, Circle, and Occlusion tabs.", 3000)
+            return
+        stack = self._mask_undo_stacks.get(tab_key, [])
+        if not stack:
+            self.statusBar().showMessage("Nothing to undo in this tab.", 2500)
+            return
+        snapshot = stack.pop()
+        self._mask_undo_restoring = True
+        try:
+            if snapshot.tab_key == "interpolation":
+                self._restore_interpolation_undo(snapshot.payload)
+            elif snapshot.tab_key == "chamber":
+                self._restore_chamber_undo(snapshot.payload)
+            elif snapshot.tab_key == "circle":
+                self._restore_circle_undo(snapshot.payload)
+            elif snapshot.tab_key == "occlusion":
+                self._restore_occlusion_undo(snapshot.payload)
+        finally:
+            self._mask_undo_restoring = False
+            self._interpolation_free_undo_open = False
+            self._occlusion_free_undo_open = False
+            self._occlusion_transform_undo_open = False
+        self.statusBar().showMessage(f"Undid {snapshot.label}.", 2500)
+
+    def clear_circle_with_undo(self) -> None:
+        if self.frame_viewer.circle_geometry() is not None:
+            self._push_circle_undo("clear circle")
+        self.frame_viewer.clear_circle()
+
+    def _show_annotate_mask_context_menu(self, payload: object) -> None:
+        if self.mode_tabs.currentIndex() not in {
+            self.TAB_CHAMBER,
+            self.TAB_CIRCLE,
+            self.TAB_OCCLUSION,
+        }:
+            return
+        global_pos = None
+        image_point = None
+        if isinstance(payload, tuple) and len(payload) >= 1:
+            global_pos = payload[0]
+            if len(payload) >= 2:
+                image_point = payload[1]
+        if not isinstance(global_pos, QPoint):
+            global_pos = self.frame_viewer.mapToGlobal(self.frame_viewer.rect().center())
+
+        if self.mode_tabs.currentIndex() == self.TAB_OCCLUSION and image_point is not None:
+            mask_name = self.frame_viewer._mask_name_at_point(image_point, margin=8)
+            if mask_name is not None:
+                self._on_occ_mask_double_clicked(mask_name)
+
+        copy_item = self._active_mask_clipboard_item()
+        paste_label, paste_enabled = self._mask_paste_action_state()
+
+        menu = QMenu(self)
+        copy_action = menu.addAction(
+            "Copy Mask" if copy_item is None else f"Copy Mask: {copy_item.label}"
+        )
+        copy_action.setEnabled(copy_item is not None)
+        copy_action.triggered.connect(self.copy_active_mask_to_clipboard)
+        paste_action = menu.addAction(paste_label)
+        paste_action.setEnabled(paste_enabled)
+        paste_action.triggered.connect(self.paste_mask_from_clipboard)
+        menu.exec(global_pos)
+
+    def _active_mask_clipboard_item(self) -> MaskClipboardItem | None:
+        if self.video_state is None:
+            return None
+        tab_index = self.mode_tabs.currentIndex()
+        if tab_index == self.TAB_CHAMBER:
+            if self.chamber_edit_chamber_radio.isChecked():
+                if self.chamber_mask is None or not np.any(self.chamber_mask):
+                    return None
+                return MaskClipboardItem(
+                    label="chamber",
+                    source="Chamber",
+                    mask=self.chamber_mask.copy().astype(np.uint8),
+                    color_name="#d1d5db",
+                )
+            current = self._selected_room()
+            if current is None:
+                return None
+            effective = self._effective_room_records_dict().get(current.name)
+            mask = current.mask if effective is None else effective.mask
+            if not np.any(mask):
+                return None
+            return MaskClipboardItem(
+                label=current.name,
+                source="Chamber",
+                mask=mask.copy().astype(np.uint8),
+                color_name=current.color.name(),
+            )
+
+        if tab_index == self.TAB_CIRCLE:
+            geometry = self.frame_viewer.circle_geometry()
+            if geometry is None:
+                return None
+            center, base_radius, adjusted_radius = geometry
+            return MaskClipboardItem(
+                label="circle",
+                source="Circle",
+                mask=build_circle_mask(
+                    self.video_state.width,
+                    self.video_state.height,
+                    center,
+                    adjusted_radius,
+                ),
+                color_name="#ef4444",
+                circle_center=center,
+                circle_base_radius=base_radius,
+                circle_margin=int(self.circle_margin_slider.value()),
+            )
+
+        if tab_index == self.TAB_OCCLUSION:
+            current = self._selected_mask()
+            if current is None or not np.any(current.mask):
+                return None
+            return MaskClipboardItem(
+                label=current.name,
+                source="Occlusion",
+                mask=current.mask.copy().astype(np.uint8),
+                color_name=current.color.name(),
+                margin=int(current.margin),
+                margin_mode=current.margin_mode,
+            )
+        return None
+
+    def copy_active_mask_to_clipboard(self) -> None:
+        item = self._active_mask_clipboard_item()
+        if item is None:
+            self.statusBar().showMessage("No mask available to copy.", 3000)
+            return
+        self._mask_clipboard = item
+        self.statusBar().showMessage(
+            f"Copied {item.source} mask: {item.label}", 3000
+        )
+
+    def _mask_clipboard_for_current_video(self) -> np.ndarray | None:
+        item = self._mask_clipboard
+        if item is None or self.video_state is None:
+            return None
+        mask = (item.mask > 0).astype(np.uint8)
+        target_shape = (self.video_state.height, self.video_state.width)
+        if mask.shape != target_shape:
+            mask = cv2.resize(
+                mask,
+                (self.video_state.width, self.video_state.height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        return (mask > 0).astype(np.uint8)
+
+    def _scaled_clipboard_circle_geometry(self) -> tuple[tuple[float, float], float, int] | None:
+        item = self._mask_clipboard
+        if (
+            item is None
+            or self.video_state is None
+            or item.circle_center is None
+            or item.circle_base_radius is None
+        ):
+            return None
+        source_height, source_width = item.mask.shape[:2]
+        scale_x = self.video_state.width / max(1.0, float(source_width))
+        scale_y = self.video_state.height / max(1.0, float(source_height))
+        radius_scale = (scale_x + scale_y) / 2.0
+        center = (
+            float(item.circle_center[0]) * scale_x,
+            float(item.circle_center[1]) * scale_y,
+        )
+        margin = int(round(float(item.circle_margin) * radius_scale))
+        return center, max(1.0, float(item.circle_base_radius) * radius_scale), margin
+
+    def _mask_paste_action_state(self) -> tuple[str, bool]:
+        if self._mask_clipboard is None:
+            return "Paste Mask (clipboard empty)", False
+        if self.video_state is None:
+            return "Paste Mask (load a video first)", False
+        tab_index = self.mode_tabs.currentIndex()
+        if tab_index == self.TAB_CIRCLE:
+            if self._scaled_clipboard_circle_geometry() is not None:
+                return f"Paste Mask to Circle: {self._mask_clipboard.label}", True
+            mask = self._mask_clipboard_for_current_video()
+            if mask is not None and infer_circular_mask_geometry(mask) is not None:
+                return f"Paste Mask to Circle: {self._mask_clipboard.label}", True
+            return "Paste Mask to Circle (circle masks only)", False
+        if tab_index == self.TAB_CHAMBER:
+            target = "Chamber" if self.chamber_edit_chamber_radio.isChecked() else "Room"
+            return f"Paste Mask to {target}: {self._mask_clipboard.label}", True
+        if tab_index == self.TAB_OCCLUSION:
+            return f"Paste Mask to Occlusion: {self._mask_clipboard.label}", True
+        return "Paste Mask", False
+
+    def paste_mask_from_clipboard(self) -> None:
+        if self._mask_clipboard is None:
+            self.statusBar().showMessage("Copy a mask first.", 3000)
+            return
+        if self.video_state is None:
+            QMessageBox.information(self, "Paste Mask", "Load a video first.")
+            return
+        tab_index = self.mode_tabs.currentIndex()
+        if tab_index == self.TAB_CHAMBER:
+            self._paste_mask_to_chamber()
+        elif tab_index == self.TAB_CIRCLE:
+            self._paste_mask_to_circle()
+        elif tab_index == self.TAB_OCCLUSION:
+            self._paste_mask_to_occlusion()
+
+    def _paste_mask_to_chamber(self) -> None:
+        item = self._mask_clipboard
+        mask = self._mask_clipboard_for_current_video()
+        if item is None or mask is None or not np.any(mask):
+            QMessageBox.information(self, "Paste Mask", "Copied mask is empty.")
+            return
+
+        self._invalidate_chamber_transform_source()
+        if self.chamber_edit_chamber_radio.isChecked():
+            self._push_chamber_undo("paste chamber mask")
+            self.chamber_mask = mask.copy().astype(np.uint8)
+            self._set_chamber_boundary_mode(
+                "full_frame" if self._is_full_frame_chamber_mask() else "custom"
+            )
+            self.frame_viewer.clear_chamber_rect_points()
+            self.frame_viewer.clear_chamber_circle()
+            self._refresh_chamber_viewer(refresh=True)
+            self._refresh_chamber_ui()
+            self.statusBar().showMessage(
+                f"Pasted mask into chamber boundary: {item.label}", 3000
+            )
+            return
+
+        if self.chamber_mask is None or not np.any(self.chamber_mask):
+            QMessageBox.information(
+                self,
+                "Paste Mask",
+                "Define the chamber area before pasting into a room.",
+            )
+            return
+
+        current = self._selected_room()
+        paste_replaces_existing_room = current is not None
+        if current is None:
+            name = self._next_available_room_name(item.label)
+            color = QColor(item.color_name)
+            if not color.isValid():
+                color = MASK_PALETTE[len(self.room_records) % len(MASK_PALETTE)]
+            current = RoomRecord(
+                name=name,
+                color=color,
+                mask=np.zeros(
+                    (self.video_state.height, self.video_state.width),
+                    dtype=np.uint8,
+                ),
+            )
+            self.room_records[name] = current
+            self.selected_room_name = name
+            self.chamber_edit_room_radio.setChecked(True)
+
+        blocked = self._occupied_room_mask(exclude_name=current.name)
+        allowed = (mask > 0) & self.chamber_mask.astype(bool)
+        if blocked is not None:
+            allowed &= ~blocked.astype(bool)
+        if not np.any(allowed):
+            QMessageBox.information(
+                self,
+                "Paste Mask",
+                "The pasted mask has no pixels available inside the chamber.",
+            )
+            return
+        if paste_replaces_existing_room:
+            self._push_chamber_undo("paste room mask")
+        current.mask = allowed.astype(np.uint8)
+        self.selected_room_name = current.name
+        self._rebuild_room_list()
+        self.statusBar().showMessage(
+            f"Pasted mask into room: {current.name}", 3000
+        )
+
+    def _paste_mask_to_occlusion(self) -> None:
+        item = self._mask_clipboard
+        mask = self._mask_clipboard_for_current_video()
+        if item is None or mask is None or not np.any(mask):
+            QMessageBox.information(self, "Paste Mask", "Copied mask is empty.")
+            return
+
+        current = self._selected_mask()
+        paste_replaces_existing_mask = current is not None
+        if current is None:
+            name = self._next_available_mask_name(item.label)
+            color = QColor(item.color_name)
+            if not color.isValid():
+                color = MASK_PALETTE[len(self.mask_records) % len(MASK_PALETTE)]
+            current = MaskRecord(
+                name=name,
+                color=color,
+                mask=np.zeros(
+                    (self.video_state.height, self.video_state.width),
+                    dtype=np.uint8,
+                ),
+                margin=(
+                    int(item.margin)
+                    if item.source == "Occlusion"
+                    else self.default_mask_margin
+                ),
+                margin_mode=(
+                    item.margin_mode
+                    if item.source == "Occlusion"
+                    else self.default_mask_margin_mode
+                ),
+            )
+            self.mask_records[name] = current
+            self.selected_mask_name = name
+
+        if paste_replaces_existing_mask:
+            self._push_occlusion_undo("paste occlusion mask")
+        self._invalidate_mask_transform_source(current.name)
+        current.mask = mask.copy().astype(np.uint8)
+        self._rebuild_mask_list()
+        self.statusBar().showMessage(
+            f"Pasted mask into occlusion: {current.name}", 3000
+        )
+
+    def _paste_mask_to_circle(self) -> None:
+        item = self._mask_clipboard
+        if item is None:
+            return
+        scaled_geometry = self._scaled_clipboard_circle_geometry()
+        if scaled_geometry is None:
+            mask = self._mask_clipboard_for_current_video()
+            geometry = None if mask is None else infer_circular_mask_geometry(mask)
+            if geometry is None:
+                QMessageBox.information(
+                    self,
+                    "Paste Mask",
+                    "Circle tab can only paste masks that are circular.",
+                )
+                return
+            center, base_radius = geometry
+            margin = 0
+        else:
+            center, base_radius, margin = scaled_geometry
+
+        margin = max(
+            self.circle_margin_slider.minimum(),
+            min(self.circle_margin_slider.maximum(), int(margin)),
+        )
+        self._push_circle_undo("paste circle mask")
+        self._set_circle_margin_value(margin)
+        self.frame_viewer.circle_start = (center[0] - base_radius, center[1])
+        self.frame_viewer.circle_end = (center[0] + base_radius, center[1])
+        self.frame_viewer.update()
+        self.frame_viewer.circle_changed.emit()
+        self._refresh_circle_ui()
+        self._save_settings()
+        self.statusBar().showMessage(
+            f"Pasted mask into circle: {item.label}", 3000
+        )
+
+
     def _refresh_mask_draft_ui(self) -> None:
         self._refresh_output_ui()
 
@@ -4427,6 +5136,7 @@ class MainWindow(
         dx, dy = self._clamp_mask_shift(current.mask.astype(np.uint8), dx, dy)
         if dx == 0 and dy == 0:
             return
+        self._push_occlusion_undo("move occlusion mask")
         self._invalidate_mask_transform_source(current.name)
         translated = np.zeros_like(current.mask)
         src_x0 = max(0, -dx)
@@ -4439,7 +5149,7 @@ class MainWindow(
         dst_y1 = dst_y0 + (src_y1 - src_y0)
         if src_x1 > src_x0 and src_y1 > src_y0:
             translated[dst_y0:dst_y1, dst_x0:dst_x1] = current.mask[src_y0:src_y1, src_x0:src_x1]
-            current.mask = translated
+            current.mask = smooth_binary_mask_low(translated)
 
     def _invalidate_mask_transform_source(self, mask_name: str | None = None) -> None:
         if mask_name is not None and mask_name != self._mask_transform_source_name:
@@ -4486,9 +5196,10 @@ class MainWindow(
         transformed = source.render(next_angle, next_scale)
         if not np.any(transformed):
             return
+        self._push_occlusion_undo("transform occlusion mask")
         self._mask_transform_angle = next_angle
         self._mask_transform_scale = next_scale
-        current.mask = transformed
+        current.mask = smooth_binary_mask_low(transformed)
         self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
 
     def scale_selected_mask(self, scale_factor: float) -> None:
@@ -4565,22 +5276,360 @@ class MainWindow(
         self.rotate_selected_mask(angle_degrees)
         self._refresh_mask_ui()
 
-    def save_current_mode_output(self) -> None:
+    def _write_csv_output(
+        self,
+        output_path: Path,
+        dataframe: pd.DataFrame,
+        should_cancel=None,
+    ) -> Path:
+        raise_if_cancelled(should_cancel)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        raise_if_cancelled(should_cancel)
+        dataframe.to_csv(output_path, index=False)
+        return output_path
+
+    def _current_mode_save_task(self):
         index = self.mode_tabs.currentIndex()
         if index == self.TAB_TRACKING_REPAIR:
-            self.save_tracking_repair_csv()
-        elif index == self.TAB_INTERPOLATION:
-            self.save_interpolated_csv()
-        elif index == self.TAB_SQUARE:
-            self.save_normalized_csv()
-        elif index == self.TAB_CHAMBER:
-            self.save_chamber_outputs()
-        elif index == self.TAB_CIRCLE:
-            self.save_circle_detection_csv()
-        elif index == self.TAB_OCCLUSION:
-            self.save_occlusion_csv()
+            if self.csv_df is None or self.video_state is None:
+                QMessageBox.warning(self, "Tracking Repair", "Load a video and CSV first.")
+                return None
+            output = self._tracking_repair_output_path()
+            if output is None:
+                return None
+            source_df = self.csv_df.copy()
+            bodyparts = list(self.bodyparts)
+            width = int(self.video_state.width)
+            height = int(self.video_state.height)
+            config = self._tracking_repair_config()
+            stats: dict[str, int] = {"input_rows": len(source_df)}
+
+            def _export_item(*, should_cancel=None) -> Path:
+                raise_if_cancelled(should_cancel)
+                repair_result = self._run_tracking_repair_for(
+                    source_df,
+                    bodyparts,
+                    width,
+                    height,
+                    config=config,
+                )
+                stats.update(
+                    output_rows=len(repair_result.dataframe),
+                    duplicates=repair_result.duplicate_removed,
+                    z_outliers=repair_result.length_outliers_invalidated,
+                )
+                return self._write_csv_output(output, repair_result.dataframe, should_cancel)
+
+            def _completed(result) -> None:
+                if getattr(result, "cancelled", False):
+                    self.statusBar().showMessage("Tracking postprocess save cancelled.")
+                    return
+                self.statusBar().showMessage(
+                    f"Tracking postprocess CSV saved: {output} "
+                    f"({stats.get('input_rows', 0):,} ? {stats.get('output_rows', 0):,} rows; "
+                    f"duplicates removed={stats.get('duplicates', 0):,}, "
+                    f"Z-score skeletons invalidated={stats.get('z_outliers', 0):,})"
+                )
+
+            return (
+                "Save CSV Progress",
+                "Saving tracking postprocess CSV in the background...",
+                _export_item,
+                _completed,
+            )
+
+        if index == self.TAB_INTERPOLATION:
+            if self.csv_df is None or self.video_state is None or not self.bodyparts:
+                QMessageBox.warning(self, "Interpolation", "Load a video and CSV first.")
+                return None
+            removal_mode = self._selected_interpolation_removal_mode()
+            anchor = self._selected_interpolation_anchor()
+            interpolate = self._interpolation_enabled()
+            if removal_mode != "none" and not self._has_interpolation_region():
+                QMessageBox.warning(self, "Interpolation", "Draw an automatic-removal region first.")
+                return None
+            if removal_mode != "none" and anchor is None:
+                QMessageBox.warning(self, "Interpolation", "Select an anchor node for automatic removal.")
+                return None
+            if removal_mode == "none" and not interpolate:
+                QMessageBox.warning(self, "Interpolation", "Enable automatic removal or interpolation first.")
+                return None
+            output = self._interpolation_output_path()
+            if output is None:
+                return None
+            source_df = self.csv_df.copy()
+            bodyparts = list(self.bodyparts)
+            mask = None if self.interpolation_mask is None else self.interpolation_mask.copy().astype(np.uint8)
+            width = int(self.video_state.width)
+            height = int(self.video_state.height)
+            extrapolate = self._interpolation_extrapolation_enabled()
+
+            def _export_item(*, should_cancel=None) -> Path:
+                raise_if_cancelled(should_cancel)
+                result_df = build_interpolation_pipeline_dataframe(
+                    source_df,
+                    bodyparts,
+                    mask,
+                    width,
+                    height,
+                    removal_mode,
+                    anchor,
+                    interpolate,
+                    extrapolate,
+                )
+                return self._write_csv_output(output, result_df, should_cancel)
+
+            def _completed(result) -> None:
+                if getattr(result, "cancelled", False):
+                    self.statusBar().showMessage("Removal/interpolation save cancelled.")
+                    return
+                self.statusBar().showMessage(f"Removal/interpolation pipeline CSV saved: {output}")
+
+            return (
+                "Save CSV Progress",
+                "Saving removal/interpolation CSV in the background...",
+                _export_item,
+                _completed,
+            )
+
+        if index == self.TAB_SQUARE:
+            if self.csv_df is None or self.video_state is None:
+                QMessageBox.warning(self, "Save", "Load a video and CSV first.")
+                return None
+            output = self._normalized_output_path()
+            if output is None:
+                return None
+            source_df = self.csv_df.copy()
+            bodyparts = list(self.bodyparts)
+            square_points = [tuple(point) for point in self.frame_viewer.square_points]
+            width = int(self.video_state.width)
+            height = int(self.video_state.height)
+
+            def _export_item(*, should_cancel=None) -> Path:
+                raise_if_cancelled(should_cancel)
+                result_df = build_normalized_dataframe(
+                    source_df,
+                    bodyparts,
+                    square_points,
+                    width,
+                    height,
+                )
+                return self._write_csv_output(output, result_df, should_cancel)
+
+            def _completed(result) -> None:
+                if getattr(result, "cancelled", False):
+                    self.statusBar().showMessage("Normalized CSV save cancelled.")
+                    return
+                self.statusBar().showMessage(f"Normalized CSV saved: {output}")
+
+            return (
+                "Save CSV Progress",
+                "Saving normalized CSV in the background...",
+                _export_item,
+                _completed,
+            )
+
+        if index == self.TAB_CHAMBER:
+            if self.video_state is None or self.csv_df is None:
+                QMessageBox.warning(self, "Save", "Load a video and CSV first.")
+                return None
+            if self.chamber_mask is None or not np.any(self.chamber_mask):
+                QMessageBox.warning(self, "Save", "Define the chamber area first.")
+                return None
+            if not self.room_records:
+                QMessageBox.warning(self, "Save", "Add at least one room first.")
+                return None
+            csv_output = self._chamber_csv_output_path()
+            mask_output = self._chamber_mask_output_path()
+            overlay_output = self._chamber_overlay_output_path()
+            manifest_output = self._chamber_manifest_output_path()
+            if csv_output is None or mask_output is None or overlay_output is None or manifest_output is None:
+                return None
+            mask_rgb = self._chamber_mask_rgb()
+            overlay_rgb = self._chamber_overlay_rgb()
+            if mask_rgb is None or overlay_rgb is None:
+                QMessageBox.warning(self, "Save", "A frame and chamber mask are required.")
+                return None
+            source_df = self.csv_df.copy()
+            bodyparts = list(self.bodyparts)
+            width = int(self.video_state.width)
+            height = int(self.video_state.height)
+            rooms = [
+                RoomRecord(
+                    name=room.name,
+                    color=QColor(room.color),
+                    mask=room.mask.copy().astype(np.uint8),
+                )
+                for room in self._effective_room_records()
+            ]
+            room_metadata = [
+                {"name": room.name, "color": room.color.name()}
+                for room in self.room_records.values()
+            ]
+            boundary_mode = self._resolved_chamber_boundary_mode()
+            mask_rgb = mask_rgb.copy()
+            overlay_rgb = overlay_rgb.copy()
+
+            def _export_item(*, should_cancel=None) -> Path:
+                raise_if_cancelled(should_cancel)
+                result_df = build_chamber_mark_dataframe(
+                    source_df,
+                    bodyparts,
+                    rooms,
+                    width,
+                    height,
+                )
+                raise_if_cancelled(should_cancel)
+                csv_output.parent.mkdir(parents=True, exist_ok=True)
+                raise_if_cancelled(should_cancel)
+                result_df.to_csv(csv_output, index=False)
+                if not cv2.imwrite(str(mask_output), cv2.cvtColor(mask_rgb, cv2.COLOR_RGB2BGR)):
+                    raise OSError(f"Could not write {mask_output}")
+                if not cv2.imwrite(str(overlay_output), cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)):
+                    raise OSError(f"Could not write {overlay_output}")
+                metadata = {
+                    "format": "happycold_chamber_mask_v1",
+                    "width": width,
+                    "height": height,
+                    "boundary_mode": boundary_mode,
+                    "rooms": room_metadata,
+                }
+                manifest_output.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+                return csv_output
+
+            def _completed(result) -> None:
+                if getattr(result, "cancelled", False):
+                    self.statusBar().showMessage("Chamber output save cancelled.")
+                    return
+                self.statusBar().showMessage(f"Chamber outputs saved: {csv_output}")
+
+            return (
+                "Save CSV Progress",
+                "Saving chamber outputs in the background...",
+                _export_item,
+                _completed,
+            )
+
+        if index == self.TAB_CIRCLE:
+            if self.csv_df is None or self.video_state is None:
+                QMessageBox.warning(self, "Save", "Load a video and CSV first.")
+                return None
+            geometry = self.frame_viewer.circle_geometry()
+            if geometry is None:
+                QMessageBox.warning(self, "Save", "Draw a circle first.")
+                return None
+            center, _, adjusted_radius = geometry
+            output = self._circle_output_path()
+            if output is None:
+                return None
+            source_df = self.csv_df.copy()
+            bodyparts = list(self.bodyparts)
+            width = int(self.video_state.width)
+            height = int(self.video_state.height)
+
+            def _export_item(*, should_cancel=None) -> Path:
+                raise_if_cancelled(should_cancel)
+                result_df = build_circle_detection_dataframe(
+                    source_df,
+                    bodyparts,
+                    center,
+                    adjusted_radius,
+                    width,
+                    height,
+                )
+                return self._write_csv_output(output, result_df, should_cancel)
+
+            def _completed(result) -> None:
+                if getattr(result, "cancelled", False):
+                    self.statusBar().showMessage("Detection CSV save cancelled.")
+                    return
+                self.statusBar().showMessage(f"Detection CSV saved: {output}")
+
+            return (
+                "Save CSV Progress",
+                "Saving circle detection CSV in the background...",
+                _export_item,
+                _completed,
+            )
+
+        if index == self.TAB_OCCLUSION:
+            if self.csv_df is None or self.video_state is None or not self.mask_records:
+                QMessageBox.warning(self, "Save", "Load video/CSV and prepare masks first.")
+                return None
+            if any(record.margin_mode == "geometric" for record in self.mask_records.values()) and len(self.frame_viewer.occ_margin_points) != 4:
+                QMessageBox.warning(self, "Save", "Geometric margin mode needs four occlusion geometric points.")
+                return None
+            output = self._occlusion_output_path()
+            if output is None:
+                return None
+            source_df = self.csv_df.copy()
+            bodyparts = list(self.bodyparts)
+            masks = [
+                MaskRecord(
+                    name=record.name,
+                    color=QColor(record.color),
+                    mask=record.mask.copy().astype(np.uint8),
+                    margin=int(record.margin),
+                    margin_mode=str(record.margin_mode),
+                )
+                for record in self.mask_records.values()
+            ]
+            width = int(self.video_state.width)
+            height = int(self.video_state.height)
+            occ_margin_points = [tuple(point) for point in self.frame_viewer.occ_margin_points]
+
+            def _export_item(*, should_cancel=None) -> Path:
+                raise_if_cancelled(should_cancel)
+                result_df = build_occlusion_dataframe(
+                    source_df,
+                    bodyparts,
+                    masks,
+                    width,
+                    height,
+                    occ_margin_points,
+                )
+                return self._write_csv_output(output, result_df, should_cancel)
+
+            def _completed(result) -> None:
+                if getattr(result, "cancelled", False):
+                    self.statusBar().showMessage("Occlusion CSV save cancelled.")
+                    return
+                self.statusBar().showMessage(f"Occlusion CSV saved: {output}")
+
+            return (
+                "Save CSV Progress",
+                "Saving occlusion CSV in the background...",
+                _export_item,
+                _completed,
+            )
+
+        return None
+
+    def save_current_mode_output(self) -> None:
+        if self._focus_active_save_progress():
+            return
+        task = self._current_mode_save_task()
+        if task is None:
+            return
+        title, activity_text, export_item, on_completed = task
+        self._start_single_save_export(
+            title=title,
+            activity_text=activity_text,
+            export_item=export_item,
+            on_completed=on_completed,
+        )
 
     def closeEvent(self, event) -> None:
+        active_thread = getattr(self, "_active_single_save_thread", None)
+        if active_thread is not None and active_thread.isRunning():
+            self._request_active_single_save_cancel()
+            dialog = getattr(self, "_active_single_save_dialog", None)
+            if dialog is not None:
+                dialog.show()
+                dialog.raise_()
+                dialog.activateWindow()
+            event.ignore()
+            return
         active_thread = getattr(self, "_active_batch_thread", None)
         if active_thread is not None and active_thread.isRunning():
             self._request_active_batch_cancel()

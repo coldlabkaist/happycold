@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from batch import BatchItem, BatchRunResult
+from batch import BatchItem, BatchRunResult, raise_if_cancelled
 from interpolation import build_interpolation_pipeline_dataframe
 from pipeline import (
     DataFramePipelineStage,
@@ -493,22 +493,10 @@ class PipelinePanelMixin:
         preview_form.addRow("Preview", self.pipeline_output_preview_label)
         layout.addLayout(preview_form)
 
-        output_note = QLabel(
-            "The source CSV is never changed. Duplicate rows may be removed in the new CSV; repair stages "
-            "update working coordinates, while normalization and analysis append columns."
-        )
-        output_note.setWordWrap(True)
-        output_note.setProperty("muted", True)
-        layout.addWidget(output_note)
-
         self.pipeline_status_label = QLabel("Select at least one stage.")
         self.pipeline_status_label.setWordWrap(True)
         self.pipeline_status_label.setProperty("muted", True)
         layout.addWidget(self.pipeline_status_label)
-
-        self.pipeline_preview_button = QPushButton("Preview Result")
-        self.pipeline_preview_button.setMinimumWidth(0)
-        layout.addWidget(self.pipeline_preview_button)
 
         run_row = QVBoxLayout()
         run_row.setSpacing(5)
@@ -531,7 +519,6 @@ class PipelinePanelMixin:
         self.pipeline_prefix_edit.editingFinished.connect(self._save_settings)
         self.pipeline_suffix_edit.editingFinished.connect(self._save_settings)
         self.pipeline_choose_save_folder_button.clicked.connect(self.choose_save_folder)
-        self.pipeline_preview_button.clicked.connect(self.preview_pipeline_result)
         self.pipeline_run_current_button.clicked.connect(self.run_current_pipeline)
         self.pipeline_run_batch_button.clicked.connect(self.run_batch_pipeline)
         return panel
@@ -899,7 +886,6 @@ class PipelinePanelMixin:
             )
             self.pipeline_status_label.setToolTip("")
         ready = not errors
-        self.pipeline_preview_button.setEnabled(ready)
         self.pipeline_run_current_button.setEnabled(ready)
         batch_ready = ready and self.video_list.count() > 0
         self.pipeline_run_batch_button.setEnabled(batch_ready)
@@ -908,13 +894,9 @@ class PipelinePanelMixin:
                 "Saving is available when the pipeline is ready.\n\n"
                 + "\n".join(errors)
             )
-            self.pipeline_preview_button.setToolTip(unavailable_tooltip)
             self.pipeline_run_current_button.setToolTip(unavailable_tooltip)
             self.pipeline_run_batch_button.setToolTip(unavailable_tooltip)
         else:
-            self.pipeline_preview_button.setToolTip(
-                "Run the configured stages without writing a CSV and summarize the result."
-            )
             self.pipeline_run_current_button.setToolTip(
                 "Run the validated pipeline and save one combined CSV."
             )
@@ -1141,54 +1123,14 @@ class PipelinePanelMixin:
         self,
         item: BatchItem,
         snapshot: PipelineSnapshot,
+        should_cancel=None,
     ) -> PipelineRunResult:
         stages = self._pipeline_stages_for_item(item, snapshot)
-        return run_dataframe_pipeline(item.source_df, stages)
-
-    def preview_pipeline_result(self) -> None:
-        snapshot = self._capture_pipeline_snapshot()
-        errors = self._pipeline_validation_errors(snapshot)
-        if errors:
-            self._refresh_pipeline_ui()
-            return
-        try:
-            result = self._execute_pipeline_item(self._current_pipeline_item(), snapshot)
-        except Exception as exc:
-            QMessageBox.warning(self, "Pipeline Preview", f"Could not run the pipeline preview.\n\n{exc}")
-            return
-
-        columns = list(result.added_columns)
-        column_lines = columns[:24]
-        if len(columns) > len(column_lines):
-            column_lines.append(f"... and {len(columns) - len(column_lines)} more")
-        stage_lines: list[str] = []
-        for stage in result.stages:
-            changes: list[str] = []
-            if stage.removed_rows:
-                changes.append(f"rows {stage.input_rows:,} → {stage.output_rows:,}")
-            if stage.replaced_columns:
-                changes.append(
-                    f"updated {len(stage.replaced_columns)} working column(s), {stage.changed_cells:,} cell(s)"
-                )
-            appended_count = len(stage.added_columns) + len(stage.derived_columns)
-            if appended_count:
-                changes.append(f"appended {appended_count} column(s)")
-            detail = " · " + " · ".join(changes) if changes else " · no data changes"
-            stage_lines.append(f"{stage.label}: {stage.elapsed_seconds * 1000.0:.1f} ms{detail}")
-        message = (
-            "Source CSV: unchanged\n"
-            f"Rows: {len(self.csv_df):,} → {len(result.dataframe):,}\n"
-            f"Columns: {len(self.csv_df.columns):,} → {len(result.dataframe.columns):,}\n\n"
-            "Stages:\n- "
-            + "\n- ".join(stage_lines)
-        )
-        if result.replaced_columns:
-            message += f"\n\nWorking columns updated: {len(result.replaced_columns)}"
-        if column_lines:
-            message += "\n\nAppended columns:\n- " + "\n- ".join(column_lines)
-        QMessageBox.information(self, "Pipeline Preview", message)
+        return run_dataframe_pipeline(item.source_df, stages, should_cancel=should_cancel)
 
     def run_current_pipeline(self) -> None:
+        if self._focus_active_save_progress():
+            return
         snapshot = self._capture_pipeline_snapshot()
         errors = self._pipeline_validation_errors(snapshot)
         if errors:
@@ -1207,23 +1149,41 @@ class PipelinePanelMixin:
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-        try:
-            result = self._execute_pipeline_item(self._current_pipeline_item(), snapshot)
+
+        item = self._current_pipeline_item()
+        run_stats: dict[str, int] = {}
+
+        def _export_item(*, should_cancel=None) -> Path:
+            raise_if_cancelled(should_cancel)
+            result = self._execute_pipeline_item(item, snapshot, should_cancel=should_cancel)
+            run_stats["columns"] = len(result.dataframe.columns)
+            raise_if_cancelled(should_cancel)
             output_path.parent.mkdir(parents=True, exist_ok=True)
+            raise_if_cancelled(should_cancel)
             result.dataframe.to_csv(output_path, index=False)
-        except Exception as exc:
-            QMessageBox.warning(self, "Run Pipeline", f"Could not save the combined pipeline CSV.\n\n{exc}")
-            return
-        self.statusBar().showMessage(f"Pipeline CSV saved: {output_path}")
-        QMessageBox.information(
-            self,
-            "Run Pipeline",
-            f"Saved a new combined CSV with {len(result.dataframe.columns)} columns. "
-            f"The source CSV was not changed.\n\n{output_path}",
+            return output_path
+
+        def _on_completed(result) -> None:
+            if getattr(result, "cancelled", False):
+                self.statusBar().showMessage("Pipeline save cancelled.")
+                return
+            self.statusBar().showMessage(f"Pipeline CSV saved: {output_path}")
+            QMessageBox.information(
+                self,
+                "Run Pipeline",
+                f"Saved a new combined CSV with {run_stats.get('columns', 0)} columns. "
+                f"\n\n{output_path}",
+            )
+
+        self._start_single_save_export(
+            title="Pipeline Save Progress",
+            activity_text="Running and saving the pipeline in the background...",
+            export_item=_export_item,
+            on_completed=_on_completed,
         )
 
     def run_batch_pipeline(self) -> None:
-        if self._focus_active_batch_progress():
+        if self._focus_active_save_progress():
             return
         snapshot = self._capture_pipeline_snapshot()
         errors = self._pipeline_validation_errors(snapshot)
@@ -1251,14 +1211,17 @@ class PipelinePanelMixin:
         source_width = int(self.video_state.width)
         source_height = int(self.video_state.height)
 
-        def _export_item(item: BatchItem) -> Path:
-            result = self._execute_pipeline_item(item, snapshot)
+        def _export_item(item: BatchItem, should_cancel=None) -> Path:
+            raise_if_cancelled(should_cancel)
+            result = self._execute_pipeline_item(item, snapshot, should_cancel=should_cancel)
+            raise_if_cancelled(should_cancel)
             output_path = save_folder / build_pipeline_output_filename(
                 item.csv_path,
                 prefix,
                 suffix,
             )
             output_path.parent.mkdir(parents=True, exist_ok=True)
+            raise_if_cancelled(should_cancel)
             result.dataframe.to_csv(output_path, index=False)
             return output_path
 

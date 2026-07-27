@@ -94,6 +94,23 @@ def build_app_stylesheet() -> str:
         border: 1px solid {c['border_soft']};
         border-radius: 9px;
     }}
+    QFrame#saveProgressHeader, QFrame#saveProgressFooter {{
+        background: {c['surface']};
+        border: 1px solid {c['border_soft']};
+        border-radius: 10px;
+    }}
+    QLabel#saveProgressTitle {{
+        color: {c['text_strong']};
+        font-size: 15px;
+        font-weight: 700;
+    }}
+    QLabel#saveProgressCounter {{
+        color: {c['text_strong']};
+        font-weight: 600;
+    }}
+    QPlainTextEdit#saveProgressDetails {{
+        background: {c['surface']};
+    }}
     QListWidget#batchVideoList::item {{
         padding: 0;
         border-bottom: 1px solid {c['border_soft']};

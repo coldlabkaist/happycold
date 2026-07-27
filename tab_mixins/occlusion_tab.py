@@ -35,6 +35,7 @@ from shared import (
     fill_polygon,
     order_quad_points,
     paint_brush,
+    smooth_binary_mask_low,
 )
 from ui_controls import NoWheelComboBox, NoWheelSpinBox
 
@@ -295,6 +296,7 @@ class OcclusionTabMixin:
                 ("R  or  ]", "Scale up"),
                 ("Ctrl+E  or  Ctrl+[", "Rotate left (Chamber / Occlusion)"),
                 ("Ctrl+R  or  Ctrl+]", "Rotate right (Chamber / Occlusion)"),
+                ("Ctrl+Z", "Undo the latest mask content edit in the current tab"),
                 ("F1", "Open this shortcut guide"),
             ],
         )
@@ -436,6 +438,8 @@ class OcclusionTabMixin:
     def clear_selected_mask(self) -> None:
         current = self._selected_mask()
         if current is not None:
+            if hasattr(self, "_push_occlusion_undo"):
+                self._push_occlusion_undo("clear occlusion mask")
             self._invalidate_mask_transform_source(current.name)
             current.mask.fill(0)
             self.frame_viewer.set_mask_records(self.mask_records, self.selected_mask_name, refresh=True)
@@ -595,15 +599,21 @@ class OcclusionTabMixin:
     def _finalize_mask_draw(self) -> None:
         current = self._selected_mask()
         if current is not None:
+            current.mask = smooth_binary_mask_low(current.mask)
+            self._invalidate_mask_transform_source(current.name)
             self._last_mask_preview_refresh = 0.0
             self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
+        self._occlusion_free_undo_open = False
         self._refresh_mask_ui()
 
     def _finalize_occ_transform(self) -> None:
         current = self._selected_mask()
         if current is not None:
+            current.mask = smooth_binary_mask_low(current.mask)
+            self._invalidate_mask_transform_source(current.name)
             # Rebuild margin only once after drag/erase transform interaction ends.
             self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
+        self._occlusion_transform_undo_open = False
         self._last_transform_preview_refresh = 0.0
         self._refresh_mask_ui()
 
@@ -611,6 +621,10 @@ class OcclusionTabMixin:
         current = self._selected_mask()
         if current is None or not self.mask_transform_radio.isChecked():
             return
+        if not getattr(self, "_occlusion_transform_undo_open", False):
+            if hasattr(self, "_push_occlusion_undo"):
+                self._push_occlusion_undo("erase transformed occlusion mask")
+            self._occlusion_transform_undo_open = True
         self._invalidate_mask_transform_source(current.name)
         brush_radius = max(1, int(self.mask_brush_slider.value()))
         paint_brush(current.mask, point, point, brush_radius, 0)
@@ -620,6 +634,10 @@ class OcclusionTabMixin:
         current = self._selected_mask()
         if current is None or not self.mask_transform_radio.isChecked():
             return
+        if not getattr(self, "_occlusion_transform_undo_open", False):
+            if hasattr(self, "_push_occlusion_undo"):
+                self._push_occlusion_undo("erase transformed occlusion mask")
+            self._occlusion_transform_undo_open = True
         self._invalidate_mask_transform_source(current.name)
         start, end = payload
         brush_radius = max(1, int(self.mask_brush_slider.value()))
@@ -647,6 +665,8 @@ class OcclusionTabMixin:
             points = payload
         else:
             return
+        if hasattr(self, "_push_occlusion_undo"):
+            self._push_occlusion_undo("draw occlusion rectangle")
         self._invalidate_mask_transform_source(current.name)
         fill_polygon(current.mask, order_quad_points(points).tolist(), 1 if add else 0)
         self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
@@ -664,6 +684,8 @@ class OcclusionTabMixin:
             add = payload[4]
         if start is None or end is None:
             return
+        if hasattr(self, "_push_occlusion_undo"):
+            self._push_occlusion_undo("draw occlusion circle")
         self._invalidate_mask_transform_source(current.name)
         fill_circle_from_diameter(current.mask, start, end, 1 if add else 0)
         self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
@@ -674,6 +696,10 @@ class OcclusionTabMixin:
         current = self._selected_mask()
         if current is None or self.mask_transform_radio.isChecked():
             return
+        if not getattr(self, "_occlusion_free_undo_open", False):
+            if hasattr(self, "_push_occlusion_undo"):
+                self._push_occlusion_undo("brush occlusion mask")
+            self._occlusion_free_undo_open = True
         start, end, add = payload
         self._invalidate_mask_transform_source(current.name)
         paint_brush(current.mask, start, end, self.mask_brush_slider.value(), 1 if add else 0)

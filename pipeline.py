@@ -8,6 +8,8 @@ from typing import Callable
 
 import pandas as pd
 
+from batch import raise_if_cancelled
+
 
 INVALID_FILENAME_CHARACTERS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -111,6 +113,7 @@ def _changed_cell_count(before: pd.Series, after: pd.Series) -> int:
 def run_dataframe_pipeline(
     source_df: pd.DataFrame,
     stages: list[DataFramePipelineStage] | tuple[DataFramePipelineStage, ...],
+    should_cancel: Callable[[], bool] | None = None,
 ) -> PipelineRunResult:
     """Run stages in memory without mutating the source dataframe.
 
@@ -119,14 +122,17 @@ def run_dataframe_pipeline(
     accumulate new result columns. If an append stage changes an existing column,
     that value is stored under a stage-suffixed derived column instead.
     """
+    raise_if_cancelled(should_cancel)
     active_df = source_df.copy()
     summaries: list[PipelineStageSummary] = []
 
     for stage in stages:
+        raise_if_cancelled(should_cancel)
         before_df = active_df
         started_at = time.perf_counter()
         next_df = stage.transform(before_df)
         elapsed_seconds = time.perf_counter() - started_at
+        raise_if_cancelled(should_cancel)
 
         if not isinstance(next_df, pd.DataFrame):
             raise TypeError(f"Pipeline stage '{stage.label}' did not return a DataFrame.")
@@ -201,4 +207,5 @@ def run_dataframe_pipeline(
             )
         )
 
+    raise_if_cancelled(should_cancel)
     return PipelineRunResult(dataframe=active_df, stages=tuple(summaries))

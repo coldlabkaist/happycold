@@ -56,6 +56,51 @@ def infer_circle_geometry_from_mask(
     return (float(center_x), float(center_y)), max(1.0, float(radius))
 
 
+def infer_circular_mask_geometry(
+    mask: np.ndarray,
+    *,
+    min_circularity: float = 0.82,
+    min_fill_ratio: float = 0.82,
+    min_iou: float = 0.78,
+) -> tuple[tuple[float, float], float] | None:
+    """Infer circle geometry only when the binary mask is circle-like enough.
+
+    This stricter helper is used for cross-tab paste into the Circle tool. The
+    looser import path stays unchanged so existing PNG imports remain tolerant.
+    """
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    if binary.ndim != 2 or not np.any(binary):
+        return None
+    component_count, _labels = cv2.connectedComponents(binary)
+    if component_count != 2:
+        return None
+    points = cv2.findNonZero(binary)
+    if points is None:
+        return None
+    (center_x, center_y), radius = cv2.minEnclosingCircle(points)
+    radius = max(1.0, float(radius))
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    perimeter = float(cv2.arcLength(contour, True))
+    if perimeter <= 0:
+        return None
+    area = float(np.count_nonzero(binary))
+    circularity = 4.0 * np.pi * area / (perimeter * perimeter)
+    ideal = build_circle_mask(binary.shape[1], binary.shape[0], (center_x, center_y), radius)
+    ideal_area = float(np.count_nonzero(ideal))
+    if ideal_area <= 0:
+        return None
+    intersection = float(np.count_nonzero((binary > 0) & (ideal > 0)))
+    union = float(np.count_nonzero((binary > 0) | (ideal > 0)))
+    fill_ratio = area / ideal_area
+    iou = intersection / max(1.0, union)
+    if circularity < min_circularity or fill_ratio < min_fill_ratio or iou < min_iou:
+        return None
+    return (float(center_x), float(center_y)), radius
+
+
 def write_circle_mask_bundle(
     mask_path: Path,
     manifest_path: Path,
@@ -262,12 +307,14 @@ class CircleTabMixin:
             for point in (next_start, next_end)
         ):
             return
+        if hasattr(self, "_push_circle_undo"):
+            self._push_circle_undo("scale circle")
         self.frame_viewer.circle_start = next_start
         self.frame_viewer.circle_end = next_end
         self.frame_viewer.update()
         self.frame_viewer.circle_changed.emit()
 
-    def _on_circle_margin_changed(self, value: int) -> None:
+    def _set_circle_margin_value(self, value: int) -> None:
         self.default_circle_margin = int(value)
         if self.circle_margin_slider.value() != value:
             self.circle_margin_slider.blockSignals(True)
@@ -279,6 +326,16 @@ class CircleTabMixin:
             self.circle_margin_spinbox.blockSignals(False)
         if self.mode_tabs.currentIndex() == self.TAB_CIRCLE:
             self.frame_viewer.set_margin_value(float(value))
+
+    def _on_circle_margin_changed(self, value: int) -> None:
+        value = int(value)
+        if (
+            value != int(getattr(self, "default_circle_margin", 0))
+            and self.frame_viewer.circle_geometry() is not None
+            and hasattr(self, "_push_circle_undo")
+        ):
+            self._push_circle_undo("adjust circle margin")
+        self._set_circle_margin_value(value)
         self._refresh_circle_ui()
         self._save_settings()
         self._refresh_output_ui()
@@ -363,7 +420,9 @@ class CircleTabMixin:
             self.circle_margin_slider.minimum(),
             min(self.circle_margin_slider.maximum(), margin),
         )
-        self._on_circle_margin_changed(margin)
+        if hasattr(self, "_push_circle_undo"):
+            self._push_circle_undo("import circle mask")
+        self._set_circle_margin_value(margin)
         self.frame_viewer.circle_start = (center[0] - base_radius, center[1])
         self.frame_viewer.circle_end = (center[0] + base_radius, center[1])
         self.frame_viewer.circle_changed.emit()
