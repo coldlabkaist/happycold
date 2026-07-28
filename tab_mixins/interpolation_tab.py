@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
 )
 
 from interpolation import build_interpolation_pipeline_dataframe
-from shared import MaskTransformSource, fill_polygon, paint_brush
+from shared import MaskTransformSource, fill_polygon, paint_brush, validated_quad_points
 from ui_controls import NoWheelComboBox, NoWheelSpinBox
 
 
@@ -440,7 +440,18 @@ class InterpolationTabMixin:
         mask = self._ensure_interpolation_mask()
         if mask is None:
             return None
-        fill_polygon(mask, points, 1)
+        ordered = validated_quad_points(points) if len(points) == 4 else None
+        if ordered is None:
+            self.statusBar().showMessage("Rectangle needs four distinct corner points.", 3000)
+            self.frame_viewer.clear_interpolation_rect_points()
+            return None
+        ordered_points = ordered.tolist()
+        shape_mask = np.zeros_like(mask, dtype=np.uint8)
+        fill_polygon(shape_mask, ordered_points, 1)
+        mask[:] = np.logical_or(
+            mask.astype(bool),
+            shape_mask.astype(bool),
+        ).astype(np.uint8)
         return mask
 
     def apply_interpolation_circle(self, payload: tuple[tuple[float, float], float]) -> None:

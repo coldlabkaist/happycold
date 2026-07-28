@@ -39,9 +39,11 @@ from shared import (
     MaskRecord,
     RoomRecord,
     build_chamber_mark_dataframe,
+    clone_mask_geometry,
     build_circle_detection_dataframe,
     build_normalized_dataframe,
     build_occlusion_dataframe,
+    scale_mask_geometry,
 )
 from tracking_postprocess import invalidate_length_outlier_skeletons, remove_duplicate_skeletons
 
@@ -108,6 +110,7 @@ class PipelineSnapshot:
     interpolation_enabled: bool
     interpolation_extrapolate: bool
     chamber_mask: np.ndarray | None
+    chamber_geometry: dict | None
     chamber_boundary_mode: str
     rooms: tuple[RoomRecord, ...]
     circle_geometry: tuple[tuple[float, float], float, float] | None
@@ -715,6 +718,7 @@ class PipelinePanelMixin:
                 name=room.name,
                 color=QColor(room.color),
                 mask=room.mask.copy().astype(np.uint8),
+                geometry=clone_mask_geometry(room.geometry),
             )
             for room in self._effective_room_records()
         )
@@ -725,6 +729,7 @@ class PipelinePanelMixin:
                 mask=record.mask.copy().astype(np.uint8),
                 margin=int(record.margin),
                 margin_mode=str(record.margin_mode),
+                geometry=clone_mask_geometry(record.geometry),
             )
             for record in self.mask_records.values()
         )
@@ -740,6 +745,7 @@ class PipelinePanelMixin:
             interpolation_enabled=self._interpolation_enabled(),
             interpolation_extrapolate=self._interpolation_extrapolation_enabled(),
             chamber_mask=chamber_mask,
+            chamber_geometry=clone_mask_geometry(getattr(self, "chamber_geometry", None)),
             chamber_boundary_mode=getattr(self, "chamber_boundary_mode", "custom"),
             rooms=rooms,
             circle_geometry=self.frame_viewer.circle_geometry(),
@@ -1036,6 +1042,7 @@ class PipelinePanelMixin:
                         name=room.name,
                         color=room.color,
                         mask=np.logical_and(resized_room > 0, chamber_mask > 0).astype(np.uint8),
+                        geometry=scale_mask_geometry(room.geometry, item.scale_x, item.scale_y),
                     )
                 )
             stages.append(
@@ -1080,6 +1087,7 @@ class PipelinePanelMixin:
                     mask=self._resize_mask(record.mask, item.width, item.height),
                     margin=record.margin,
                     margin_mode=record.margin_mode,
+                    geometry=scale_mask_geometry(record.geometry, item.scale_x, item.scale_y),
                 )
                 for record in snapshot.masks
             )

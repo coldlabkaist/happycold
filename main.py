@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -39,6 +40,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QSpinBox,
     QSplitter,
     QTabBar,
     QTabWidget,
@@ -78,6 +80,7 @@ class MaskClipboardItem:
     color_name: str = "#06b6d4"
     margin: int = 0
     margin_mode: str = "simple"
+    geometry: dict | None = None
     circle_center: tuple[float, float] | None = None
     circle_base_radius: float | None = None
     circle_margin: int = 0
@@ -88,6 +91,17 @@ class MaskUndoSnapshot:
     tab_key: str
     label: str
     payload: object
+
+
+@dataclass(frozen=True)
+class MaskHoverInfo:
+    title: str
+    source_label: str
+    lines: tuple[str, ...]
+    anchor: tuple[float, float]
+    marker_points: tuple[tuple[float, float], ...] = ()
+    marker_circle: tuple[tuple[float, float], float] | None = None
+    color_name: str = "#f8fafc"
 
 
 def get_settings_path() -> Path:
@@ -124,9 +138,18 @@ from shared import (
     build_occlusion_dataframe,
     build_rectified_geometry,
     bodyparts_from_dataframe,
+    circle_mask_geometry,
+    clone_mask_geometry,
     discover_videos,
+    infer_mask_geometry,
     infer_pixel_scale,
+    mask_geometry_for_export,
+    mask_geometry_is_exact,
+    mask_polygon_geometry,
+    order_quad_points,
+    scale_mask_geometry,
     smooth_binary_mask_low,
+    translate_mask_geometry,
 )
 from interpolation import build_interpolation_pipeline_dataframe
 from trajectory import resolve_bodypart_coordinate_columns
@@ -422,6 +445,7 @@ class FrameViewer(QWidget):
         self._chamber_transform_shift_limits = (0, 0, 0, 0)
         self.circle_start: tuple[float, float] | None = None
         self.circle_end: tuple[float, float] | None = None
+        self.circle_geometry_source = "exact"
         self._circle_dragging = False
         self._circle_current: tuple[float, float] | None = None
         self._circle_move_dragging = False
@@ -454,11 +478,18 @@ class FrameViewer(QWidget):
         self._right_button_drag_moved = False
 
         self.pin_records: list[PinRecord] = []
+        self.show_pins_outside_pin_mode = False
+        self.snap_to_nearby_pins = False
+        self.pin_snap_radius = 20.0
         self.mask_records: dict[str, MaskRecord] = {}
         self.selected_mask_name: str | None = None
         self.chamber_mask: np.ndarray | None = None
+        self.chamber_geometry: dict | None = None
         self.room_records: dict[str, RoomRecord] = {}
         self.selected_room_name: str | None = None
+        self._mask_hover_info: MaskHoverInfo | None = None
+        self._mask_hover_widget_position = QPointF(0.0, 0.0)
+        self._hover_geometry_cache: dict[str, dict | None] = {}
         self._mask_fill_cache: dict[str, QPixmap] = {}
         self._mask_margin_cache: dict[str, QPixmap] = {}
         self._mask_fill_path_cache: dict[str, QPainterPath] = {}
@@ -707,6 +738,8 @@ class FrameViewer(QWidget):
         return self._pixmap is not None and self._frame_width > 0 and self._frame_height > 0
 
     def set_mode(self, mode: str) -> None:
+        if self.mode != mode:
+            self._set_mask_hover_info(None)
         self.mode = mode
         self.update()
 
@@ -779,20 +812,85 @@ class FrameViewer(QWidget):
         self.pin_records = list(pins)
         self.update()
 
+    def set_pin_overlay_options(
+        self,
+        show_outside_pin_mode: bool,
+        snap_to_nearby_pins: bool,
+        snap_radius: int | float = 20,
+    ) -> None:
+        self.show_pins_outside_pin_mode = bool(show_outside_pin_mode)
+        self.snap_to_nearby_pins = bool(snap_to_nearby_pins)
+        self.pin_snap_radius = max(0.0, float(snap_radius))
+        self.update()
+
+    def _pin_overlay_supported_in_current_mode(self) -> bool:
+        if self.mode == "pin":
+            return True
+        if self.mode in {"inspect", "trajectory_region", "circle"}:
+            return True
+        if self.mode.startswith("chamber_") or self.mode.startswith("occ_"):
+            return True
+        return False
+
+    def _pin_snap_supported_in_current_mode(self) -> bool:
+        if self.mode in {
+            "trajectory_region",
+            "interp_rect",
+            "interp_circle",
+            "chamber_rect",
+            "chamber_circle",
+            "circle",
+            "occ_rect",
+            "occ_circle",
+            "square",
+        }:
+            return True
+        return False
+
+    def _nearest_pin_for_snap(self, image_point: tuple[float, float]) -> PinRecord | None:
+        if not self.pin_records or self.pin_snap_radius <= 0:
+            return None
+        current_frame = getattr(self, "current_frame_number", None)
+        best_pin: PinRecord | None = None
+        best_distance_sq = float(self.pin_snap_radius) * float(self.pin_snap_radius)
+        for pin in self.pin_records:
+            if current_frame is not None and pin.frame != current_frame:
+                continue
+            dx = float(pin.x) - float(image_point[0])
+            dy = float(pin.y) - float(image_point[1])
+            distance_sq = dx * dx + dy * dy
+            if distance_sq <= best_distance_sq:
+                best_distance_sq = distance_sq
+                best_pin = pin
+        return best_pin
+
+    def _snapped_drawing_point(self, image_point: tuple[float, float]) -> tuple[float, float]:
+        if not self.snap_to_nearby_pins or not self._pin_snap_supported_in_current_mode():
+            return image_point
+        pin = self._nearest_pin_for_snap(image_point)
+        if pin is None:
+            return image_point
+        x = max(0.0, min(float(self._frame_width - 1), float(pin.x))) if self._frame_width > 0 else float(pin.x)
+        y = max(0.0, min(float(self._frame_height - 1), float(pin.y))) if self._frame_height > 0 else float(pin.y)
+        return (x, y)
+
     def set_chamber_records(
         self,
         chamber_mask: np.ndarray | None,
         rooms: dict[str, RoomRecord],
         selected_name: str | None,
         refresh: bool = False,
+        chamber_geometry: dict | None = None,
     ) -> None:
         previous_names = set(self.room_records.keys())
         previous_selected = self.selected_room_name
         previous_has_chamber = self.chamber_mask is not None and bool(np.any(self.chamber_mask))
         next_has_chamber = chamber_mask is not None and bool(np.any(chamber_mask))
         self.chamber_mask = None if chamber_mask is None else chamber_mask.astype(np.uint8)
+        self.chamber_geometry = clone_mask_geometry(chamber_geometry)
         self.room_records = rooms
         self.selected_room_name = selected_name
+        self._hover_geometry_cache.clear()
         if refresh or previous_names != set(rooms.keys()) or previous_selected != selected_name or previous_has_chamber != next_has_chamber:
             self._rebuild_chamber_cache()
         self.update()
@@ -802,11 +900,13 @@ class FrameViewer(QWidget):
         previous_selected = self.selected_mask_name
         self.mask_records = masks
         self.selected_mask_name = selected_name
+        self._hover_geometry_cache.clear()
         if refresh or previous_names != set(masks.keys()) or previous_selected != selected_name:
             self._rebuild_mask_cache()
         self.update()
 
     def refresh_mask_record(self, name: str, include_margin: bool = True) -> None:
+        self._hover_geometry_cache.pop(f"occ:{name}", None)
         record = self.mask_records.get(name)
         if record is None:
             self._mask_fill_cache.pop(name, None)
@@ -819,6 +919,7 @@ class FrameViewer(QWidget):
         self.update()
 
     def _rebuild_mask_cache(self) -> None:
+        self._hover_geometry_cache.clear()
         self._mask_fill_cache = {}
         self._mask_margin_cache = {}
         self._mask_fill_path_cache = {}
@@ -853,6 +954,122 @@ class FrameViewer(QWidget):
         ).copy()
         return QPixmap.fromImage(qimage)
 
+    @staticmethod
+    def _signed_polygon_area(points: list[tuple[float, float]]) -> float:
+        if len(points) < 3:
+            return 0.0
+        area = 0.0
+        for index, point in enumerate(points):
+            next_point = points[(index + 1) % len(points)]
+            area += float(point[0]) * float(next_point[1]) - float(next_point[0]) * float(point[1])
+        return area * 0.5
+
+    @staticmethod
+    def _line_intersection(
+        point_a: np.ndarray,
+        direction_a: np.ndarray,
+        point_b: np.ndarray,
+        direction_b: np.ndarray,
+    ) -> tuple[float, float] | None:
+        cross = float(direction_a[0] * direction_b[1] - direction_a[1] * direction_b[0])
+        if abs(cross) < 1e-6:
+            return None
+        delta = point_b - point_a
+        t = float(delta[0] * direction_b[1] - delta[1] * direction_b[0]) / cross
+        intersection = point_a + direction_a * t
+        if not np.all(np.isfinite(intersection)):
+            return None
+        return float(intersection[0]), float(intersection[1])
+
+    def _offset_polygon_points(
+        self,
+        points: list[tuple[float, float]],
+        margin: float,
+    ) -> list[tuple[float, float]] | None:
+        if len(points) < 3 or abs(float(margin)) < 1e-6:
+            return list(points)
+        signed_area = self._signed_polygon_area(points)
+        if abs(signed_area) < 1e-6:
+            return None
+        normal_sign = 1.0 if signed_area > 0 else -1.0
+        offset_lines: list[tuple[np.ndarray, np.ndarray]] = []
+        for index, point in enumerate(points):
+            current = np.array(point, dtype=np.float64)
+            next_point = np.array(points[(index + 1) % len(points)], dtype=np.float64)
+            direction = next_point - current
+            length = float(np.hypot(direction[0], direction[1]))
+            if length < 1e-6:
+                return None
+            unit = direction / length
+            outward_normal = np.array([unit[1], -unit[0]], dtype=np.float64) * normal_sign
+            offset_lines.append((current + outward_normal * float(margin), unit))
+
+        offset_points: list[tuple[float, float]] = []
+        for index in range(len(offset_lines)):
+            previous_point, previous_direction = offset_lines[index - 1]
+            current_point, current_direction = offset_lines[index]
+            intersection = self._line_intersection(
+                previous_point,
+                previous_direction,
+                current_point,
+                current_direction,
+            )
+            if intersection is None:
+                return None
+            offset_points.append(intersection)
+        if abs(self._signed_polygon_area(offset_points)) < 0.5:
+            return None
+        return offset_points
+
+    def _geometry_to_path(
+        self,
+        geometry: dict | None,
+        margin: int | float = 0,
+    ) -> QPainterPath | None:
+        if not isinstance(geometry, dict):
+            return None
+        if str(geometry.get("source", "")).lower() != "exact":
+            return None
+        path = QPainterPath()
+        path.setFillRule(Qt.FillRule.OddEvenFill)
+        kind = str(geometry.get("kind", "")).lower()
+        if kind == "circle":
+            center = self._geometry_point(geometry.get("center"))
+            radius = self._geometry_radius(
+                geometry.get("adjusted_radius", geometry.get("base_radius", geometry.get("radius")))
+            )
+            if center is None or radius is None:
+                return None
+            radius = float(radius) + float(margin)
+            if radius <= 0:
+                return None
+            path.addEllipse(
+                QRectF(
+                    float(center[0] - radius),
+                    float(center[1] - radius),
+                    float(radius * 2.0),
+                    float(radius * 2.0),
+                )
+            )
+            return None if path.isEmpty() else path
+
+        raw_points = geometry.get("points")
+        points: list[tuple[float, float]] = []
+        if isinstance(raw_points, list):
+            for value in raw_points:
+                point = self._geometry_point(value)
+                if point is not None:
+                    points.append(point)
+        if len(points) < 3:
+            return None
+        points = self._offset_polygon_points(points, float(margin))
+        if points is None or len(points) < 3:
+            return None
+        path.moveTo(float(points[0][0]), float(points[0][1]))
+        for point in points[1:]:
+            path.lineTo(float(point[0]), float(point[1]))
+        path.closeSubpath()
+        return None if path.isEmpty() else path
 
     @staticmethod
     def _add_display_contour(
@@ -871,6 +1088,10 @@ class FrameViewer(QWidget):
 
         epsilon = 0.35 if high_quality else 1.0
         approximated = cv2.approxPolyDP(contour, epsilon, True)
+        if len(approximated) < 4 and len(contour) >= 4 and abs(float(cv2.contourArea(contour))) >= 8.0:
+            safer_epsilon = 0.08 if high_quality else 0.18
+            safer = cv2.approxPolyDP(contour, safer_epsilon, True)
+            approximated = safer if len(safer) >= 4 else contour
         points = approximated.reshape(-1, 2).astype(np.float64)
 
         # A rasterized axis-aligned rectangle has a perfectly rectangular contour.
@@ -974,7 +1195,7 @@ class FrameViewer(QWidget):
             record.color,
             alpha,
         )
-        mask_path = self._mask_to_path(
+        mask_path = self._geometry_to_path(record.geometry) or self._mask_to_path(
             record.mask,
             high_quality=include_margin,
         )
@@ -992,7 +1213,16 @@ class FrameViewer(QWidget):
         except ValueError:
             adjusted = None
         if adjusted is not None and adjusted.any():
-            margin_path = self._mask_to_path(adjusted)
+            geometry_margin = (
+                float(record.margin)
+                if str(record.margin_mode) == "simple"
+                else 0.0 if int(record.margin) == 0 else None
+            )
+            margin_path = (
+                self._geometry_to_path(record.geometry, margin=geometry_margin)
+                if geometry_margin is not None
+                else None
+            ) or self._mask_to_path(adjusted)
             if margin_path is not None:
                 self._mask_margin_path_cache[name] = margin_path
             edge = cv2.morphologyEx(adjusted, cv2.MORPH_GRADIENT, np.ones((3, 3), dtype=np.uint8))
@@ -1004,6 +1234,7 @@ class FrameViewer(QWidget):
             )
 
     def _rebuild_chamber_cache(self) -> None:
+        self._hover_geometry_cache.clear()
         self._chamber_base_cache = None
         self._chamber_fill_cache = None
         self._chamber_edge_cache = None
@@ -1020,7 +1251,7 @@ class FrameViewer(QWidget):
                 QColor("#d1d5db"),
                 72,
             )
-            self._chamber_base_path_cache = self._mask_to_path(self.chamber_mask)
+            self._chamber_base_path_cache = self._geometry_to_path(self.chamber_geometry) or self._mask_to_path(self.chamber_mask)
 
         for name, record in self.room_records.items():
             if not np.any(record.mask):
@@ -1031,7 +1262,7 @@ class FrameViewer(QWidget):
                 record.color,
                 118 if selected else 86,
             )
-            room_path = self._mask_to_path(record.mask)
+            room_path = self._geometry_to_path(record.geometry) or self._mask_to_path(record.mask)
             if room_path is not None:
                 self._chamber_room_path_cache[name] = room_path
             edge = cv2.morphologyEx(
@@ -1107,6 +1338,7 @@ class FrameViewer(QWidget):
     def clear_circle(self) -> None:
         self.circle_start = None
         self.circle_end = None
+        self.circle_geometry_source = "exact"
         self._circle_current = None
         self._circle_dragging = False
         self._circle_move_dragging = False
@@ -1262,6 +1494,343 @@ class FrameViewer(QWidget):
                     break
         return best_name
 
+    def _set_mask_hover_info(
+        self,
+        info: MaskHoverInfo | None,
+        widget_position: QPointF | None = None,
+    ) -> None:
+        position_changed = False
+        if widget_position is not None:
+            position_changed = (
+                abs(widget_position.x() - self._mask_hover_widget_position.x()) > 0.5
+                or abs(widget_position.y() - self._mask_hover_widget_position.y()) > 0.5
+            )
+            self._mask_hover_widget_position = QPointF(widget_position)
+        if self._mask_hover_info != info or (info is not None and position_changed):
+            self._mask_hover_info = info
+            self.update()
+
+    @staticmethod
+    def _format_hover_point(point: tuple[float, float] | list[float]) -> str:
+        return f"({float(point[0]):.1f}, {float(point[1]):.1f})"
+
+    @staticmethod
+    def _geometry_source_label(geometry: dict) -> str:
+        return "exact" if str(geometry.get("source", "exact")).lower() == "exact" else "inferred"
+
+    def _format_cursor_hover_lines(self, image_point: tuple[float, float]) -> list[str]:
+        x, y = float(image_point[0]), float(image_point[1])
+        lines = [f"cursor=({x:.1f}, {y:.1f}) px"]
+        if self._frame_width > 0 and self._frame_height > 0:
+            lines.append(f"normalized=({x / self._frame_width:.4f}, {y / self._frame_height:.4f})")
+        return lines
+
+    @staticmethod
+    def _mask_pixel_stats(mask: np.ndarray | None) -> dict[str, int | tuple[int, int, int, int]] | None:
+        if mask is None or mask.ndim != 2:
+            return None
+        ys, xs = np.where(mask > 0)
+        if len(xs) == 0:
+            return None
+        left = int(xs.min())
+        right = int(xs.max())
+        top = int(ys.min())
+        bottom = int(ys.max())
+        return {
+            "area": int(len(xs)),
+            "width": int(right - left + 1),
+            "height": int(bottom - top + 1),
+            "bbox": (left, top, right, bottom),
+        }
+
+    def _hover_mask_from_geometry(self, geometry: dict | None) -> np.ndarray | None:
+        if not isinstance(geometry, dict) or self._frame_width <= 0 or self._frame_height <= 0:
+            return None
+        mask = np.zeros((self._frame_height, self._frame_width), dtype=np.uint8)
+        kind = str(geometry.get("kind", "")).lower()
+        if kind == "circle":
+            center = self._geometry_point(geometry.get("center"))
+            radius = self._geometry_radius(
+                geometry.get("adjusted_radius", geometry.get("base_radius", geometry.get("radius")))
+            )
+            if center is None or radius is None:
+                return None
+            cv2.circle(mask, (int(round(center[0])), int(round(center[1]))), int(round(radius)), 1, thickness=-1)
+            return mask
+        raw_points = geometry.get("points")
+        points: list[tuple[float, float]] = []
+        if isinstance(raw_points, list):
+            for value in raw_points:
+                point = self._geometry_point(value)
+                if point is not None:
+                    points.append(point)
+        if len(points) >= 3:
+            contour = np.array(points, dtype=np.float32).round().astype(np.int32)
+            cv2.fillPoly(mask, [contour], 1)
+            return mask
+        return None
+
+    @staticmethod
+    def _geometry_point(value: object) -> tuple[float, float] | None:
+        try:
+            return float(value[0]), float(value[1])  # type: ignore[index]
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _geometry_radius(value: object) -> float | None:
+        try:
+            radius = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(radius) or radius <= 0:
+            return None
+        return radius
+
+    def _cached_hover_geometry(
+        self,
+        key: str,
+        geometry: dict | None,
+        mask: np.ndarray | None,
+    ) -> dict | None:
+        cloned = clone_mask_geometry(geometry)
+        if cloned is not None:
+            cloned.setdefault("source", "exact")
+            return cloned
+        if mask is None:
+            return None
+        if key not in self._hover_geometry_cache:
+            self._hover_geometry_cache[key] = infer_mask_geometry(mask)
+        return clone_mask_geometry(self._hover_geometry_cache.get(key))
+
+    def _point_in_polygon(
+        self,
+        points: list[tuple[float, float]] | tuple[tuple[float, float], ...],
+        point: tuple[float, float],
+        margin: float = 6.0,
+    ) -> bool:
+        if len(points) < 3:
+            return False
+        contour = np.array(points, dtype=np.float32)
+        try:
+            return cv2.pointPolygonTest(contour, (float(point[0]), float(point[1])), True) >= -float(margin)
+        except cv2.error:
+            return False
+
+    @staticmethod
+    def _point_in_circle(
+        center: tuple[float, float],
+        radius: float,
+        point: tuple[float, float],
+        margin: float = 6.0,
+    ) -> bool:
+        return math.hypot(point[0] - center[0], point[1] - center[1]) <= radius + margin
+
+    def _room_name_at_point(self, point: tuple[float, float], margin: int = 8) -> str | None:
+        if not self.room_records:
+            return None
+        best_name: str | None = None
+        best_distance = float("inf")
+        ordered_names = list(self.room_records.keys())
+        if self.selected_room_name in self.room_records:
+            ordered_names = [self.selected_room_name] + [name for name in ordered_names if name != self.selected_room_name]
+        for name in ordered_names:
+            record = self.room_records.get(name)
+            if record is None:
+                continue
+            distance = self._mask_hit_distance(record.mask.astype(np.uint8), point, margin)
+            if distance is None:
+                continue
+            if distance < best_distance:
+                best_distance = distance
+                best_name = name
+                if distance <= 0.0:
+                    break
+        return best_name
+
+    def _format_geometry_hover(
+        self,
+        title: str,
+        geometry: dict | None,
+        anchor: tuple[float, float],
+        color_name: str,
+        mask: np.ndarray | None = None,
+        cursor: tuple[float, float] | None = None,
+    ) -> MaskHoverInfo | None:
+        if not isinstance(geometry, dict):
+            return None
+        source_label = self._geometry_source_label(geometry)
+        source_is_exact = source_label == "exact"
+        kind = str(geometry.get("kind", "")).lower()
+        lines: list[str] = []
+        marker_points: list[tuple[float, float]] = []
+        marker_circle: tuple[tuple[float, float], float] | None = None
+
+        if cursor is not None:
+            lines.extend(self._format_cursor_hover_lines(cursor))
+
+        stats = self._mask_pixel_stats(mask)
+        fallback_bbox_line: str | None = None
+        if kind == "circle":
+            center = self._geometry_point(geometry.get("center"))
+            radius = self._geometry_radius(
+                geometry.get("adjusted_radius", geometry.get("base_radius", geometry.get("radius")))
+            )
+            base_radius = self._geometry_radius(geometry.get("base_radius"))
+            if center is not None:
+                anchor = center
+            if base_radius is not None and radius is not None and abs(base_radius - radius) > 0.05:
+                lines.append(f"base radius{'=' if source_is_exact else '~='}{base_radius:.1f}px")
+                lines.append(f"adjusted radius{'=' if source_is_exact else '~='}{radius:.1f}px")
+            elif radius is not None:
+                lines.append(f"radius{'=' if source_is_exact else '~='}{radius:.1f}px")
+            if center is not None and radius is not None:
+                pass
+        else:
+            raw_points = geometry.get("points")
+            points: list[tuple[float, float]] = []
+            if isinstance(raw_points, list):
+                for value in raw_points:
+                    point = self._geometry_point(value)
+                    if point is not None:
+                        points.append(point)
+            if points and source_is_exact:
+                anchor = points[0]
+            else:
+                centroid = self._geometry_point(geometry.get("centroid"))
+                if centroid is not None:
+                    anchor = centroid
+                bbox = geometry.get("bbox")
+                if isinstance(bbox, list) and len(bbox) == 4:
+                    try:
+                        left, top, right, bottom = [float(value) for value in bbox]
+                        fallback_bbox_line = f"bbox~=({left:.1f}, {top:.1f})-({right:.1f}, {bottom:.1f})"
+                    except (TypeError, ValueError):
+                        pass
+
+        if stats is not None:
+            bbox = stats.get("bbox")
+            lines.append(f"area={stats['area']} px")
+            lines.append(f"width={stats['width']} px | height={stats['height']} px")
+            if isinstance(bbox, tuple) and len(bbox) == 4:
+                left, top, right, bottom = bbox
+                lines.append(f"bbox=({left}, {top})-({right}, {bottom})")
+        else:
+            area = geometry.get("area")
+            try:
+                if area is not None:
+                    lines.append(f"area~={int(round(float(area)))} px")
+            except (TypeError, ValueError):
+                pass
+            if fallback_bbox_line is not None:
+                lines.append(fallback_bbox_line)
+
+        if not lines:
+            return None
+        return MaskHoverInfo(
+            title=title,
+            source_label=source_label,
+            lines=tuple(lines[:8]),
+            anchor=anchor,
+            marker_points=tuple(marker_points),
+            marker_circle=marker_circle,
+            color_name=color_name,
+        )
+
+    def _build_mask_hover_info(self, image_point: tuple[float, float]) -> MaskHoverInfo | None:
+        if self.mode == "square" and len(self.square_points) == 4:
+            ordered_points = order_quad_points(self.square_points).tolist()
+            polygon_points = [(float(x), float(y)) for x, y in ordered_points]
+            if self._point_in_polygon(polygon_points, image_point):
+                geometry = mask_polygon_geometry(ordered_points, source="exact", shape="rectangle")
+                return self._format_geometry_hover(
+                    "Square region",
+                    geometry,
+                    image_point,
+                    "#60a5fa",
+                    mask=self._hover_mask_from_geometry(geometry),
+                    cursor=None,
+                )
+
+        if self.mode == "circle":
+            circle = self.circle_geometry()
+            if circle is not None:
+                center, base_radius, adjusted_radius = circle
+                if self._point_in_circle(center, adjusted_radius, image_point):
+                    geometry = circle_mask_geometry(
+                        center,
+                        base_radius,
+                        adjusted_radius,
+                        source=getattr(self, "circle_geometry_source", "exact"),
+                    )
+                    return self._format_geometry_hover(
+                        "Circle mask",
+                        geometry,
+                        center,
+                        "#ef4444",
+                        mask=self._hover_mask_from_geometry(geometry),
+                        cursor=None,
+                    )
+
+        if self.mode.startswith("chamber_"):
+            room_name = self._room_name_at_point(image_point, margin=8)
+            if room_name is not None:
+                record = self.room_records.get(room_name)
+                if record is not None:
+                    geometry = self._cached_hover_geometry(f"room:{room_name}", record.geometry, record.mask)
+                    return self._format_geometry_hover(
+                        f"Room: {room_name}",
+                        geometry,
+                        image_point,
+                        record.color.name(),
+                        mask=record.mask,
+                        cursor=None,
+                    )
+            if self.chamber_mask is not None and self._mask_hit_distance(self.chamber_mask.astype(np.uint8), image_point, 8) is not None:
+                geometry = self._cached_hover_geometry("chamber", self.chamber_geometry, self.chamber_mask)
+                return self._format_geometry_hover(
+                    "Chamber",
+                    geometry,
+                    image_point,
+                    "#d1d5db",
+                    mask=self.chamber_mask,
+                    cursor=None,
+                )
+
+        if self.mode.startswith("occ_"):
+            mask_name = self._mask_name_at_point(image_point, margin=8)
+            if mask_name is not None:
+                record = self.mask_records.get(mask_name)
+                if record is not None:
+                    geometry = self._cached_hover_geometry(f"occ:{mask_name}", record.geometry, record.mask)
+                    return self._format_geometry_hover(
+                        f"Mask: {mask_name}",
+                        geometry,
+                        image_point,
+                        record.color.name(),
+                        mask=record.mask,
+                        cursor=None,
+                    )
+        return None
+
+    def _build_cursor_hover_info(self, image_point: tuple[float, float]) -> MaskHoverInfo:
+        return MaskHoverInfo(
+            title="Cursor",
+            source_label="",
+            lines=tuple(self._format_cursor_hover_lines(image_point)),
+            anchor=image_point,
+            color_name="#94a3b8",
+        )
+
+    def _update_mask_hover(self, widget_position: QPointF, image_point: tuple[float, float] | None) -> None:
+        if image_point is None or self._pan_dragging:
+            self._set_mask_hover_info(None, widget_position)
+            return
+        info = self._build_mask_hover_info(image_point)
+        if info is None and self.mode == "pin":
+            info = self._build_cursor_hover_info(image_point)
+        self._set_mask_hover_info(info, widget_position)
+
     @staticmethod
     def _control_pressed(modifiers: Qt.KeyboardModifiers) -> bool:
         return bool(modifiers & Qt.KeyboardModifier.ControlModifier)
@@ -1321,6 +1890,7 @@ class FrameViewer(QWidget):
             return
 
         if event.button() == Qt.MouseButton.RightButton:
+            self._set_mask_hover_info(None, event.position())
             self._pan_dragging = True
             self._right_button_drag_moved = False
             self._pan_drag_start = event.position().toPoint()
@@ -1329,19 +1899,23 @@ class FrameViewer(QWidget):
 
         image_point = self._widget_to_image(event.position())
         if image_point is None or event.button() != Qt.MouseButton.LeftButton:
+            self._set_mask_hover_info(None, event.position())
             return
+        self._set_mask_hover_info(None, event.position())
 
         if self.mode == "trajectory_region":
-            self.trajectory_region_start = image_point
+            draw_point = self._snapped_drawing_point(image_point)
+            self.trajectory_region_start = draw_point
             self.trajectory_region_end = None
-            self._trajectory_region_current = image_point
+            self._trajectory_region_current = draw_point
             self._trajectory_region_dragging = True
             self.update()
             self.trajectory_region_changed.emit()
         elif self.mode.startswith("interp_") and self.interpolation_transform_mode:
             self._begin_interpolation_transform_drag(image_point)
         elif self.mode == "interp_rect":
-            self.interpolation_rect_points.append(image_point)
+            draw_point = self._snapped_drawing_point(image_point)
+            self.interpolation_rect_points.append(draw_point)
             self.update()
             self.interpolation_rect_points_changed.emit()
             if len(self.interpolation_rect_points) == 4:
@@ -1350,10 +1924,11 @@ class FrameViewer(QWidget):
                 self.update()
                 self.interpolation_rect_points_changed.emit()
         elif self.mode == "interp_circle":
+            draw_point = self._snapped_drawing_point(image_point)
             self._interpolation_circle_dragging = True
-            self.interpolation_circle_start = image_point
+            self.interpolation_circle_start = draw_point
             self.interpolation_circle_end = None
-            self._interpolation_circle_current = image_point
+            self._interpolation_circle_current = draw_point
             self.update()
             self.interpolation_circle_changed.emit()
         elif self.mode == "interp_free":
@@ -1382,7 +1957,8 @@ class FrameViewer(QWidget):
         elif self.mode.startswith("chamber_") and self.chamber_transform_mode:
             self._begin_chamber_transform_drag(image_point)
         elif self.mode == "chamber_rect":
-            self.chamber_rect_points.append(image_point)
+            draw_point = self._snapped_drawing_point(image_point)
+            self.chamber_rect_points.append(draw_point)
             self.update()
             self.chamber_rect_points_changed.emit()
             if len(self.chamber_rect_points) == 4:
@@ -1391,10 +1967,11 @@ class FrameViewer(QWidget):
                 self.update()
                 self.chamber_rect_points_changed.emit()
         elif self.mode == "chamber_circle":
+            draw_point = self._snapped_drawing_point(image_point)
             self._chamber_circle_dragging = True
-            self.chamber_circle_start = image_point
+            self.chamber_circle_start = draw_point
             self.chamber_circle_end = None
-            self._chamber_circle_current = image_point
+            self._chamber_circle_current = draw_point
             self.update()
             self.chamber_circle_changed.emit()
         elif self.mode == "square":
@@ -1402,7 +1979,8 @@ class FrameViewer(QWidget):
             if hit_index is not None:
                 self._square_drag_index = hit_index
             elif len(self.square_points) < 4:
-                self.square_points.append(image_point)
+                draw_point = self._snapped_drawing_point(image_point)
+                self.square_points.append(draw_point)
                 self.update()
                 self.square_points_changed.emit()
         elif self.mode == "circle":
@@ -1413,10 +1991,12 @@ class FrameViewer(QWidget):
                 self._circle_move_last_point = image_point
                 return
             self.circle_edit_started.emit()
+            draw_point = self._snapped_drawing_point(image_point)
+            self.circle_geometry_source = "exact"
             self._circle_dragging = True
-            self.circle_start = image_point
+            self.circle_start = draw_point
             self.circle_end = None
-            self._circle_current = image_point
+            self._circle_current = draw_point
             self.update()
             self.circle_changed.emit()
         elif self.mode == "occ_rect":
@@ -1424,7 +2004,8 @@ class FrameViewer(QWidget):
                 self._occ_rect_draw_override_add = False if self._control_pressed(event.modifiers()) else None
             elif self._occ_rect_draw_override_add is None and self._control_pressed(event.modifiers()):
                 self._occ_rect_draw_override_add = False
-            self.occ_rect_points.append(image_point)
+            draw_point = self._snapped_drawing_point(image_point)
+            self.occ_rect_points.append(draw_point)
             self.update()
             self.occ_rect_points_changed.emit()
             if len(self.occ_rect_points) == 4:
@@ -1435,10 +2016,11 @@ class FrameViewer(QWidget):
                 self.update()
                 self.occ_rect_points_changed.emit()
         elif self.mode == "occ_circle":
+            draw_point = self._snapped_drawing_point(image_point)
             self._occ_circle_dragging = True
-            self.occ_circle_start = image_point
+            self.occ_circle_start = draw_point
             self.occ_circle_end = None
-            self._occ_circle_current = image_point
+            self._occ_circle_current = draw_point
             self._occ_circle_draw_override_add = False if self._control_pressed(event.modifiers()) else None
             self.update()
             self.occ_circle_changed.emit()
@@ -1493,6 +2075,7 @@ class FrameViewer(QWidget):
 
         image_point = self._widget_to_image(event.position())
         if image_point is None:
+            self._set_mask_hover_info(None, event.position())
             return
 
         if self.mode == "trajectory_region" and self._trajectory_region_dragging:
@@ -1564,6 +2147,11 @@ class FrameViewer(QWidget):
             self._occ_transform_erase_last_point = image_point
         elif self.mode.startswith("occ_") and self.occ_transform_mode and self._occ_transform_dragging and self._occ_transform_last_point is not None:
             self._update_occ_transform_preview(image_point)
+
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            self._set_mask_hover_info(None, event.position())
+        else:
+            self._update_mask_hover(event.position(), image_point)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.RightButton:
@@ -1711,6 +2299,7 @@ class FrameViewer(QWidget):
             self.free_draw_finished.emit()
         if was_transform_erase_dragging:
             self.occ_transform_finished.emit()
+        self._set_mask_hover_info(None)
         super().leaveEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
@@ -1769,6 +2358,7 @@ class FrameViewer(QWidget):
         self._draw_circle_overlay(painter)
         self._draw_occ_shape_overlay(painter)
         self._draw_node_overlay(painter)
+        self._draw_mask_hover_overlay(painter)
 
     def _draw_node_overlay(self, painter: QPainter) -> None:
         if not self.node_overlay_points:
@@ -1795,6 +2385,47 @@ class FrameViewer(QWidget):
             painter.setPen(QPen(QColor("#0f172a"), 2))
             painter.setBrush(color)
             painter.drawEllipse(widget_point, radius, radius)
+        painter.restore()
+
+    def _draw_mask_hover_overlay(self, painter: QPainter) -> None:
+        info = self._mask_hover_info
+        if info is None:
+            return
+        image_rect = self._image_rect()
+        if image_rect is None:
+            return
+        text_lines = [info.title]
+        if info.source_label:
+            text_lines.append(f"source: {info.source_label}")
+        text_lines.extend(info.lines)
+        metrics = painter.fontMetrics()
+        text_width = max(metrics.horizontalAdvance(line) for line in text_lines)
+        line_height = metrics.height()
+        padding_x = 10.0
+        padding_y = 7.0
+        box_width = float(text_width) + padding_x * 2.0
+        box_height = float(line_height * len(text_lines)) + padding_y * 2.0
+        x = self._mask_hover_widget_position.x() + 14.0
+        y = self._mask_hover_widget_position.y() + 14.0
+        if x + box_width > self.width() - 8.0:
+            x = self._mask_hover_widget_position.x() - box_width - 14.0
+        if y + box_height > self.height() - 8.0:
+            y = self._mask_hover_widget_position.y() - box_height - 14.0
+        x = max(8.0, min(x, self.width() - box_width - 8.0))
+        y = max(8.0, min(y, self.height() - box_height - 8.0))
+        box = QRectF(x, y, box_width, box_height)
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(QColor(15, 23, 42, 228))
+        painter.setPen(QPen(QColor(226, 232, 240, 190), 1))
+        painter.drawRoundedRect(box, 6.0, 6.0)
+        painter.setPen(QColor("#f8fafc"))
+        text_x = x + padding_x
+        text_y = y + padding_y + metrics.ascent()
+        for index, line in enumerate(text_lines):
+            painter.setPen(QColor("#f8fafc") if index == 0 else QColor("#cbd5e1"))
+            painter.drawText(QPointF(text_x, text_y + index * line_height), line)
         painter.restore()
 
     def _draw_interpolation_overlay(self, painter: QPainter) -> None:
@@ -2017,19 +2648,27 @@ class FrameViewer(QWidget):
         painter.restore()
 
     def _draw_pin_overlays(self, painter: QPainter) -> None:
-        if not self.pin_records or self.mode != "pin":
+        if not self.pin_records:
+            return
+        if self.mode != "pin" and not (self.show_pins_outside_pin_mode and self._pin_overlay_supported_in_current_mode()):
             return
         colors = ["#ef4444", "#f97316", "#eab308", "#22c55e", "#3b82f6", "#8b5cf6"]
+        current_frame = getattr(self, "current_frame_number", None)
+        visible_pins = [pin for pin in self.pin_records if current_frame is None or pin.frame == current_frame]
+        if not visible_pins:
+            return
         painter.save()
-        painter.setPen(QPen(QColor("#ffffff"), 2))
-        for index, pin in enumerate([pin for pin in self.pin_records if pin.frame == getattr(self, "current_frame_number", pin.frame)]):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        for index, pin in enumerate(visible_pins):
             point = self._image_to_widget((pin.x, pin.y))
             if point is None:
                 continue
             color = QColor(colors[index % len(colors)])
+            painter.setPen(QPen(QColor("#0f172a"), 1.5))
             painter.setBrush(color)
-            painter.drawEllipse(point, 6.0, 6.0)
-            painter.drawText(point + QPointF(8, -8), pin.pin_id)
+            painter.drawEllipse(point, 4.5, 4.5)
+            painter.setPen(QPen(QColor("#f8fafc"), 1))
+            painter.drawText(point + QPointF(7, -7), pin.pin_id)
         painter.restore()
 
     def _draw_square_overlay(self, painter: QPainter) -> None:
@@ -2167,6 +2806,20 @@ class MainWindow(
     FILE_SIDEBAR_MIN_RESTORE_WIDTH = 160
     FILE_SIDEBAR_MAX_WIDTH = 360
     TAB_VISIBILITY_SCHEMA_VERSION = 2
+    PERSISTENT_SPINBOX_SETTINGS_KEY = "spinbox_values"
+    PERSISTENT_SPINBOX_NAMES = (
+        "tracking_duplicate_criteria_spinbox",
+        "tracking_zscore_high_spinbox",
+        "tracking_zscore_low_spinbox",
+        "interpolation_brush_spinbox",
+        "pin_snap_radius_spinbox",
+        "mask_brush_spinbox",
+        "mask_margin_spinbox",
+        "circle_margin_spinbox",
+        "square_start_spinbox",
+        "square_duration_spinbox",
+        "square_end_spinbox",
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -2231,8 +2884,10 @@ class MainWindow(
 
 
         self.pins: list[PinRecord] = []
+        self.selected_pin_index: int | None = None
         self.pin_counter = 0
         self.chamber_mask: np.ndarray | None = None
+        self.chamber_geometry: dict | None = None
         self.chamber_boundary_mode = "unset"
         self.room_records: dict[str, RoomRecord] = {}
         self.selected_room_name: str | None = None
@@ -2256,6 +2911,10 @@ class MainWindow(
         self.default_mask_margin_mode = str(self.settings.get("occlusion_mask_margin_mode", "simple"))
         if self.default_mask_margin_mode not in {"simple", "geometric"}:
             self.default_mask_margin_mode = "simple"
+        self._mode_tab_memory_suspended = False
+        self._settings_save_suspended = False
+        self._restoring_persistent_spinbox_values = False
+        self.last_mode_tab_by_workflow = self._load_last_mode_tab_by_workflow()
 
         self._build_ui()
         self._refresh_csv_search_folder_ui()
@@ -2272,6 +2931,7 @@ class MainWindow(
             self.mask_margin_geometric_radio.setChecked(True)
         else:
             self.mask_margin_simple_radio.setChecked(True)
+        self._restore_persistent_spinbox_values()
         self._restore_last_visible_mode_tab()
         self._refresh_chamber_ui()
         self._on_mode_changed(self.mode_tabs.currentIndex())
@@ -2558,6 +3218,7 @@ class MainWindow(
             max(self.CATEGORY_PREPARE, min(saved_category, self.CATEGORY_PIPELINE))
         )
         self.workflow_category_bar.currentChanged.connect(self._on_workflow_category_changed)
+        self.workflow_category_bar.tabBarClicked.connect(self._on_workflow_category_clicked)
         self._apply_workflow_category_visibility(select_first=True)
 
         self.workflow_tools_label = QLabel()
@@ -2797,24 +3458,98 @@ class MainWindow(
             return self.CATEGORY_PIPELINE
         return self.CATEGORY_INSPECT
 
+    def _default_mode_tab_by_workflow(self) -> dict[int, int]:
+        return {
+            self.CATEGORY_PREPARE: self.TAB_TRACKING_REPAIR,
+            self.CATEGORY_ANNOTATE: self.TAB_CHAMBER,
+            self.CATEGORY_INSPECT: self.TAB_TRAJECTORY,
+            self.CATEGORY_PIPELINE: self.TAB_PIPELINE,
+        }
+
+    def _valid_mode_tab_index(self, tab_index: int) -> bool:
+        return tab_index in {index for index, _key, _label in self._mode_tab_specs()}
+
+    def _load_last_mode_tab_by_workflow(self) -> dict[int, int]:
+        tab_by_workflow = self._default_mode_tab_by_workflow()
+        raw_map = self.settings.get("last_mode_tab_by_workflow")
+        if isinstance(raw_map, dict):
+            for category_key, tab_value in raw_map.items():
+                try:
+                    category = int(category_key)
+                    tab_index = int(tab_value)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    category in tab_by_workflow
+                    and self._valid_mode_tab_index(tab_index)
+                    and self._mode_tab_category(tab_index) == category
+                ):
+                    tab_by_workflow[category] = tab_index
+
+        try:
+            legacy_last_tab = int(self.settings.get("last_tab_index", -1))
+        except (TypeError, ValueError):
+            legacy_last_tab = -1
+        if self._valid_mode_tab_index(legacy_last_tab):
+            tab_by_workflow[self._mode_tab_category(legacy_last_tab)] = legacy_last_tab
+        return tab_by_workflow
+
+    def _remember_mode_tab_by_workflow(self, tab_index: int, *, force: bool = False) -> None:
+        if getattr(self, "_mode_tab_memory_suspended", False) and not force:
+            return
+        if not self._valid_mode_tab_index(tab_index):
+            return
+        if not hasattr(self, "last_mode_tab_by_workflow"):
+            self.last_mode_tab_by_workflow = self._default_mode_tab_by_workflow()
+        self.last_mode_tab_by_workflow[self._mode_tab_category(tab_index)] = tab_index
+
+    def _preferred_mode_tab_for_workflow(self, category: int, visible_indexes: list[int]) -> int:
+        if not visible_indexes:
+            return -1
+        remembered_index = getattr(self, "last_mode_tab_by_workflow", {}).get(category)
+        if remembered_index in visible_indexes:
+            return int(remembered_index)
+        default_index = self._default_mode_tab_by_workflow().get(category)
+        if default_index in visible_indexes:
+            return int(default_index)
+        return int(visible_indexes[0])
+
     def _apply_workflow_category_visibility(self, *, select_first: bool) -> None:
         if not hasattr(self, "workflow_category_bar"):
             return
         category = self.workflow_category_bar.currentIndex()
         if hasattr(self, "annotate_help_button"):
             self.annotate_help_button.setVisible(category == self.CATEGORY_ANNOTATE)
+
         visible_indexes: list[int] = []
-        for tab_index, _key, _label in self._mode_tab_specs():
-            action = getattr(self, "tab_visibility_actions", {}).get(tab_index)
-            enabled_by_user = action is None or action.isChecked()
-            visible = enabled_by_user and self._mode_tab_category(tab_index) == category
-            self.mode_tabs.setTabVisible(tab_index, visible)
-            if visible:
-                visible_indexes.append(tab_index)
-        if not visible_indexes:
-            return
-        if select_first or self.mode_tabs.currentIndex() not in visible_indexes:
-            self.mode_tabs.setCurrentIndex(visible_indexes[0])
+        selected_index: int | None = None
+        was_suspended = bool(getattr(self, "_mode_tab_memory_suspended", False))
+        self._mode_tab_memory_suspended = True
+        try:
+            for tab_index, _key, _label in self._mode_tab_specs():
+                action = getattr(self, "tab_visibility_actions", {}).get(tab_index)
+                enabled_by_user = action is None or action.isChecked()
+                visible = enabled_by_user and self._mode_tab_category(tab_index) == category
+                self.mode_tabs.setTabVisible(tab_index, visible)
+                if visible:
+                    visible_indexes.append(tab_index)
+
+            if visible_indexes:
+                current_index = self.mode_tabs.currentIndex()
+                if select_first or current_index not in visible_indexes:
+                    preferred_index = self._preferred_mode_tab_for_workflow(category, visible_indexes)
+                    if preferred_index >= 0:
+                        self.mode_tabs.setCurrentIndex(preferred_index)
+                        selected_index = preferred_index
+                else:
+                    selected_index = current_index
+        finally:
+            self._mode_tab_memory_suspended = was_suspended
+
+        if selected_index is None:
+            selected_index = self.mode_tabs.currentIndex()
+        if selected_index in visible_indexes:
+            self._remember_mode_tab_by_workflow(selected_index, force=True)
 
     def _refresh_workflow_hierarchy_ui(self) -> None:
         if not hasattr(self, "workflow_tools_label"):
@@ -2831,6 +3566,13 @@ class MainWindow(
         )
 
     def _on_workflow_category_changed(self, _category_index: int) -> None:
+        self._refresh_workflow_hierarchy_ui()
+        self._apply_workflow_category_visibility(select_first=True)
+        self._save_settings()
+
+    def _on_workflow_category_clicked(self, category_index: int) -> None:
+        if category_index != self.workflow_category_bar.currentIndex():
+            return
         self._refresh_workflow_hierarchy_ui()
         self._apply_workflow_category_visibility(select_first=True)
         self._save_settings()
@@ -2958,10 +3700,20 @@ class MainWindow(
             requested_index = int(self.settings.get("last_tab_index", self.TAB_TRACKING_REPAIR))
         except (TypeError, ValueError):
             requested_index = self.TAB_TRACKING_REPAIR
-        valid_indexes = {tab_index for tab_index, _key, _label in self._mode_tab_specs()}
-        if requested_index not in valid_indexes:
+        if not self._valid_mode_tab_index(requested_index):
+            requested_index = self._preferred_mode_tab_for_workflow(
+                self.workflow_category_bar.currentIndex(),
+                [
+                    tab_index
+                    for tab_index, _, _ in self._mode_tab_specs()
+                    if self._mode_tab_category(tab_index) == self.workflow_category_bar.currentIndex()
+                    and self.mode_tabs.isTabVisible(tab_index)
+                ],
+            )
+        if requested_index < 0:
             requested_index = self.TAB_TRACKING_REPAIR
-        self.workflow_category_bar.setCurrentIndex(self._mode_tab_category(requested_index))
+        requested_category = self._mode_tab_category(requested_index)
+        self.workflow_category_bar.setCurrentIndex(requested_category)
         self._apply_workflow_category_visibility(select_first=False)
         visible_indexes = [
             tab_index
@@ -2969,8 +3721,14 @@ class MainWindow(
             if self.mode_tabs.isTabVisible(tab_index)
         ]
         if visible_indexes:
-            selected_index = requested_index if requested_index in visible_indexes else visible_indexes[0]
-            self.mode_tabs.setCurrentIndex(selected_index)
+            selected_index = (
+                requested_index
+                if requested_index in visible_indexes
+                else self._preferred_mode_tab_for_workflow(requested_category, visible_indexes)
+            )
+            if selected_index >= 0:
+                self.mode_tabs.setCurrentIndex(selected_index)
+                self._remember_mode_tab_by_workflow(selected_index, force=True)
 
     def _connect_signals(self) -> None:
 
@@ -3021,6 +3779,11 @@ class MainWindow(
         self.export_circle_mask_button.clicked.connect(self.export_circle_mask)
         self.pin_reset_button.clicked.connect(self.reset_pins)
         self.pin_remove_last_button.clicked.connect(self.remove_last_pin)
+        self.pin_import_button.clicked.connect(self.import_pins_metadata)
+        self.pin_export_button.clicked.connect(self.export_pins_metadata)
+        self.pin_show_outside_tab_checkbox.toggled.connect(self._on_pin_option_changed)
+        self.pin_snap_checkbox.toggled.connect(self._on_pin_option_changed)
+        self.pin_snap_radius_spinbox.valueChanged.connect(self._on_pin_option_changed)
 
         self.mask_name_button.clicked.connect(self.add_mask)
         self.mask_rename_button.clicked.connect(self.rename_mask)
@@ -3084,6 +3847,7 @@ class MainWindow(
         self.frame_viewer.occ_transform_erase_segment_requested.connect(self.erase_occ_transform_segment)
         self.frame_viewer.occ_transform_finished.connect(self._finalize_occ_transform)
         self.frame_viewer.occ_mask_double_clicked.connect(self._on_occ_mask_double_clicked)
+        self._connect_persistent_spinbox_settings()
 
     def _register_shortcuts(self) -> None:
         QShortcut(QKeySequence("Ctrl+B"), self, activated=self._toggle_file_sidebar)
@@ -3223,9 +3987,69 @@ class MainWindow(
         except Exception:
             return {}
 
+    def _persistent_spinbox_widgets(self) -> dict[str, QSpinBox | QDoubleSpinBox]:
+        widgets: dict[str, QSpinBox | QDoubleSpinBox] = {}
+        for name in self.PERSISTENT_SPINBOX_NAMES:
+            widget = getattr(self, name, None)
+            if isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+                widgets[name] = widget
+        return widgets
+
+    def _persistent_spinbox_settings_payload(self) -> dict:
+        values: dict[str, int | float] = {}
+        for name, widget in self._persistent_spinbox_widgets().items():
+            value = widget.value()
+            values[name] = float(value) if isinstance(widget, QDoubleSpinBox) else int(value)
+        return {self.PERSISTENT_SPINBOX_SETTINGS_KEY: values}
+
+    def _restore_persistent_spinbox_values(self) -> None:
+        saved_values = self.settings.get(self.PERSISTENT_SPINBOX_SETTINGS_KEY, {})
+        if not isinstance(saved_values, dict):
+            return
+        widgets = self._persistent_spinbox_widgets()
+        if not widgets:
+            return
+        self._restoring_persistent_spinbox_values = True
+        self._settings_save_suspended = True
+        try:
+            for name, widget in widgets.items():
+                if name not in saved_values:
+                    continue
+                raw_value = saved_values.get(name)
+                try:
+                    if isinstance(widget, QDoubleSpinBox):
+                        value = float(raw_value)
+                    else:
+                        value = int(round(float(raw_value)))
+                except (TypeError, ValueError):
+                    continue
+                value = max(widget.minimum(), min(widget.maximum(), value))
+                widget.setValue(value)
+        finally:
+            self._settings_save_suspended = False
+            self._restoring_persistent_spinbox_values = False
+
+    def _connect_persistent_spinbox_settings(self) -> None:
+        for widget in self._persistent_spinbox_widgets().values():
+            widget.valueChanged.connect(self._on_persistent_spinbox_value_changed)
+
+    def _on_persistent_spinbox_value_changed(self, *_args) -> None:
+        if getattr(self, "_restoring_persistent_spinbox_values", False):
+            return
+        self._save_settings()
+
     def _save_settings(self) -> None:
+        if getattr(self, "_settings_save_suspended", False):
+            return
+        if hasattr(self, "mode_tabs"):
+            self._remember_mode_tab_by_workflow(self.mode_tabs.currentIndex())
         data = {
             "last_tab_index": self.mode_tabs.currentIndex() if hasattr(self, "mode_tabs") else 0,
+            "last_mode_tab_by_workflow": {
+                str(category): int(tab_index)
+                for category, tab_index in getattr(self, "last_mode_tab_by_workflow", {}).items()
+                if self._valid_mode_tab_index(int(tab_index))
+            },
             "workflow_category": (
                 self.workflow_category_bar.currentIndex()
                 if hasattr(self, "workflow_category_bar")
@@ -3253,6 +4077,8 @@ class MainWindow(
         data.update(self._pipeline_settings_payload())
         data.update(self._tracking_repair_settings_payload())
         data.update(self._interpolation_settings_payload())
+        data.update(self._pin_settings_payload())
+        data.update(self._persistent_spinbox_settings_payload())
         try:
             SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
             SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -3727,6 +4553,7 @@ class MainWindow(
                 name=room.name,
                 color=QColor(room.color),
                 mask=room.mask.copy().astype(np.uint8),
+                geometry=clone_mask_geometry(room.geometry),
             )
             for room in self._effective_room_records()
         ]
@@ -3739,6 +4566,7 @@ class MainWindow(
                 mask=record.mask.copy().astype(np.uint8),
                 margin=int(record.margin),
                 margin_mode=str(record.margin_mode),
+                geometry=clone_mask_geometry(record.geometry),
             )
             for record in self.mask_records.values()
         ]
@@ -3852,7 +4680,14 @@ class MainWindow(
                         interpolation=cv2.INTER_NEAREST,
                     )
                     room_mask = np.logical_and(resized_mask > 0, chamber_mask > 0).astype(np.uint8)
-                    scaled_rooms.append(RoomRecord(name=room.name, color=room.color, mask=room_mask))
+                    scaled_rooms.append(
+                        RoomRecord(
+                            name=room.name,
+                            color=room.color,
+                            mask=room_mask,
+                            geometry=scale_mask_geometry(room.geometry, item.scale_x, item.scale_y),
+                        )
+                    )
                 result_df = build_chamber_mark_dataframe(
                     item.source_df,
                     item.bodyparts,
@@ -3893,6 +4728,7 @@ class MainWindow(
                             mask=(resized_mask > 0).astype(np.uint8),
                             margin=record.margin,
                             margin_mode=record.margin_mode,
+                            geometry=scale_mask_geometry(record.geometry, item.scale_x, item.scale_y),
                         )
                     )
                 result_df = build_occlusion_dataframe(
@@ -4565,6 +5401,7 @@ class MainWindow(
         self.zoom_label.setText(f"{int(round(self.frame_viewer.zoom_factor * 100))}%")
 
     def _on_mode_changed(self, index: int) -> None:
+        self._remember_mode_tab_by_workflow(index)
         self._sync_current_output_default_suffix(index)
         if index == self.TAB_TRACKING_REPAIR:
             self.frame_viewer.set_mode("inspect")
@@ -4639,10 +5476,14 @@ class MainWindow(
             label,
             {
                 "chamber_mask": self._copy_mask_payload(self.chamber_mask),
+                "chamber_geometry": clone_mask_geometry(getattr(self, "chamber_geometry", None)),
                 "boundary_mode": getattr(self, "chamber_boundary_mode", "unset"),
                 "selected_room_name": self.selected_room_name,
                 "rooms": {
-                    name: room.mask.copy().astype(np.uint8)
+                    name: {
+                        "mask": room.mask.copy().astype(np.uint8),
+                        "geometry": clone_mask_geometry(room.geometry),
+                    }
                     for name, room in self.room_records.items()
                 },
             },
@@ -4653,6 +5494,7 @@ class MainWindow(
             "circle_start": None if self.frame_viewer.circle_start is None else tuple(self.frame_viewer.circle_start),
             "circle_end": None if self.frame_viewer.circle_end is None else tuple(self.frame_viewer.circle_end),
             "margin": int(self.circle_margin_slider.value()),
+            "source": getattr(self.frame_viewer, "circle_geometry_source", "exact"),
         }
 
     def _push_circle_undo(self, label: str = "edit circle mask") -> None:
@@ -4665,7 +5507,10 @@ class MainWindow(
             {
                 "selected_mask_name": self.selected_mask_name,
                 "masks": {
-                    name: record.mask.copy().astype(np.uint8)
+                    name: {
+                        "mask": record.mask.copy().astype(np.uint8),
+                        "geometry": clone_mask_geometry(record.geometry),
+                    }
                     for name, record in self.mask_records.items()
                 },
             },
@@ -4684,12 +5529,19 @@ class MainWindow(
             if chamber_mask is None
             else (np.asarray(chamber_mask) > 0).astype(np.uint8)
         )
+        self.chamber_geometry = clone_mask_geometry(payload.get("chamber_geometry"))
         self._set_chamber_boundary_mode(str(payload.get("boundary_mode", "unset")))
         rooms = payload.get("rooms", {})
         if isinstance(rooms, dict):
-            for name, mask in rooms.items():
+            for name, entry in rooms.items():
                 room = self.room_records.get(str(name))
                 if room is not None:
+                    if isinstance(entry, dict):
+                        mask = entry.get("mask")
+                        room.geometry = clone_mask_geometry(entry.get("geometry"))
+                    else:
+                        mask = entry
+                        room.geometry = None
                     room.mask = (np.asarray(mask) > 0).astype(np.uint8)
         selected_name = payload.get("selected_room_name")
         if isinstance(selected_name, str) and selected_name in self.room_records:
@@ -4716,6 +5568,8 @@ class MainWindow(
         end = payload.get("circle_end")
         self.frame_viewer.circle_start = None if start is None else tuple(start)
         self.frame_viewer.circle_end = None if end is None else tuple(end)
+        source = str(payload.get("source", "exact"))
+        self.frame_viewer.circle_geometry_source = source if source in {"exact", "inferred"} else "exact"
         self.frame_viewer._circle_current = None
         self.frame_viewer._circle_dragging = False
         self.frame_viewer._circle_move_dragging = False
@@ -4730,9 +5584,15 @@ class MainWindow(
             return
         masks = payload.get("masks", {})
         if isinstance(masks, dict):
-            for name, mask in masks.items():
+            for name, entry in masks.items():
                 record = self.mask_records.get(str(name))
                 if record is not None:
+                    if isinstance(entry, dict):
+                        mask = entry.get("mask")
+                        record.geometry = clone_mask_geometry(entry.get("geometry"))
+                    else:
+                        mask = entry
+                        record.geometry = None
                     record.mask = (np.asarray(mask) > 0).astype(np.uint8)
         selected_name = payload.get("selected_mask_name")
         if isinstance(selected_name, str) and selected_name in self.mask_records:
@@ -4824,12 +5684,14 @@ class MainWindow(
                     source="Chamber",
                     mask=self.chamber_mask.copy().astype(np.uint8),
                     color_name="#d1d5db",
+                    geometry=clone_mask_geometry(getattr(self, "chamber_geometry", None)),
                 )
             current = self._selected_room()
             if current is None:
                 return None
             effective = self._effective_room_records_dict().get(current.name)
             mask = current.mask if effective is None else effective.mask
+            geometry = current.geometry if effective is None else effective.geometry
             if not np.any(mask):
                 return None
             return MaskClipboardItem(
@@ -4837,6 +5699,7 @@ class MainWindow(
                 source="Chamber",
                 mask=mask.copy().astype(np.uint8),
                 color_name=current.color.name(),
+                geometry=clone_mask_geometry(geometry),
             )
 
         if tab_index == self.TAB_CIRCLE:
@@ -4854,6 +5717,7 @@ class MainWindow(
                     adjusted_radius,
                 ),
                 color_name="#ef4444",
+                geometry=circle_mask_geometry(center, base_radius, adjusted_radius, source="exact"),
                 circle_center=center,
                 circle_base_radius=base_radius,
                 circle_margin=int(self.circle_margin_slider.value()),
@@ -4870,6 +5734,7 @@ class MainWindow(
                 color_name=current.color.name(),
                 margin=int(current.margin),
                 margin_mode=current.margin_mode,
+                geometry=clone_mask_geometry(current.geometry),
             )
         return None
 
@@ -4897,25 +5762,46 @@ class MainWindow(
             )
         return (mask > 0).astype(np.uint8)
 
-    def _scaled_clipboard_circle_geometry(self) -> tuple[tuple[float, float], float, int] | None:
+    def _scaled_clipboard_geometry(self) -> dict | None:
         item = self._mask_clipboard
-        if (
-            item is None
-            or self.video_state is None
-            or item.circle_center is None
-            or item.circle_base_radius is None
-        ):
+        if item is None or self.video_state is None:
+            return None
+        source_height, source_width = item.mask.shape[:2]
+        scale_x = self.video_state.width / max(1.0, float(source_width))
+        scale_y = self.video_state.height / max(1.0, float(source_height))
+        return scale_mask_geometry(item.geometry, scale_x, scale_y)
+
+    def _scaled_clipboard_circle_geometry(self) -> tuple[tuple[float, float], float, int, str] | None:
+        item = self._mask_clipboard
+        if item is None or self.video_state is None:
             return None
         source_height, source_width = item.mask.shape[:2]
         scale_x = self.video_state.width / max(1.0, float(source_width))
         scale_y = self.video_state.height / max(1.0, float(source_height))
         radius_scale = (scale_x + scale_y) / 2.0
+        scaled_geometry = scale_mask_geometry(item.geometry, scale_x, scale_y)
+        if isinstance(scaled_geometry, dict) and str(scaled_geometry.get("kind", "")).lower() == "circle":
+            center_value = scaled_geometry.get("center")
+            try:
+                center = (float(center_value[0]), float(center_value[1]))
+                base_radius = float(scaled_geometry.get("base_radius", scaled_geometry.get("radius")))
+            except (TypeError, ValueError, IndexError):
+                center = None
+                base_radius = 0.0
+            if center is not None and base_radius > 0:
+                source = str(scaled_geometry.get("source", "exact")).lower()
+                if source not in {"exact", "inferred"}:
+                    source = "inferred"
+                margin = int(round(float(item.circle_margin) * radius_scale)) if item.source == "Circle" else 0
+                return center, max(1.0, base_radius), margin, source
+        if item.circle_center is None or item.circle_base_radius is None:
+            return None
         center = (
             float(item.circle_center[0]) * scale_x,
             float(item.circle_center[1]) * scale_y,
         )
         margin = int(round(float(item.circle_margin) * radius_scale))
-        return center, max(1.0, float(item.circle_base_radius) * radius_scale), margin
+        return center, max(1.0, float(item.circle_base_radius) * radius_scale), margin, "exact"
 
     def _mask_paste_action_state(self) -> tuple[str, bool]:
         if self._mask_clipboard is None:
@@ -4963,6 +5849,7 @@ class MainWindow(
         if self.chamber_edit_chamber_radio.isChecked():
             self._push_chamber_undo("paste chamber mask")
             self.chamber_mask = mask.copy().astype(np.uint8)
+            self.chamber_geometry = self._scaled_clipboard_geometry()
             self._set_chamber_boundary_mode(
                 "full_frame" if self._is_full_frame_chamber_mask() else "custom"
             )
@@ -5016,6 +5903,11 @@ class MainWindow(
         if paste_replaces_existing_room:
             self._push_chamber_undo("paste room mask")
         current.mask = allowed.astype(np.uint8)
+        current.geometry = (
+            self._scaled_clipboard_geometry()
+            if np.array_equal(allowed.astype(np.uint8), mask.astype(np.uint8))
+            else None
+        )
         self.selected_room_name = current.name
         self._rebuild_room_list()
         self.statusBar().showMessage(
@@ -5061,6 +5953,7 @@ class MainWindow(
             self._push_occlusion_undo("paste occlusion mask")
         self._invalidate_mask_transform_source(current.name)
         current.mask = mask.copy().astype(np.uint8)
+        current.geometry = self._scaled_clipboard_geometry()
         self._rebuild_mask_list()
         self.statusBar().showMessage(
             f"Pasted mask into occlusion: {current.name}", 3000
@@ -5083,8 +5976,9 @@ class MainWindow(
                 return
             center, base_radius = geometry
             margin = 0
+            geometry_source = "inferred"
         else:
-            center, base_radius, margin = scaled_geometry
+            center, base_radius, margin, geometry_source = scaled_geometry
 
         margin = max(
             self.circle_margin_slider.minimum(),
@@ -5094,6 +5988,7 @@ class MainWindow(
         self._set_circle_margin_value(margin)
         self.frame_viewer.circle_start = (center[0] - base_radius, center[1])
         self.frame_viewer.circle_end = (center[0] + base_radius, center[1])
+        self.frame_viewer.circle_geometry_source = geometry_source
         self.frame_viewer.update()
         self.frame_viewer.circle_changed.emit()
         self._refresh_circle_ui()
@@ -5149,7 +6044,13 @@ class MainWindow(
         dst_y1 = dst_y0 + (src_y1 - src_y0)
         if src_x1 > src_x0 and src_y1 > src_y0:
             translated[dst_y0:dst_y1, dst_x0:dst_x1] = current.mask[src_y0:src_y1, src_x0:src_x1]
-            current.mask = smooth_binary_mask_low(translated)
+            translated_geometry = translate_mask_geometry(current.geometry, dx, dy)
+            if mask_geometry_is_exact(current.geometry):
+                current.mask = translated.astype(np.uint8)
+                current.geometry = translated_geometry
+            else:
+                current.mask = smooth_binary_mask_low(translated)
+                current.geometry = None
 
     def _invalidate_mask_transform_source(self, mask_name: str | None = None) -> None:
         if mask_name is not None and mask_name != self._mask_transform_source_name:
@@ -5200,6 +6101,7 @@ class MainWindow(
         self._mask_transform_angle = next_angle
         self._mask_transform_scale = next_scale
         current.mask = smooth_binary_mask_low(transformed)
+        current.geometry = None
         self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
 
     def scale_selected_mask(self, scale_factor: float) -> None:
@@ -5459,13 +6361,22 @@ class MainWindow(
                     name=room.name,
                     color=QColor(room.color),
                     mask=room.mask.copy().astype(np.uint8),
+                    geometry=clone_mask_geometry(room.geometry),
                 )
                 for room in self._effective_room_records()
             ]
             room_metadata = [
-                {"name": room.name, "color": room.color.name()}
+                {
+                    "name": room.name,
+                    "color": room.color.name(),
+                    "geometry": mask_geometry_for_export(room.geometry, room.mask),
+                }
                 for room in self.room_records.values()
             ]
+            chamber_metadata_geometry = mask_geometry_for_export(
+                getattr(self, "chamber_geometry", None),
+                self.chamber_mask,
+            )
             boundary_mode = self._resolved_chamber_boundary_mode()
             mask_rgb = mask_rgb.copy()
             overlay_rgb = overlay_rgb.copy()
@@ -5489,9 +6400,11 @@ class MainWindow(
                     raise OSError(f"Could not write {overlay_output}")
                 metadata = {
                     "format": "happycold_chamber_mask_v1",
+                    "metadata_version": 2,
                     "width": width,
                     "height": height,
                     "boundary_mode": boundary_mode,
+                    "geometry": chamber_metadata_geometry,
                     "rooms": room_metadata,
                 }
                 manifest_output.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -5571,6 +6484,7 @@ class MainWindow(
                     mask=record.mask.copy().astype(np.uint8),
                     margin=int(record.margin),
                     margin_mode=str(record.margin_mode),
+                    geometry=clone_mask_geometry(record.geometry),
                 )
                 for record in self.mask_records.values()
             ]

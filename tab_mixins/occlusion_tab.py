@@ -31,10 +31,15 @@ from shared import (
     MaskRecord,
     adjust_mask_by_mode,
     build_occlusion_dataframe,
+    circle_mask_geometry,
     fill_circle_from_diameter,
     fill_polygon,
-    order_quad_points,
+    mask_geometry_for_export,
+    mask_geometry_is_exact,
+    mask_polygon_geometry,
     paint_brush,
+    validated_quad_points,
+    scale_mask_geometry,
     smooth_binary_mask_low,
 )
 from ui_controls import NoWheelComboBox, NoWheelSpinBox
@@ -442,6 +447,7 @@ class OcclusionTabMixin:
                 self._push_occlusion_undo("clear occlusion mask")
             self._invalidate_mask_transform_source(current.name)
             current.mask.fill(0)
+            current.geometry = None
             self.frame_viewer.set_mask_records(self.mask_records, self.selected_mask_name, refresh=True)
             self._refresh_mask_ui()
 
@@ -609,7 +615,8 @@ class OcclusionTabMixin:
     def _finalize_occ_transform(self) -> None:
         current = self._selected_mask()
         if current is not None:
-            current.mask = smooth_binary_mask_low(current.mask)
+            if not mask_geometry_is_exact(current.geometry):
+                current.mask = smooth_binary_mask_low(current.mask)
             self._invalidate_mask_transform_source(current.name)
             # Rebuild margin only once after drag/erase transform interaction ends.
             self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
@@ -626,6 +633,7 @@ class OcclusionTabMixin:
                 self._push_occlusion_undo("erase transformed occlusion mask")
             self._occlusion_transform_undo_open = True
         self._invalidate_mask_transform_source(current.name)
+        current.geometry = None
         brush_radius = max(1, int(self.mask_brush_slider.value()))
         paint_brush(current.mask, point, point, brush_radius, 0)
         self.frame_viewer.refresh_mask_record(current.name, include_margin=False)
@@ -639,6 +647,7 @@ class OcclusionTabMixin:
                 self._push_occlusion_undo("erase transformed occlusion mask")
             self._occlusion_transform_undo_open = True
         self._invalidate_mask_transform_source(current.name)
+        current.geometry = None
         start, end = payload
         brush_radius = max(1, int(self.mask_brush_slider.value()))
         paint_brush(current.mask, start, end, brush_radius, 0)
@@ -668,7 +677,30 @@ class OcclusionTabMixin:
         if hasattr(self, "_push_occlusion_undo"):
             self._push_occlusion_undo("draw occlusion rectangle")
         self._invalidate_mask_transform_source(current.name)
-        fill_polygon(current.mask, order_quad_points(points).tolist(), 1 if add else 0)
+        had_pixels = bool(np.any(current.mask))
+        ordered = validated_quad_points(points)
+        if ordered is None:
+            self.statusBar().showMessage("Rectangle needs four distinct corner points.", 3000)
+            self.frame_viewer.clear_occ_rect_points()
+            return
+        ordered_points = ordered.tolist()
+        shape_mask = np.zeros_like(current.mask, dtype=np.uint8)
+        fill_polygon(shape_mask, ordered_points, 1)
+        if add:
+            current.mask = np.logical_or(
+                current.mask.astype(bool),
+                shape_mask.astype(bool),
+            ).astype(np.uint8)
+        else:
+            current.mask = np.logical_and(
+                current.mask.astype(bool),
+                ~shape_mask.astype(bool),
+            ).astype(np.uint8)
+        current.geometry = (
+            mask_polygon_geometry(ordered_points, source="exact", shape="rectangle")
+            if add and not had_pixels
+            else None
+        )
         self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
         self._refresh_mask_ui()
 
@@ -687,7 +719,29 @@ class OcclusionTabMixin:
         if hasattr(self, "_push_occlusion_undo"):
             self._push_occlusion_undo("draw occlusion circle")
         self._invalidate_mask_transform_source(current.name)
-        fill_circle_from_diameter(current.mask, start, end, 1 if add else 0)
+        had_pixels = bool(np.any(current.mask))
+        shape_mask = np.zeros_like(current.mask, dtype=np.uint8)
+        fill_circle_from_diameter(shape_mask, start, end, 1)
+        if add:
+            current.mask = np.logical_or(
+                current.mask.astype(bool),
+                shape_mask.astype(bool),
+            ).astype(np.uint8)
+        else:
+            current.mask = np.logical_and(
+                current.mask.astype(bool),
+                ~shape_mask.astype(bool),
+            ).astype(np.uint8)
+        current.geometry = (
+            circle_mask_geometry(
+                ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0),
+                float(np.hypot(start[0] - end[0], start[1] - end[1]) / 2.0),
+                float(np.hypot(start[0] - end[0], start[1] - end[1]) / 2.0),
+                source="exact",
+            )
+            if add and not had_pixels
+            else None
+        )
         self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
         self.frame_viewer.clear_occ_circle()
         self._refresh_mask_ui()
@@ -702,6 +756,7 @@ class OcclusionTabMixin:
             self._occlusion_free_undo_open = True
         start, end, add = payload
         self._invalidate_mask_transform_source(current.name)
+        current.geometry = None
         paint_brush(current.mask, start, end, self.mask_brush_slider.value(), 1 if add else 0)
         now = time.monotonic()
         if now - getattr(self, "_last_mask_preview_refresh", 0.0) >= 0.03:
@@ -731,8 +786,18 @@ class OcclusionTabMixin:
                 manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
             except Exception:
                 manifest_data = {}
+        if not isinstance(manifest_data, dict):
+            manifest_data = {}
+        mask_metadata_map = manifest_data.get("masks") if isinstance(manifest_data.get("masks"), dict) else manifest_data
+        source_width = manifest_data.get("width") if isinstance(manifest_data, dict) else None
+        source_height = manifest_data.get("height") if isinstance(manifest_data, dict) else None
         for path in sorted(folder_path.glob("*.png")):
-            self._import_mask_file(path, manifest_data.get(path.stem, {}))
+            metadata = dict(mask_metadata_map.get(path.stem, {}) or {}) if isinstance(mask_metadata_map, dict) else {}
+            if source_width is not None:
+                metadata.setdefault("_manifest_width", source_width)
+            if source_height is not None:
+                metadata.setdefault("_manifest_height", source_height)
+            self._import_mask_file(path, metadata)
 
     def _import_mask_file(self, path: Path, metadata: dict | None = None) -> None:
         if self.video_state is None:
@@ -740,16 +805,45 @@ class OcclusionTabMixin:
         img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if img is None:
             return
+        original_height, original_width = img.shape[:2]
+        metadata = dict(metadata or {})
+        if not metadata:
+            sidecar_path = path.with_suffix(".json")
+            if sidecar_path.exists():
+                try:
+                    loaded = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        metadata = loaded
+                except Exception:
+                    metadata = {}
+        try:
+            source_width = max(1.0, float(metadata.get("width", metadata.get("_manifest_width", original_width))))
+            source_height = max(1.0, float(metadata.get("height", metadata.get("_manifest_height", original_height))))
+        except (TypeError, ValueError):
+            source_width = max(1.0, float(original_width))
+            source_height = max(1.0, float(original_height))
+        scale_x = self.video_state.width / source_width
+        scale_y = self.video_state.height / source_height
         if img.shape != (self.video_state.height, self.video_state.width):
             img = cv2.resize(img, (self.video_state.width, self.video_state.height), interpolation=cv2.INTER_NEAREST)
         name = self._next_available_mask_name(path.stem)
-        margin = int((metadata or {}).get("margin", 0))
-        margin_mode = str((metadata or {}).get("margin_mode", "simple"))
+        try:
+            margin = int(metadata.get("margin", 0))
+        except (TypeError, ValueError):
+            margin = 0
+        margin_mode = str(metadata.get("margin_mode", "simple"))
         if margin_mode not in {"simple", "geometric"}:
             margin_mode = "simple"
-        color_hex = (metadata or {}).get("color")
+        color_hex = metadata.get("color")
         color = QColor(color_hex) if color_hex else MASK_PALETTE[len(self.mask_records) % len(MASK_PALETTE)]
-        self.mask_records[name] = MaskRecord(name=name, color=color, mask=(img > 0).astype(np.uint8), margin=margin, margin_mode=margin_mode)
+        self.mask_records[name] = MaskRecord(
+            name=name,
+            color=color,
+            mask=(img > 0).astype(np.uint8),
+            margin=margin,
+            margin_mode=margin_mode,
+            geometry=scale_mask_geometry(metadata.get("geometry"), scale_x, scale_y),
+        )
         self.selected_mask_name = name
         self._rebuild_mask_list()
 
@@ -759,14 +853,29 @@ class OcclusionTabMixin:
             return
         folder = self._mask_export_folder()
         folder.mkdir(parents=True, exist_ok=True)
-        manifest = {}
+        first_record = next(iter(self.mask_records.values()))
+        height, width = first_record.mask.shape[:2]
+        manifest = {
+            "format": "happycold_occlusion_masks_v1",
+            "metadata_version": 2,
+            "width": int(width),
+            "height": int(height),
+            "masks": {},
+        }
         for name, record in self.mask_records.items():
             img = record.mask.astype(np.uint8) * 255
             ok = cv2.imwrite(str(folder / f"{name}.png"), img)
             if not ok:
                 QMessageBox.warning(self, "Export Masks", f"Could not write mask image:\n{folder / f'{name}.png'}")
                 return
-            manifest[name] = {"margin": int(record.margin), "margin_mode": record.margin_mode, "color": record.color.name()}
+            metadata = {
+                "margin": int(record.margin),
+                "margin_mode": record.margin_mode,
+                "color": record.color.name(),
+                "geometry": mask_geometry_for_export(record.geometry, record.mask),
+            }
+            manifest["masks"][name] = metadata
+            manifest[name] = metadata
         try:
             (folder / "masks_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         except Exception as exc:

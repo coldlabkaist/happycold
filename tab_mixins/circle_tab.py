@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from shared import build_circle_detection_dataframe
+from shared import build_circle_detection_dataframe, circle_mask_geometry
 from ui_controls import NoWheelSpinBox
 
 
@@ -110,6 +110,7 @@ def write_circle_mask_bundle(
     center: tuple[float, float],
     base_radius: float,
     margin: int,
+    source: str = "exact",
 ) -> None:
     adjusted_radius = max(1.0, float(base_radius) + int(margin))
     mask = build_circle_mask(width, height, center, adjusted_radius) * 255
@@ -118,12 +119,19 @@ def write_circle_mask_bundle(
         raise OSError(f"Could not write {mask_path}")
     metadata = {
         "format": "happycold_circle_mask_v1",
+        "metadata_version": 2,
         "width": int(width),
         "height": int(height),
         "center": [float(center[0]), float(center[1])],
         "base_radius": float(base_radius),
         "margin": int(margin),
         "adjusted_radius": adjusted_radius,
+        "geometry": circle_mask_geometry(
+            center,
+            base_radius,
+            adjusted_radius,
+            source=source,
+        ),
     }
     manifest_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
@@ -133,7 +141,8 @@ def load_circle_mask_bundle(
     *,
     width: int,
     height: int,
-) -> tuple[tuple[float, float], float, int]:
+    return_source: bool = False,
+) -> tuple[tuple[float, float], float, int] | tuple[tuple[float, float], float, int, str]:
     image = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
     if image is None:
         raise ValueError(f"Could not read mask file: {mask_path}")
@@ -145,6 +154,7 @@ def load_circle_mask_bundle(
 
     manifest_path = mask_path.with_suffix(".json")
     metadata: dict = {}
+    geometry_source = "inferred"
     if manifest_path.exists():
         try:
             loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -166,9 +176,20 @@ def load_circle_mask_bundle(
         )
         base_radius = max(1.0, float(metadata["base_radius"]) * radius_scale)
         margin = int(round(float(metadata.get("margin", 0)) * radius_scale))
+        geometry_metadata = metadata.get("geometry")
+        geometry_source = (
+            str(geometry_metadata.get("source", "exact")).lower()
+            if isinstance(geometry_metadata, dict)
+            else "exact"
+        )
+        if geometry_source not in {"exact", "inferred"}:
+            geometry_source = "inferred"
     except (KeyError, TypeError, ValueError, IndexError):
         center, base_radius = inferred
         margin = 0
+        geometry_source = "inferred"
+    if return_source:
+        return center, base_radius, margin, geometry_source
     return center, base_radius, margin
 
 
@@ -384,6 +405,7 @@ class CircleTabMixin:
                 center=center,
                 base_radius=base_radius,
                 margin=self.circle_margin_slider.value(),
+                source=getattr(self.frame_viewer, "circle_geometry_source", "exact"),
             )
         except Exception as exc:
             QMessageBox.warning(self, "Circle Mask", f"Could not export circle mask.\n\n{exc}")
@@ -408,10 +430,11 @@ class CircleTabMixin:
         if self.video_state is None:
             return
         try:
-            center, base_radius, margin = load_circle_mask_bundle(
+            center, base_radius, margin, geometry_source = load_circle_mask_bundle(
                 path,
                 width=self.video_state.width,
                 height=self.video_state.height,
+                return_source=True,
             )
         except Exception as exc:
             QMessageBox.warning(self, "Import Circle Mask", str(exc))
@@ -425,6 +448,7 @@ class CircleTabMixin:
         self._set_circle_margin_value(margin)
         self.frame_viewer.circle_start = (center[0] - base_radius, center[1])
         self.frame_viewer.circle_end = (center[0] + base_radius, center[1])
+        self.frame_viewer.circle_geometry_source = geometry_source
         self.frame_viewer.circle_changed.emit()
         self.statusBar().showMessage(f"Imported circle mask: {path.name}")
 

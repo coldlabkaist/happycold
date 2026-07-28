@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from shared import MASK_PALETTE, MaskTransformSource, RoomRecord, build_chamber_mark_dataframe, fill_circle_from_diameter, fill_polygon, order_quad_points, smooth_binary_mask_low
+from shared import MASK_PALETTE, MaskTransformSource, RoomRecord, build_chamber_mark_dataframe, circle_mask_geometry, clone_mask_geometry, fill_circle_from_diameter, fill_polygon, full_frame_mask_geometry, mask_geometry_for_export, mask_geometry_is_exact, mask_polygon_geometry, scale_mask_geometry, smooth_binary_mask_low, translate_mask_geometry, validated_quad_points
 from ui_controls import NoWheelComboBox
 
 
@@ -228,6 +228,7 @@ class ChamberTabMixin:
             room = self.room_records.get(effective.name)
             if room is not None:
                 room.mask = effective.mask.copy().astype(np.uint8)
+                room.geometry = clone_mask_geometry(effective.geometry)
 
     def set_chamber_to_full_frame(self, _checked: bool | None = None, *, show_message: bool = True) -> None:
         mask = self._full_frame_chamber_mask()
@@ -241,6 +242,7 @@ class ChamberTabMixin:
             self._push_chamber_undo("set full-frame chamber")
         self._invalidate_chamber_transform_source()
         self.chamber_mask = mask
+        self.chamber_geometry = full_frame_mask_geometry(mask.shape[1], mask.shape[0])
         self._set_chamber_boundary_mode("full_frame")
         self.chamber_edit_chamber_radio.setChecked(True)
         self.frame_viewer.clear_chamber_rect_points()
@@ -257,6 +259,7 @@ class ChamberTabMixin:
             return
         self._invalidate_chamber_transform_source()
         self.chamber_mask = mask
+        self.chamber_geometry = full_frame_mask_geometry(mask.shape[1], mask.shape[0])
         self._set_chamber_boundary_mode("full_frame")
         self.room_records.clear()
         self.selected_room_name = None
@@ -292,14 +295,20 @@ class ChamberTabMixin:
             allowed = room.mask.astype(bool) & chamber & ~occupied
             effective_masks[name] = allowed.astype(np.uint8)
             occupied |= allowed
-        return [
-            RoomRecord(
-                name=room.name,
-                color=room.color,
-                mask=effective_masks.get(room.name, np.zeros(shape, dtype=np.uint8)),
+        records: list[RoomRecord] = []
+        for room in self.room_records.values():
+            effective_mask = effective_masks.get(room.name, np.zeros(shape, dtype=np.uint8))
+            raw_mask = room.mask.astype(np.uint8)
+            geometry = clone_mask_geometry(room.geometry) if np.array_equal(effective_mask, raw_mask) else None
+            records.append(
+                RoomRecord(
+                    name=room.name,
+                    color=room.color,
+                    mask=effective_mask,
+                    geometry=geometry,
+                )
             )
-            for room in self.room_records.values()
-        ]
+        return records
 
     def _effective_room_records_dict(self) -> dict[str, RoomRecord]:
         return {room.name: room for room in self._effective_room_records()}
@@ -310,6 +319,7 @@ class ChamberTabMixin:
             self._effective_room_records_dict(),
             self.selected_room_name,
             refresh=refresh,
+            chamber_geometry=getattr(self, "chamber_geometry", None),
         )
 
     def _selected_chamber_layer(self) -> tuple[str, np.ndarray] | None:
@@ -322,18 +332,32 @@ class ChamberTabMixin:
             return None
         return f"room:{room.name}", room.mask
 
-    def _set_selected_chamber_layer_mask(self, mask: np.ndarray, *, smooth: bool = False) -> None:
+    def _selected_chamber_layer_geometry(self) -> dict | None:
+        if self.chamber_edit_chamber_radio.isChecked():
+            return getattr(self, "chamber_geometry", None)
+        room = self._selected_room()
+        return None if room is None else room.geometry
+
+    def _set_selected_chamber_layer_mask(
+        self,
+        mask: np.ndarray,
+        *,
+        smooth: bool = False,
+        geometry: dict | None = None,
+    ) -> None:
         normalized = (mask > 0).astype(np.uint8)
         if smooth:
             normalized = smooth_binary_mask_low(normalized)
         if self.chamber_edit_chamber_radio.isChecked():
             self.chamber_mask = normalized
+            self.chamber_geometry = clone_mask_geometry(geometry)
             self._mark_chamber_boundary_custom()
         else:
             room = self._selected_room()
             if room is None:
                 return
             room.mask = normalized
+            room.geometry = clone_mask_geometry(geometry)
         self._refresh_chamber_viewer(refresh=True)
         if self.mode_tabs.currentIndex() == self.TAB_CHAMBER:
             self._sync_chamber_mode()
@@ -414,8 +438,14 @@ class ChamberTabMixin:
         ]
         if hasattr(self, "_push_chamber_undo"):
             self._push_chamber_undo("move chamber mask")
+        source_geometry = self._selected_chamber_layer_geometry()
+        translated_geometry = translate_mask_geometry(source_geometry, dx, dy)
         self._invalidate_chamber_transform_source()
-        self._set_selected_chamber_layer_mask(translated, smooth=True)
+        self._set_selected_chamber_layer_mask(
+            translated,
+            smooth=not mask_geometry_is_exact(source_geometry),
+            geometry=translated_geometry if mask_geometry_is_exact(source_geometry) else None,
+        )
 
     def scale_selected_chamber_layer(self, scale_factor: float) -> None:
         self._apply_chamber_affine_transform(scale_multiplier=scale_factor)
@@ -540,12 +570,14 @@ class ChamberTabMixin:
             self._push_chamber_undo("clear room mask")
         self._invalidate_chamber_transform_source()
         current.mask.fill(0)
+        current.geometry = None
         self._refresh_chamber_viewer(refresh=True)
         self._refresh_chamber_ui()
 
     def reset_chamber(self) -> None:
         self._invalidate_chamber_transform_source()
         self.chamber_mask = None
+        self.chamber_geometry = None
         self._set_chamber_boundary_mode("unset")
         self.room_records.clear()
         self.selected_room_name = None
@@ -567,16 +599,22 @@ class ChamberTabMixin:
             occupied |= room.mask.astype(bool)
         return occupied.astype(np.uint8)
 
-    def _apply_chamber_shape_mask(self, shape_mask: np.ndarray) -> None:
+    def _apply_chamber_shape_mask(
+        self,
+        shape_mask: np.ndarray,
+        geometry: dict | None = None,
+    ) -> None:
         if self.video_state is None:
             return
         if hasattr(self, "_push_chamber_undo"):
             self._push_chamber_undo("draw chamber mask")
         self._invalidate_chamber_transform_source()
         if self.chamber_edit_chamber_radio.isChecked():
+            had_pixels = self.chamber_mask is not None and bool(np.any(self.chamber_mask))
             if self.chamber_mask is None:
                 self.chamber_mask = np.zeros((self.video_state.height, self.video_state.width), dtype=np.uint8)
             self.chamber_mask = np.logical_or(self.chamber_mask.astype(bool), shape_mask.astype(bool)).astype(np.uint8)
+            self.chamber_geometry = clone_mask_geometry(geometry) if not had_pixels else None
             self._mark_chamber_boundary_custom()
         else:
             current = self._selected_room()
@@ -586,30 +624,48 @@ class ChamberTabMixin:
             if self.chamber_mask is None or not np.any(self.chamber_mask):
                 QMessageBox.information(self, "Room", "Define the chamber area before assigning rooms.")
                 return
+            had_pixels = bool(np.any(current.mask))
             blocked = self._occupied_room_mask(exclude_name=current.name)
             allowed = shape_mask.astype(bool) & self.chamber_mask.astype(bool)
             if blocked is not None:
                 allowed &= ~blocked.astype(bool)
             current.mask = np.logical_or(current.mask.astype(bool), allowed).astype(np.uint8)
+            current.geometry = (
+                clone_mask_geometry(geometry)
+                if not had_pixels and np.array_equal(allowed.astype(np.uint8), shape_mask.astype(np.uint8))
+                else None
+            )
         self._refresh_chamber_viewer(refresh=True)
         self._refresh_chamber_ui()
 
     def apply_chamber_rect(self, points: list[tuple[float, float]]) -> None:
         if self.video_state is None:
             return
+        ordered = validated_quad_points(points)
+        if ordered is None:
+            self.statusBar().showMessage("Rectangle needs four distinct corner points.", 3000)
+            self.frame_viewer.clear_chamber_rect_points()
+            return
         shape_mask = np.zeros((self.video_state.height, self.video_state.width), dtype=np.uint8)
-        fill_polygon(shape_mask, order_quad_points(points).tolist(), 1)
-        self._apply_chamber_shape_mask(shape_mask)
+        ordered_points = ordered.tolist()
+        fill_polygon(shape_mask, ordered_points, 1)
+        self._apply_chamber_shape_mask(
+            shape_mask,
+            mask_polygon_geometry(ordered_points, source="exact", shape="rectangle"),
+        )
 
     def apply_chamber_circle(self, payload: tuple[tuple[float, float], float, tuple[float, float], tuple[float, float]]) -> None:
         if self.video_state is None:
             return
-        _, _, start, end = payload
+        center, base_radius, start, end = payload
         if start is None or end is None:
             return
         shape_mask = np.zeros((self.video_state.height, self.video_state.width), dtype=np.uint8)
         fill_circle_from_diameter(shape_mask, start, end, 1)
-        self._apply_chamber_shape_mask(shape_mask)
+        self._apply_chamber_shape_mask(
+            shape_mask,
+            circle_mask_geometry(center, base_radius, base_radius, source="exact"),
+        )
         self.frame_viewer.clear_chamber_circle()
 
     def _refresh_chamber_ui(self) -> None:
@@ -711,10 +767,22 @@ class ChamberTabMixin:
                 raise OSError(f"Could not write {mask_path}")
             metadata = {
                 "format": "happycold_chamber_mask_v1",
+                "metadata_version": 2,
                 "width": self.video_state.width,
                 "height": self.video_state.height,
                 "boundary_mode": self._resolved_chamber_boundary_mode(),
-                "rooms": [{"name": room.name, "color": room.color.name()} for room in self.room_records.values()],
+                "geometry": mask_geometry_for_export(
+                    getattr(self, "chamber_geometry", None),
+                    self.chamber_mask,
+                ),
+                "rooms": [
+                    {
+                        "name": room.name,
+                        "color": room.color.name(),
+                        "geometry": mask_geometry_for_export(room.geometry, room.mask),
+                    }
+                    for room in self.room_records.values()
+                ],
             }
             manifest_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         except Exception as exc:
@@ -740,16 +808,35 @@ class ChamberTabMixin:
             QMessageBox.warning(self, "Import Chamber Mask", f"Could not read mask file:\n{path}")
             return
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        if image.shape[:2] != (self.video_state.height, self.video_state.width):
-            image = cv2.resize(image, (self.video_state.width, self.video_state.height), interpolation=cv2.INTER_NEAREST)
+        original_height, original_width = image.shape[:2]
 
         manifest_path = path.with_suffix(".json")
+        manifest_data: dict = {}
         room_entries: list[dict] = []
         if manifest_path.exists():
             try:
-                room_entries = json.loads(manifest_path.read_text(encoding="utf-8")).get("rooms", [])
+                loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    manifest_data = loaded
+                    room_entries = loaded.get("rooms", []) if isinstance(loaded.get("rooms", []), list) else []
             except Exception:
+                manifest_data = {}
                 room_entries = []
+
+        try:
+            source_width = max(1.0, float(manifest_data.get("width", original_width)))
+            source_height = max(1.0, float(manifest_data.get("height", original_height)))
+        except (TypeError, ValueError):
+            source_width = max(1.0, float(original_width))
+            source_height = max(1.0, float(original_height))
+        scale_x = self.video_state.width / source_width
+        scale_y = self.video_state.height / source_height
+        chamber_geometry = scale_mask_geometry(manifest_data.get("geometry"), scale_x, scale_y)
+        if chamber_geometry is None and manifest_data.get("boundary_mode") == "full_frame":
+            chamber_geometry = full_frame_mask_geometry(self.video_state.width, self.video_state.height)
+
+        if image.shape[:2] != (self.video_state.height, self.video_state.width):
+            image = cv2.resize(image, (self.video_state.width, self.video_state.height), interpolation=cv2.INTER_NEAREST)
 
         chamber_mask = np.any(image > 0, axis=2).astype(np.uint8)
         imported_rooms: dict[str, RoomRecord] = {}
@@ -760,7 +847,12 @@ class ChamberTabMixin:
                 rgb = np.array([color.red(), color.green(), color.blue()], dtype=np.uint8)
                 room_mask = np.all(image == rgb, axis=2).astype(np.uint8)
                 if np.any(room_mask):
-                    imported_rooms[name] = RoomRecord(name=name, color=color, mask=room_mask)
+                    imported_rooms[name] = RoomRecord(
+                        name=name,
+                        color=color,
+                        mask=room_mask,
+                        geometry=scale_mask_geometry(entry.get("geometry"), scale_x, scale_y),
+                    )
         else:
             unique_colors = np.unique(image.reshape(-1, 3), axis=0)
             inferred_index = 1
@@ -775,6 +867,7 @@ class ChamberTabMixin:
                     imported_rooms[name] = RoomRecord(name=name, color=color, mask=room_mask)
 
         self.chamber_mask = chamber_mask
+        self.chamber_geometry = chamber_geometry
         self._set_chamber_boundary_mode(
             "full_frame" if self._is_full_frame_chamber_mask() else "custom"
         )
@@ -825,10 +918,22 @@ class ChamberTabMixin:
                 raise OSError(f"Could not write {overlay_output}")
             metadata = {
                 "format": "happycold_chamber_mask_v1",
+                "metadata_version": 2,
                 "width": self.video_state.width,
                 "height": self.video_state.height,
                 "boundary_mode": self._resolved_chamber_boundary_mode(),
-                "rooms": [{"name": room.name, "color": room.color.name()} for room in self.room_records.values()],
+                "geometry": mask_geometry_for_export(
+                    getattr(self, "chamber_geometry", None),
+                    self.chamber_mask,
+                ),
+                "rooms": [
+                    {
+                        "name": room.name,
+                        "color": room.color.name(),
+                        "geometry": mask_geometry_for_export(room.geometry, room.mask),
+                    }
+                    for room in self.room_records.values()
+                ],
             }
             manifest_output.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         except Exception as exc:
