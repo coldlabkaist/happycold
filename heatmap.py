@@ -32,12 +32,33 @@ def _grid_shape(x_limit: float, y_limit: float, max_bins: int) -> tuple[int, int
     return max(64, int(round(max_bins * safe_x / safe_y))), max_bins
 
 
+def _clamped_display_bounds(
+    display_bounds: tuple[float, float, float, float],
+    frame_size: tuple[int, int],
+) -> tuple[float, float, float, float]:
+    frame_width = max(1, int(frame_size[0]))
+    frame_height = max(1, int(frame_size[1]))
+    left, top, right, bottom = (float(value) for value in display_bounds)
+    if not all(np.isfinite((left, top, right, bottom))):
+        raise ValueError("Selected spatial range contains invalid coordinates.")
+    left, right = sorted((left, right))
+    top, bottom = sorted((top, bottom))
+    left = max(0.0, min(float(frame_width), left))
+    right = max(0.0, min(float(frame_width), right))
+    top = max(0.0, min(float(frame_height), top))
+    bottom = max(0.0, min(float(frame_height), bottom))
+    if right - left < 1.0 or bottom - top < 1.0:
+        raise ValueError("Selected spatial range is empty.")
+    return left, top, right, bottom
+
+
 def _coordinate_tensor(
     df: pd.DataFrame,
     bodyparts: list[str],
     normalized: bool,
     frame_size: tuple[int, int],
     rectified_size: tuple[int, int] | None,
+    display_bounds: tuple[float, float, float, float] | None,
 ) -> tuple[np.ndarray, float, float]:
     available_coordinates = [
         (bodypart, columns)
@@ -62,12 +83,32 @@ def _coordinate_tensor(
         rect_height = max(1, int(rectified_size[1]))
         coordinates[:, :, 0] *= float(rect_width)
         coordinates[:, :, 1] *= float(rect_height)
+        if display_bounds is not None:
+            left, top, right, bottom = _clamped_display_bounds(
+                display_bounds,
+                (rect_width, rect_height),
+            )
+            coordinates[:, :, 0] -= left
+            coordinates[:, :, 1] -= top
+            return coordinates, right - left, bottom - top
         return coordinates, float(rect_width), float(rect_height)
 
     frame_width = max(1, int(frame_size[0]))
     frame_height = max(1, int(frame_size[1]))
     x_columns = [columns[0] for _bodypart, columns in available_coordinates]
     y_columns = [columns[1] for _bodypart, columns in available_coordinates]
+    if display_bounds is not None:
+        left, top, right, bottom = _clamped_display_bounds(
+            display_bounds,
+            (frame_width, frame_height),
+        )
+        for index, (x_col, y_col) in enumerate(zip(x_columns, y_columns)):
+            coordinates[:, index, 0] *= infer_pixel_scale(df[x_col], frame_width)
+            coordinates[:, index, 1] *= infer_pixel_scale(df[y_col], frame_height)
+        coordinates[:, :, 0] -= left
+        coordinates[:, :, 1] -= top
+        return coordinates, right - left, bottom - top
+
     return (
         coordinates,
         _axis_extent(df, x_columns, frame_width),
@@ -125,6 +166,7 @@ def calculate_body_occupancy_heatmap(
     rectified_size: tuple[int, int] | None = None,
     max_bins: int = 180,
     blur_sigma: float = 1.2,
+    display_bounds: tuple[float, float, float, float] | None = None,
 ) -> HeatmapResult:
     """Calculate body-volume occupancy without depending on any Qt/UI state."""
     coordinates, x_limit, y_limit = _coordinate_tensor(
@@ -133,6 +175,7 @@ def calculate_body_occupancy_heatmap(
         normalized,
         frame_size,
         rectified_size,
+        display_bounds,
     )
     grid_width, grid_height = _grid_shape(x_limit, y_limit, max(64, int(max_bins)))
     counts = np.zeros((grid_height, grid_width), dtype=np.uint32)

@@ -23,8 +23,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from shared import MASK_PALETTE, MaskTransformSource, RoomRecord, build_chamber_mark_dataframe, circle_mask_geometry, clone_mask_geometry, fill_circle_from_diameter, fill_polygon, full_frame_mask_geometry, mask_geometry_for_export, mask_geometry_is_exact, mask_polygon_geometry, scale_mask_geometry, smooth_binary_mask_low, translate_mask_geometry, validated_quad_points
-from ui_controls import NoWheelComboBox
+from mask_tools import build_circle_mask, build_polygon_mask, merge_mask, paint_brush_segment, parse_draw_shape_payload
+from shared import MASK_PALETTE, MaskTransformSource, RoomRecord, build_chamber_mark_dataframe, circle_mask_geometry, clone_mask_geometry, full_frame_mask_geometry, mask_geometry_for_export, mask_geometry_is_exact, mask_polygon_geometry, scale_mask_geometry, smooth_binary_mask_low, translate_mask_geometry
+from ui_controls import NoWheelComboBox, NoWheelSpinBox
 
 
 class ChamberTabMixin:
@@ -131,7 +132,7 @@ class ChamberTabMixin:
         self.chamber_draw_radio = QRadioButton("Draw")
         self.chamber_transform_radio = QRadioButton("Transform")
         self.chamber_draw_radio.setChecked(True)
-        self.chamber_draw_radio.setToolTip("Add shapes to the selected target.")
+        self.chamber_draw_radio.setToolTip("Add or erase shapes in the selected target.")
         self.chamber_transform_radio.setToolTip(
             "Move, scale, or rotate the selected target."
         )
@@ -144,11 +145,32 @@ class ChamberTabMixin:
         operation_row.addStretch(1)
 
         self.chamber_shape_combo = NoWheelComboBox()
-        self.chamber_shape_combo.addItems(["Rectangle 4 Points", "Circle Drag"])
+        self.chamber_shape_combo.addItems(["Rectangle Drag", "Rectangle 4 Points", "Polygon", "Circle Drag", "Brush"])
         self.chamber_shape_combo.setMinimumWidth(0)
         self.chamber_shape_combo.setToolTip("Choose the next shape drawn in the viewer.")
+        self.chamber_draw_add_radio = QRadioButton("Add")
+        self.chamber_draw_erase_radio = QRadioButton("Erase")
+        self.chamber_draw_add_radio.setChecked(True)
+        self.chamber_draw_action_group = QButtonGroup(self)
+        self.chamber_draw_action_group.addButton(self.chamber_draw_add_radio)
+        self.chamber_draw_action_group.addButton(self.chamber_draw_erase_radio)
+        draw_action_row = QHBoxLayout()
+        draw_action_row.addWidget(self.chamber_draw_add_radio)
+        draw_action_row.addWidget(self.chamber_draw_erase_radio)
+        draw_action_row.addStretch(1)
+        self.chamber_brush_spinbox = NoWheelSpinBox()
+        self.chamber_brush_spinbox.setRange(1, 200)
+        self.chamber_brush_spinbox.setValue(20)
+        self.chamber_brush_spinbox.setSuffix(" px")
+        self.chamber_brush_spinbox.setFixedWidth(88)
+        brush_row = QHBoxLayout()
+        brush_row.addWidget(QLabel("Brush"))
+        brush_row.addWidget(self.chamber_brush_spinbox)
+        brush_row.addStretch(1)
         tool_layout = QVBoxLayout()
         tool_layout.addWidget(self.chamber_shape_combo)
+        tool_layout.addLayout(draw_action_row)
+        tool_layout.addLayout(brush_row)
 
         edit_group = QGroupBox("3. Draw or Transform")
         edit_form = QFormLayout(edit_group)
@@ -198,14 +220,34 @@ class ChamberTabMixin:
             dtype=np.uint8,
         )
 
+    def _current_video_mask_shape(self) -> tuple[int, int] | None:
+        if self.video_state is None:
+            return None
+        return (self.video_state.height, self.video_state.width)
+
+    def _mask_matches_current_video(self, mask: np.ndarray | None) -> bool:
+        expected_shape = self._current_video_mask_shape()
+        return (
+            expected_shape is not None
+            and mask is not None
+            and getattr(mask, "ndim", 0) >= 2
+            and mask.shape[:2] == expected_shape
+        )
+
+    def _current_chamber_mask(self) -> np.ndarray | None:
+        if not self._mask_matches_current_video(self.chamber_mask):
+            return None
+        return self.chamber_mask.astype(np.uint8)
+
     def _is_full_frame_chamber_mask(self) -> bool:
-        if self.video_state is None or self.chamber_mask is None:
+        chamber_mask = self._current_chamber_mask()
+        if chamber_mask is None:
             return False
-        expected_shape = (self.video_state.height, self.video_state.width)
-        return self.chamber_mask.shape == expected_shape and bool(np.all(self.chamber_mask > 0))
+        return bool(np.all(chamber_mask > 0))
 
     def _resolved_chamber_boundary_mode(self) -> str:
-        if self.chamber_mask is None or not np.any(self.chamber_mask):
+        chamber_mask = self._current_chamber_mask()
+        if chamber_mask is None or not np.any(chamber_mask):
             return "unset"
         if getattr(self, "chamber_boundary_mode", "custom") == "full_frame" and self._is_full_frame_chamber_mask():
             return "full_frame"
@@ -275,11 +317,8 @@ class ChamberTabMixin:
         if self.video_state is None:
             return []
         shape = (self.video_state.height, self.video_state.width)
-        chamber = (
-            np.zeros(shape, dtype=bool)
-            if self.chamber_mask is None
-            else self.chamber_mask.astype(bool)
-        )
+        current_chamber = self._current_chamber_mask()
+        chamber = np.zeros(shape, dtype=bool) if current_chamber is None else current_chamber.astype(bool)
         selected_name = (
             self.selected_room_name
             if self.chamber_edit_room_radio.isChecked()
@@ -292,6 +331,9 @@ class ChamberTabMixin:
         effective_masks: dict[str, np.ndarray] = {}
         for name in ordered_names:
             room = self.room_records[name]
+            if not self._mask_matches_current_video(room.mask):
+                effective_masks[name] = np.zeros(shape, dtype=np.uint8)
+                continue
             allowed = room.mask.astype(bool) & chamber & ~occupied
             effective_masks[name] = allowed.astype(np.uint8)
             occupied |= allowed
@@ -314,29 +356,31 @@ class ChamberTabMixin:
         return {room.name: room for room in self._effective_room_records()}
 
     def _refresh_chamber_viewer(self, refresh: bool = True) -> None:
+        chamber_mask = self._current_chamber_mask()
         self.frame_viewer.set_chamber_records(
-            self.chamber_mask,
+            chamber_mask,
             self._effective_room_records_dict(),
             self.selected_room_name,
             refresh=refresh,
-            chamber_geometry=getattr(self, "chamber_geometry", None),
+            chamber_geometry=getattr(self, "chamber_geometry", None) if chamber_mask is not None else None,
         )
 
     def _selected_chamber_layer(self) -> tuple[str, np.ndarray] | None:
         if self.chamber_edit_chamber_radio.isChecked():
-            if self.chamber_mask is None or not np.any(self.chamber_mask):
+            chamber_mask = self._current_chamber_mask()
+            if chamber_mask is None or not np.any(chamber_mask):
                 return None
-            return "chamber", self.chamber_mask
+            return "chamber", chamber_mask
         room = self._selected_room()
-        if room is None or not np.any(room.mask):
+        if room is None or not self._mask_matches_current_video(room.mask) or not np.any(room.mask):
             return None
         return f"room:{room.name}", room.mask
 
     def _selected_chamber_layer_geometry(self) -> dict | None:
         if self.chamber_edit_chamber_radio.isChecked():
-            return getattr(self, "chamber_geometry", None)
+            return getattr(self, "chamber_geometry", None) if self._current_chamber_mask() is not None else None
         room = self._selected_room()
-        return None if room is None else room.geometry
+        return None if room is None or not self._mask_matches_current_video(room.mask) else room.geometry
 
     def _set_selected_chamber_layer_mask(
         self,
@@ -348,6 +392,9 @@ class ChamberTabMixin:
         normalized = (mask > 0).astype(np.uint8)
         if smooth:
             normalized = smooth_binary_mask_low(normalized)
+        expected_shape = self._current_video_mask_shape()
+        if expected_shape is not None and normalized.shape != expected_shape:
+            return
         if self.chamber_edit_chamber_radio.isChecked():
             self.chamber_mask = normalized
             self.chamber_geometry = clone_mask_geometry(geometry)
@@ -473,17 +520,32 @@ class ChamberTabMixin:
         return f"{candidate}_{suffix}"
 
     def _selected_chamber_draw_mode(self) -> str:
-        return "chamber_circle" if self.chamber_shape_combo.currentIndex() == 1 else "chamber_rect"
+        mapping = {
+            0: "chamber_rect_drag",
+            1: "chamber_rect",
+            2: "chamber_polygon",
+            3: "chamber_circle",
+            4: "chamber_free",
+        }
+        return mapping.get(self.chamber_shape_combo.currentIndex(), "chamber_rect_drag")
+
+    def _sync_chamber_draw_mode(self) -> None:
+        if not hasattr(self, "chamber_draw_add_radio"):
+            return
+        self.frame_viewer.set_chamber_draw_mode(
+            add=self.chamber_draw_add_radio.isChecked(),
+            brush_radius=int(self.chamber_brush_spinbox.value()),
+        )
+        self._refresh_chamber_ui()
 
     def _sync_chamber_mode(self) -> None:
         if self.mode_tabs.currentIndex() != self.TAB_CHAMBER:
             return
-        if self.chamber_shape_combo.currentIndex() == 0:
-            self.frame_viewer.clear_chamber_circle()
-        else:
-            self.frame_viewer.clear_chamber_rect_points()
+        self.frame_viewer.clear_chamber_rect_points()
+        self.frame_viewer.clear_chamber_circle()
         self.frame_viewer.set_mode(self._selected_chamber_draw_mode())
         self.frame_viewer.set_margin_value(0.0)
+        self._sync_chamber_draw_mode()
         selected_layer = self._selected_chamber_layer()
         self.frame_viewer.set_chamber_transform_mode(
             self.chamber_transform_radio.isChecked() and selected_layer is not None,
@@ -603,86 +665,147 @@ class ChamberTabMixin:
         self,
         shape_mask: np.ndarray,
         geometry: dict | None = None,
+        *,
+        add: bool = True,
+        push_undo: bool = True,
+        refresh: bool = True,
     ) -> None:
         if self.video_state is None:
             return
-        if hasattr(self, "_push_chamber_undo"):
-            self._push_chamber_undo("draw chamber mask")
+        if push_undo and hasattr(self, "_push_chamber_undo"):
+            self._push_chamber_undo("draw chamber mask" if add else "erase chamber mask")
         self._invalidate_chamber_transform_source()
+        shape_bool = shape_mask.astype(bool)
         if self.chamber_edit_chamber_radio.isChecked():
-            had_pixels = self.chamber_mask is not None and bool(np.any(self.chamber_mask))
-            if self.chamber_mask is None:
-                self.chamber_mask = np.zeros((self.video_state.height, self.video_state.width), dtype=np.uint8)
-            self.chamber_mask = np.logical_or(self.chamber_mask.astype(bool), shape_mask.astype(bool)).astype(np.uint8)
-            self.chamber_geometry = clone_mask_geometry(geometry) if not had_pixels else None
+            chamber_mask = self._current_chamber_mask()
+            had_pixels = chamber_mask is not None and bool(np.any(chamber_mask))
+            if chamber_mask is None:
+                chamber_mask = np.zeros((self.video_state.height, self.video_state.width), dtype=np.uint8)
+            if add:
+                self.chamber_mask = merge_mask(chamber_mask, shape_mask, add=True)
+                self.chamber_geometry = clone_mask_geometry(geometry) if not had_pixels else None
+            else:
+                self.chamber_mask = merge_mask(chamber_mask, shape_mask, add=False)
+                self.chamber_geometry = None
             self._mark_chamber_boundary_custom()
         else:
             current = self._selected_room()
             if current is None:
                 QMessageBox.information(self, "Room", "Add or select a room first.")
                 return
-            if self.chamber_mask is None or not np.any(self.chamber_mask):
+            chamber_mask = self._current_chamber_mask()
+            if chamber_mask is None or not np.any(chamber_mask):
                 QMessageBox.information(self, "Room", "Define the chamber area before assigning rooms.")
                 return
-            had_pixels = bool(np.any(current.mask))
-            blocked = self._occupied_room_mask(exclude_name=current.name)
-            allowed = shape_mask.astype(bool) & self.chamber_mask.astype(bool)
-            if blocked is not None:
-                allowed &= ~blocked.astype(bool)
-            current.mask = np.logical_or(current.mask.astype(bool), allowed).astype(np.uint8)
-            current.geometry = (
-                clone_mask_geometry(geometry)
-                if not had_pixels and np.array_equal(allowed.astype(np.uint8), shape_mask.astype(np.uint8))
-                else None
+            current_mask = (
+                current.mask.astype(np.uint8)
+                if self._mask_matches_current_video(current.mask)
+                else np.zeros((self.video_state.height, self.video_state.width), dtype=np.uint8)
             )
-        self._refresh_chamber_viewer(refresh=True)
-        self._refresh_chamber_ui()
+            had_pixels = bool(np.any(current_mask))
+            if add:
+                blocked = self._occupied_room_mask(exclude_name=current.name)
+                allowed = shape_bool & chamber_mask.astype(bool)
+                if blocked is not None:
+                    allowed &= ~blocked.astype(bool)
+                current.mask = merge_mask(current_mask, allowed.astype(np.uint8), add=True)
+                current.geometry = (
+                    clone_mask_geometry(geometry)
+                    if not had_pixels and np.array_equal(allowed.astype(np.uint8), shape_mask.astype(np.uint8))
+                    else None
+                )
+            else:
+                current.mask = merge_mask(current_mask, shape_mask, add=False)
+                current.geometry = None
+        if refresh:
+            self._refresh_chamber_viewer(refresh=True)
+            self._refresh_chamber_ui()
 
-    def apply_chamber_rect(self, points: list[tuple[float, float]]) -> None:
+    def apply_chamber_rect(self, payload: object) -> None:
         if self.video_state is None:
             return
-        ordered = validated_quad_points(points)
-        if ordered is None:
-            self.statusBar().showMessage("Rectangle needs four distinct corner points.", 3000)
+        parsed = parse_draw_shape_payload(
+            payload,
+            default_add=self.chamber_draw_add_radio.isChecked(),
+            default_shape="rectangle",
+        )
+        if parsed is None:
+            return
+        base_mask = np.zeros((self.video_state.height, self.video_state.width), dtype=np.uint8)
+        built = build_polygon_mask(base_mask, parsed.points, shape_kind=parsed.shape_kind)
+        if built is None:
+            message = "Polygon needs at least three points." if parsed.shape_kind == "polygon" else "Rectangle needs four distinct corner points."
+            self.statusBar().showMessage(message, 3000)
             self.frame_viewer.clear_chamber_rect_points()
             return
-        shape_mask = np.zeros((self.video_state.height, self.video_state.width), dtype=np.uint8)
-        ordered_points = ordered.tolist()
-        fill_polygon(shape_mask, ordered_points, 1)
+        shape_mask, ordered_points, geometry_shape = built
         self._apply_chamber_shape_mask(
             shape_mask,
-            mask_polygon_geometry(ordered_points, source="exact", shape="rectangle"),
+            mask_polygon_geometry(ordered_points, source="exact", shape=geometry_shape),
+            add=parsed.add,
         )
 
-    def apply_chamber_circle(self, payload: tuple[tuple[float, float], float, tuple[float, float], tuple[float, float]]) -> None:
+    def apply_chamber_circle(self, payload: object) -> None:
         if self.video_state is None:
             return
-        center, base_radius, start, end = payload
+        if not isinstance(payload, tuple) or len(payload) < 4:
+            return
+        center, base_radius, start, end = payload[:4]
+        add = self.chamber_draw_add_radio.isChecked()
+        if len(payload) >= 5 and isinstance(payload[4], bool):
+            add = payload[4]
         if start is None or end is None:
             return
-        shape_mask = np.zeros((self.video_state.height, self.video_state.width), dtype=np.uint8)
-        fill_circle_from_diameter(shape_mask, start, end, 1)
+        base_mask = np.zeros((self.video_state.height, self.video_state.width), dtype=np.uint8)
+        shape_mask = build_circle_mask(base_mask, start, end)
         self._apply_chamber_shape_mask(
             shape_mask,
             circle_mask_geometry(center, base_radius, base_radius, source="exact"),
+            add=add,
         )
         self.frame_viewer.clear_chamber_circle()
+
+    def apply_chamber_free_segment(self, payload: tuple[tuple[float, float], tuple[float, float], bool]) -> None:
+        if self.video_state is None or self.chamber_transform_radio.isChecked():
+            return
+        if not getattr(self, "_chamber_free_undo_open", False):
+            if hasattr(self, "_push_chamber_undo"):
+                self._push_chamber_undo("brush chamber mask")
+            self._chamber_free_undo_open = True
+        start, end, add = payload
+        shape_mask = np.zeros((self.video_state.height, self.video_state.width), dtype=np.uint8)
+        paint_brush_segment(shape_mask, start, end, radius=int(self.chamber_brush_spinbox.value()), add=True)
+        self._apply_chamber_shape_mask(
+            shape_mask,
+            add=bool(add),
+            push_undo=False,
+            refresh=True,
+        )
+
+    def _finalize_chamber_free_draw(self) -> None:
+        selected = self._selected_chamber_layer()
+        if selected is not None:
+            _key, mask = selected
+            self._set_selected_chamber_layer_mask(mask, smooth=True)
+        self._chamber_free_undo_open = False
+        self._refresh_chamber_ui()
 
     def _refresh_chamber_ui(self) -> None:
         if not self.room_records and self.chamber_edit_room_radio.isChecked():
             self.chamber_edit_chamber_radio.setChecked(True)
             return
-        chamber_pixels = int(self.chamber_mask.sum()) if self.chamber_mask is not None else 0
+        chamber_mask = self._current_chamber_mask()
+        chamber_pixels = int(chamber_mask.sum()) if chamber_mask is not None else 0
         effective_rooms = self._effective_room_records_dict()
         occupied_pixels = int(sum(int(room.mask.sum()) for room in effective_rooms.values()))
         free_pixels = max(0, chamber_pixels - occupied_pixels)
         current = self._selected_room()
         current_effective = effective_rooms.get(current.name) if current is not None else None
         current_name = current.name if current is not None else "-"
-        current_pixels = int(current.mask.sum()) if current is not None else 0
+        current_pixels = int(current.mask.sum()) if current is not None and self._mask_matches_current_video(current.mask) else 0
         effective_pixels = int(current_effective.mask.sum()) if current_effective is not None else 0
         target_text = "chamber" if self.chamber_edit_chamber_radio.isChecked() else "room"
-        operation_text = "transform" if self.chamber_transform_radio.isChecked() else "draw"
+        operation_text = "transform" if self.chamber_transform_radio.isChecked() else ("add" if self.chamber_draw_add_radio.isChecked() else "erase")
         self.chamber_summary_label.setText(
             f"target={target_text} | mode={operation_text} | chamber={chamber_pixels} px | "
             f"occupied={occupied_pixels} px | free={free_pixels} px | "
@@ -690,7 +813,7 @@ class ChamberTabMixin:
             f"rooms={len(self.room_records)}"
         )
         has_video = self.video_state is not None
-        has_chamber = self.chamber_mask is not None and bool(np.any(self.chamber_mask))
+        has_chamber = chamber_mask is not None and bool(np.any(chamber_mask))
         boundary_mode = self._resolved_chamber_boundary_mode()
         if not has_video:
             boundary_text = "Current: load a video first"
@@ -715,15 +838,20 @@ class ChamberTabMixin:
         self.chamber_transform_radio.setEnabled(has_transform_target)
         if not has_transform_target and self.chamber_transform_radio.isChecked():
             self.chamber_draw_radio.setChecked(True)
-        self.chamber_shape_combo.setEnabled(self.chamber_draw_radio.isChecked())
+        drawing_enabled = self.chamber_draw_radio.isChecked()
+        self.chamber_shape_combo.setEnabled(drawing_enabled)
+        self.chamber_draw_add_radio.setEnabled(drawing_enabled)
+        self.chamber_draw_erase_radio.setEnabled(drawing_enabled)
+        self.chamber_brush_spinbox.setEnabled(drawing_enabled and self._selected_chamber_draw_mode() == "chamber_free")
         self.export_chamber_mask_button.setEnabled(has_chamber)
         self._refresh_output_ui()
 
     def _chamber_mask_rgb(self) -> np.ndarray | None:
-        if self.video_state is None or self.chamber_mask is None or not np.any(self.chamber_mask):
+        chamber_mask = self._current_chamber_mask()
+        if self.video_state is None or chamber_mask is None or not np.any(chamber_mask):
             return None
         image = np.zeros((self.video_state.height, self.video_state.width, 3), dtype=np.uint8)
-        chamber_bool = self.chamber_mask.astype(bool)
+        chamber_bool = chamber_mask.astype(bool)
         occupied = np.zeros((self.video_state.height, self.video_state.width), dtype=bool)
         for room in self._effective_room_records():
             room_bool = room.mask.astype(bool)
@@ -743,6 +871,8 @@ class ChamberTabMixin:
         mask_rgb = self._chamber_mask_rgb()
         if mask_rgb is None:
             return None
+        if self.current_frame_rgb.shape[:2] != mask_rgb.shape[:2]:
+            return None
         overlay = self.current_frame_rgb.copy()
         active = np.any(mask_rgb > 0, axis=2)
         blended = (overlay[active].astype(np.float32) * 0.58 + mask_rgb[active].astype(np.float32) * 0.42).clip(0, 255).astype(np.uint8)
@@ -753,8 +883,9 @@ class ChamberTabMixin:
         if self.video_state is None:
             QMessageBox.information(self, "Chamber Mask", "Load a video first.")
             return
+        chamber_mask = self._current_chamber_mask()
         mask_rgb = self._chamber_mask_rgb()
-        if mask_rgb is None:
+        if chamber_mask is None or mask_rgb is None:
             QMessageBox.information(self, "Chamber Mask", "Define the chamber area first.")
             return
         mask_path = self._chamber_mask_output_path()
@@ -773,7 +904,7 @@ class ChamberTabMixin:
                 "boundary_mode": self._resolved_chamber_boundary_mode(),
                 "geometry": mask_geometry_for_export(
                     getattr(self, "chamber_geometry", None),
-                    self.chamber_mask,
+                    chamber_mask,
                 ),
                 "rooms": [
                     {
@@ -882,7 +1013,8 @@ class ChamberTabMixin:
         if self.video_state is None or self.csv_df is None:
             QMessageBox.warning(self, "Save", "Load a video and CSV first.")
             return
-        if self.chamber_mask is None or not np.any(self.chamber_mask):
+        chamber_mask = self._current_chamber_mask()
+        if chamber_mask is None or not np.any(chamber_mask):
             QMessageBox.warning(self, "Save", "Define the chamber area first.")
             return
         if not self.room_records:
@@ -924,7 +1056,7 @@ class ChamberTabMixin:
                 "boundary_mode": self._resolved_chamber_boundary_mode(),
                 "geometry": mask_geometry_for_export(
                     getattr(self, "chamber_geometry", None),
-                    self.chamber_mask,
+                    chamber_mask,
                 ),
                 "rooms": [
                     {

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import time
 
-import cv2
 import numpy as np
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -20,7 +19,8 @@ from PyQt6.QtWidgets import (
 )
 
 from interpolation import build_interpolation_pipeline_dataframe
-from shared import MaskTransformSource, fill_polygon, paint_brush, validated_quad_points
+from mask_tools import build_circle_mask, build_polygon_mask, merge_mask, paint_brush_segment, parse_draw_shape_payload
+from shared import MaskTransformSource
 from ui_controls import NoWheelComboBox, NoWheelSpinBox
 
 
@@ -65,14 +65,16 @@ class InterpolationTabMixin:
         region_layout.setHorizontalSpacing(8)
         region_layout.setVerticalSpacing(7)
         self.interpolation_shape_combo = NoWheelComboBox()
-        self.interpolation_shape_combo.addItem("Rectangle (repeat 4 points)", "interp_rect")
-        self.interpolation_shape_combo.addItem("Circle (drag diameter)", "interp_circle")
-        self.interpolation_shape_combo.addItem("Free Draw", "interp_free")
+        self.interpolation_shape_combo.addItem("Rectangle Drag", "interp_rect_drag")
+        self.interpolation_shape_combo.addItem("Rectangle 4 Points", "interp_rect")
+        self.interpolation_shape_combo.addItem("Polygon", "interp_polygon")
+        self.interpolation_shape_combo.addItem("Circle Drag", "interp_circle")
+        self.interpolation_shape_combo.addItem("Brush", "interp_free")
         region_layout.addRow("Shape", self.interpolation_shape_combo)
 
         edit_mode_row = QHBoxLayout()
         self.interpolation_region_draw_radio = QRadioButton("Draw")
-        self.interpolation_region_transform_radio = QRadioButton("Move / Scale")
+        self.interpolation_region_transform_radio = QRadioButton("Transform")
         self.interpolation_region_draw_radio.setChecked(True)
         self.interpolation_region_edit_group = QButtonGroup(self)
         self.interpolation_region_edit_group.addButton(self.interpolation_region_draw_radio)
@@ -85,8 +87,8 @@ class InterpolationTabMixin:
         region_layout.addRow("Edit", edit_mode_row)
 
         transform_help = QLabel(
-            "Same as Annotate masks: D draw · T move/scale · drag to move · "
-            "[ / ] or E / R to scale slightly."
+            "Same as Annotate masks: D draw 쨌 T transform 쨌 drag to move 쨌 "
+            "[ / ] or E / R to scale 쨌 Ctrl+[ / ] or Ctrl+E / R to rotate 쨌 Ctrl+drag to erase."
         )
         transform_help.setWordWrap(True)
         transform_help.setProperty("muted", True)
@@ -108,7 +110,7 @@ class InterpolationTabMixin:
         free_draw_row.addStretch(1)
         free_draw_row.addWidget(QLabel("Brush"))
         free_draw_row.addWidget(self.interpolation_brush_spinbox)
-        region_layout.addRow("Free draw", free_draw_row)
+        region_layout.addRow("Draw Action", free_draw_row)
 
         self.interpolation_region_label = QLabel("No region selected.")
         self.interpolation_region_label.setWordWrap(True)
@@ -175,6 +177,7 @@ class InterpolationTabMixin:
         tab_layout.addWidget(scroll)
 
         self._interpolation_transform_source: MaskTransformSource | None = None
+        self._interpolation_transform_angle = 0.0
         self._interpolation_transform_scale = 1.0
         self.interpolation_shape_combo.currentIndexChanged.connect(self._sync_interpolation_mode)
         self.interpolation_removal_combo.currentIndexChanged.connect(
@@ -339,13 +342,12 @@ class InterpolationTabMixin:
         removal_active = has_region and removal_mode != "none"
         self.interpolation_removal_combo.setEnabled(has_region)
         self.interpolation_anchor_combo.setEnabled(removal_active and bool(self.bodyparts))
-        free_draw_enabled = (
-            str(self.interpolation_shape_combo.currentData()) == "interp_free"
-            and self.interpolation_region_draw_radio.isChecked()
-        )
-        self.interpolation_draw_add_radio.setEnabled(free_draw_enabled)
-        self.interpolation_draw_erase_radio.setEnabled(free_draw_enabled)
-        self.interpolation_brush_spinbox.setEnabled(free_draw_enabled)
+        selected_shape = str(self.interpolation_shape_combo.currentData())
+        draw_controls_enabled = self.interpolation_region_draw_radio.isChecked()
+        brush_enabled = selected_shape == "interp_free" and draw_controls_enabled
+        self.interpolation_draw_add_radio.setEnabled(draw_controls_enabled)
+        self.interpolation_draw_erase_radio.setEnabled(draw_controls_enabled)
+        self.interpolation_brush_spinbox.setEnabled(brush_enabled)
         interpolation_enabled = self._interpolation_enabled()
         self.interpolation_extrapolate_checkbox.setEnabled(interpolation_enabled)
         if interpolation_enabled and self._interpolation_extrapolation_enabled():
@@ -365,6 +367,7 @@ class InterpolationTabMixin:
 
     def _invalidate_interpolation_transform_source(self) -> None:
         self._interpolation_transform_source = None
+        self._interpolation_transform_angle = 0.0
         self._interpolation_transform_scale = 1.0
 
     def _ensure_interpolation_transform_source(self) -> bool:
@@ -382,6 +385,7 @@ class InterpolationTabMixin:
         except ValueError:
             self._invalidate_interpolation_transform_source()
             return False
+        self._interpolation_transform_angle = 0.0
         self._interpolation_transform_scale = 1.0
         return True
 
@@ -407,72 +411,93 @@ class InterpolationTabMixin:
             self._push_interpolation_undo("move interpolation region")
         self._set_interpolation_mask(translated)
 
-    def scale_interpolation_region(self, scale_factor: float) -> None:
-        if scale_factor <= 0 or not self._ensure_interpolation_transform_source():
+    def _apply_interpolation_affine_transform(
+        self,
+        *,
+        angle_delta: float = 0.0,
+        scale_multiplier: float = 1.0,
+    ) -> None:
+        if scale_multiplier <= 0 or not self._ensure_interpolation_transform_source():
             return
         source = self._interpolation_transform_source
         if source is None:
             return
-        next_scale = self._interpolation_transform_scale * float(scale_factor)
+        next_angle = (self._interpolation_transform_angle + float(angle_delta)) % 360.0
+        next_scale = self._interpolation_transform_scale * float(scale_multiplier)
         if next_scale < 0.1 or next_scale > 10.0:
             return
-        transformed = source.render(0.0, next_scale)
+        transformed = source.render(next_angle, next_scale)
         if not np.any(transformed):
             return
         if hasattr(self, "_push_interpolation_undo"):
-            self._push_interpolation_undo("scale interpolation region")
+            label = "rotate interpolation region" if abs(angle_delta) > 1e-6 else "scale interpolation region"
+            self._push_interpolation_undo(label)
+        self._interpolation_transform_angle = next_angle
         self._interpolation_transform_scale = next_scale
         self._set_interpolation_mask(
             transformed,
             reset_transform_source=False,
         )
 
-    def apply_interpolation_rect(self, points: list[tuple[float, float]]) -> None:
+    def scale_interpolation_region(self, scale_factor: float) -> None:
+        self._apply_interpolation_affine_transform(scale_multiplier=scale_factor)
+
+    def rotate_interpolation_region(self, angle_degrees: float) -> None:
+        if abs(angle_degrees) < 1e-6:
+            return
+        self._apply_interpolation_affine_transform(angle_delta=angle_degrees)
+
+    def apply_interpolation_rect(self, payload: object) -> None:
         if hasattr(self, "video_state") and self.video_state is None:
             return
+        parsed = parse_draw_shape_payload(payload, default_add=self.interpolation_draw_add_radio.isChecked(), default_shape="rectangle")
+        if parsed is None:
+            return
+        points, add, shape_kind = parsed.points, parsed.add, parsed.shape_kind
         if hasattr(self, "_push_interpolation_undo"):
-            self._push_interpolation_undo("draw interpolation rectangle")
-        mask = self._merge_interpolation_polygon(points)
+            self._push_interpolation_undo("draw interpolation region")
+        mask = self._merge_interpolation_polygon(points, add=add, shape_kind=shape_kind)
         if mask is not None:
             self._set_interpolation_mask(mask)
 
-    def _merge_interpolation_polygon(self, points: list[tuple[float, float]]) -> np.ndarray | None:
+    def _merge_interpolation_polygon(
+        self,
+        points: list[tuple[float, float]],
+        *,
+        add: bool = True,
+        shape_kind: str = "rectangle",
+    ) -> np.ndarray | None:
         mask = self._ensure_interpolation_mask()
         if mask is None:
             return None
-        ordered = validated_quad_points(points) if len(points) == 4 else None
-        if ordered is None:
-            self.statusBar().showMessage("Rectangle needs four distinct corner points.", 3000)
+        built = build_polygon_mask(mask, points, shape_kind=shape_kind)
+        if built is None:
+            message = "Polygon needs at least three points." if shape_kind == "polygon" else "Rectangle needs four distinct corner points."
+            self.statusBar().showMessage(message, 3000)
             self.frame_viewer.clear_interpolation_rect_points()
             return None
-        ordered_points = ordered.tolist()
-        shape_mask = np.zeros_like(mask, dtype=np.uint8)
-        fill_polygon(shape_mask, ordered_points, 1)
-        mask[:] = np.logical_or(
-            mask.astype(bool),
-            shape_mask.astype(bool),
-        ).astype(np.uint8)
+        shape_mask, _ordered_points, _geometry_shape = built
+        mask[:] = merge_mask(mask, shape_mask, add=add)
         return mask
-
-    def apply_interpolation_circle(self, payload: tuple[tuple[float, float], float]) -> None:
+    def apply_interpolation_circle(self, payload: object) -> None:
         if hasattr(self, "video_state") and self.video_state is None:
             return
+        if not isinstance(payload, tuple) or len(payload) < 2:
+            return
+        add = self.interpolation_draw_add_radio.isChecked()
+        center, radius = payload[:2]
+        if len(payload) >= 5 and isinstance(payload[4], bool):
+            add = payload[4]
         if hasattr(self, "_push_interpolation_undo"):
             self._push_interpolation_undo("draw interpolation circle")
         mask = self._ensure_interpolation_mask()
         if mask is None:
             return
-        center, radius = payload
-        mask.fill(0)
-        cv2.circle(
-            mask,
-            (int(round(center[0])), int(round(center[1]))),
-            max(1, int(round(radius))),
-            1,
-            -1,
-        )
+        start = payload[2] if len(payload) >= 4 else (center[0] - radius, center[1])
+        end = payload[3] if len(payload) >= 4 else (center[0] + radius, center[1])
+        shape_mask = build_circle_mask(mask, start, end)
+        mask[:] = merge_mask(mask, shape_mask, add=add)
         self._set_interpolation_mask(mask)
-
     def apply_interpolation_free_segment(
         self,
         payload: tuple[tuple[float, float], tuple[float, float], bool],
@@ -487,12 +512,12 @@ class InterpolationTabMixin:
         if mask is None:
             return
         start, end, add = payload
-        paint_brush(
+        paint_brush_segment(
             mask,
             start,
             end,
-            int(self.interpolation_brush_spinbox.value()),
-            1 if add else 0,
+            radius=int(self.interpolation_brush_spinbox.value()),
+            add=bool(add),
         )
         now = time.monotonic()
         if now - self._last_interpolation_preview_refresh >= 0.03:

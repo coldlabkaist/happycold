@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 
 from batch import BatchItem, BatchRunResult, raise_if_cancelled
 from interpolation import build_interpolation_pipeline_dataframe
+from smoothing import SMOOTHING_METHODS, build_smoothed_dataframe
 from pipeline import (
     DataFramePipelineStage,
     PipelineRunResult,
@@ -52,11 +53,19 @@ PIPELINE_STAGE_LABELS = {
     "duplicate_removal": "Duplicate Skeleton Removal",
     "zscore_removal": "Robust Z-score Outlier Invalidation",
     "clean_repair": "Region Removal / Interpolation",
+    "smoothing": "Smoothing",
     "square": "Square Normalization",
     "chamber": "Chamber Detection",
     "circle": "Circle Detection",
     "occlusion": "Occlusion Detection",
 }
+REPAIR_PIPELINE_STAGE_KEYS = (
+    "duplicate_removal",
+    "zscore_removal",
+    "clean_repair",
+    "smoothing",
+)
+DEFAULT_REPAIR_PIPELINE_STAGE_ORDER = REPAIR_PIPELINE_STAGE_KEYS
 
 
 def _duplicate_stage_dataframe(
@@ -109,6 +118,10 @@ class PipelineSnapshot:
     interpolation_anchor: str | None
     interpolation_enabled: bool
     interpolation_extrapolate: bool
+    smoothing_method: str
+    smoothing_anchor: str | None
+    smoothing_window_size: int
+    repair_stage_order: tuple[str, ...]
     chamber_mask: np.ndarray | None
     chamber_geometry: dict | None
     chamber_boundary_mode: str
@@ -283,7 +296,7 @@ class PipelinePanelMixin:
         layout.setSpacing(6)
 
         info = QLabel(
-            "Batch exports use the coordinate mode and optional time range configured in Inspect > Trajectory."
+            "Batch exports use the coordinate mode and optional time range configured in Inspect > Visualize."
         )
         info.setWordWrap(True)
         info.setProperty("muted", True)
@@ -303,6 +316,12 @@ class PipelinePanelMixin:
         folder_form.addRow("", self.trajectory_choose_save_folder_button)
         layout.addLayout(folder_form)
 
+        self.square_batch_trajectory_button = QPushButton("Save Multiple Trajectories")
+        self.square_batch_trajectory_button.setProperty("batchAction", True)
+        self.square_batch_trajectory_button.setEnabled(False)
+        self.square_batch_trajectory_button.setToolTip(
+            "Save trajectory PNG files for multiple selected videos."
+        )
         self.square_batch_heatmap_overlay_button = QPushButton(
             "Save Multiple Heatmaps with Background"
         )
@@ -319,11 +338,16 @@ class PipelinePanelMixin:
         self.square_batch_heatmap_plain_button.setToolTip(
             "Save background-free heatmap PNG files for multiple selected videos."
         )
-        export_group = QGroupBox("Batch Heatmap Images")
-        export_layout = QVBoxLayout(export_group)
-        export_layout.addWidget(self.square_batch_heatmap_overlay_button)
-        export_layout.addWidget(self.square_batch_heatmap_plain_button)
-        layout.addWidget(export_group)
+        trajectory_export_group = QGroupBox("Batch Trajectory Images")
+        trajectory_export_layout = QVBoxLayout(trajectory_export_group)
+        trajectory_export_layout.addWidget(self.square_batch_trajectory_button)
+        layout.addWidget(trajectory_export_group)
+
+        heatmap_export_group = QGroupBox("Batch Heatmap Images")
+        heatmap_export_layout = QVBoxLayout(heatmap_export_group)
+        heatmap_export_layout.addWidget(self.square_batch_heatmap_overlay_button)
+        heatmap_export_layout.addWidget(self.square_batch_heatmap_plain_button)
+        layout.addWidget(heatmap_export_group)
 
         save_note = QLabel(
             "For one image, open a preview and right-click it to use Save As."
@@ -337,6 +361,9 @@ class PipelinePanelMixin:
         panel_layout.addWidget(scroll)
 
         self.trajectory_choose_save_folder_button.clicked.connect(self.choose_save_folder)
+        self.square_batch_trajectory_button.clicked.connect(
+            self.save_multiple_square_trajectories
+        )
         self.square_batch_heatmap_overlay_button.clicked.connect(
             self.save_multiple_square_heatmaps_with_background
         )
@@ -345,6 +372,68 @@ class PipelinePanelMixin:
         )
         return panel
 
+    def _load_pipeline_repair_stage_order(self) -> tuple[str, ...]:
+        saved_order = self.settings.get("pipeline_repair_stage_order", [])
+        if not isinstance(saved_order, list):
+            saved_order = []
+        ordered: list[str] = []
+        for key in saved_order:
+            key = str(key)
+            if key in REPAIR_PIPELINE_STAGE_KEYS and key not in ordered:
+                ordered.append(key)
+        for key in DEFAULT_REPAIR_PIPELINE_STAGE_ORDER:
+            if key not in ordered:
+                ordered.append(key)
+        return tuple(ordered)
+
+    def _pipeline_repair_stage_order(self) -> tuple[str, ...]:
+        order = getattr(self, "pipeline_repair_stage_order", None)
+        if order is None:
+            self.pipeline_repair_stage_order = self._load_pipeline_repair_stage_order()
+        return tuple(self.pipeline_repair_stage_order)
+
+    def _refresh_pipeline_repair_order_widgets(self) -> None:
+        layout = getattr(self, "pipeline_repair_stage_layout", None)
+        cards = getattr(self, "pipeline_stage_cards", {})
+        if layout is None or not cards:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        order = self._pipeline_repair_stage_order()
+        for key in order:
+            card = cards.get(key)
+            if card is not None:
+                layout.addWidget(card)
+        self._refresh_pipeline_repair_order_buttons()
+
+    def _refresh_pipeline_repair_order_buttons(self) -> None:
+        controls = getattr(self, "pipeline_stage_controls", {})
+        order = self._pipeline_repair_stage_order()
+        for index, key in enumerate(order):
+            stage_controls = controls.get(key, {})
+            up_button = stage_controls.get("up_button")
+            down_button = stage_controls.get("down_button")
+            if isinstance(up_button, QPushButton):
+                up_button.setEnabled(index > 0)
+            if isinstance(down_button, QPushButton):
+                down_button.setEnabled(index < len(order) - 1)
+
+    def _move_pipeline_repair_stage(self, key: str, direction: int) -> None:
+        order = list(self._pipeline_repair_stage_order())
+        if key not in order:
+            return
+        index = order.index(key)
+        next_index = index + int(direction)
+        if next_index < 0 or next_index >= len(order):
+            return
+        order[index], order[next_index] = order[next_index], order[index]
+        self.pipeline_repair_stage_order = tuple(order)
+        self._refresh_pipeline_repair_order_widgets()
+        self._refresh_pipeline_ui()
+        self._save_settings()
     def _build_pipeline_tab(self) -> QWidget:
         tab = QWidget()
         tab.setMinimumWidth(0)
@@ -378,24 +467,49 @@ class PipelinePanelMixin:
         scroll_layout.setSpacing(8)
 
         self.pipeline_stage_controls: dict[str, dict[str, QWidget]] = {}
+        self.pipeline_stage_cards: dict[str, QFrame] = {}
+        self.pipeline_repair_stage_order = self._load_pipeline_repair_stage_order()
         saved_stages = self.settings.get("pipeline_stages", {})
         if not isinstance(saved_stages, dict):
             saved_stages = {}
+
+        repair_tab_by_key = {
+            "duplicate_removal": self.TAB_TRACKING_REPAIR,
+            "zscore_removal": self.TAB_TRACKING_REPAIR,
+            "clean_repair": self.TAB_INTERPOLATION,
+            "smoothing": self.TAB_SMOOTHING,
+        }
+        repair_label_by_key = {
+            "duplicate_removal": "Duplicates",
+            "zscore_removal": "Z-score outliers",
+            "clean_repair": "Region repair",
+            "smoothing": "Smoothing",
+        }
+        repair_group = QGroupBox("Data Preparation Stage")
+        repair_group.setMinimumWidth(0)
+        repair_group.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.pipeline_repair_stage_layout = QVBoxLayout(repair_group)
+        self.pipeline_repair_stage_layout.setContentsMargins(8, 10, 8, 8)
+        self.pipeline_repair_stage_layout.setSpacing(7)
+        for key in self._pipeline_repair_stage_order():
+            card = self._build_pipeline_stage_card(
+                key,
+                repair_label_by_key[key],
+                repair_tab_by_key[key],
+                checked=bool(saved_stages.get(key, False)),
+                orderable=True,
+            )
+            self.pipeline_stage_cards[key] = card
+            self.pipeline_repair_stage_layout.addWidget(card)
+        scroll_layout.addWidget(repair_group)
+
         phase_specs = (
             (
-                "1-1. Tracking Repair",
-                (
-                    ("duplicate_removal", "Duplicates", self.TAB_TRACKING_REPAIR),
-                    ("zscore_removal", "Z-score outliers", self.TAB_TRACKING_REPAIR),
-                    ("clean_repair", "Region repair", self.TAB_INTERPOLATION),
-                ),
-            ),
-            (
-                "1-2. Square Normalize",
+                "Normalize",
                 (("square", "Square coordinates", self.TAB_SQUARE),),
             ),
             (
-                "2. Analysis Columns",
+                "Analysis Columns",
                 (
                     ("chamber", "Chamber membership", self.TAB_CHAMBER),
                     ("circle", "Circle in/out", self.TAB_CIRCLE),
@@ -411,15 +525,16 @@ class PipelinePanelMixin:
             phase_layout.setContentsMargins(8, 10, 8, 8)
             phase_layout.setSpacing(7)
             for key, checkbox_text, tab_index in stage_specs:
-                phase_layout.addWidget(
-                    self._build_pipeline_stage_card(
-                        key,
-                        checkbox_text,
-                        tab_index,
-                        checked=bool(saved_stages.get(key, False)),
-                    )
+                card = self._build_pipeline_stage_card(
+                    key,
+                    checkbox_text,
+                    tab_index,
+                    checked=bool(saved_stages.get(key, False)),
                 )
+                self.pipeline_stage_cards[key] = card
+                phase_layout.addWidget(card)
             scroll_layout.addWidget(phase_group)
+        self._refresh_pipeline_repair_order_buttons()
         scroll_layout.addStretch(1)
         scroll.setWidget(scroll_content)
         tab_layout.addWidget(scroll, stretch=1)
@@ -539,7 +654,7 @@ class PipelinePanelMixin:
             title = "PIPELINE OUTPUT"
         elif tab_index == self.TAB_TRAJECTORY:
             page_index = 1
-            title = "TRAJECTORY OUTPUT"
+            title = "VISUALIZE OUTPUT"
         else:
             page_index = 0
             title = "CURRENT OUTPUT"
@@ -605,6 +720,7 @@ class PipelinePanelMixin:
         checkbox_text: str,
         tab_index: int,
         checked: bool,
+        orderable: bool = False,
     ) -> QFrame:
         card = QFrame()
         card.setObjectName("pipelineStageCard")
@@ -645,11 +761,27 @@ class PipelinePanelMixin:
         header_row.addWidget(status, alignment=Qt.AlignmentFlag.AlignRight)
         layout.addLayout(header_row)
         layout.addWidget(summary)
-        layout.addWidget(open_button)
+        button_row = QHBoxLayout()
+        button_row.setSpacing(6)
+        button_row.addWidget(open_button, stretch=1)
+        up_button = None
+        down_button = None
+        if orderable:
+            up_button = QPushButton("Up")
+            down_button = QPushButton("Down")
+            up_button.setToolTip("Run this repair stage earlier.")
+            down_button.setToolTip("Run this repair stage later.")
+            up_button.clicked.connect(lambda _checked=False, stage_key=key: self._move_pipeline_repair_stage(stage_key, -1))
+            down_button.clicked.connect(lambda _checked=False, stage_key=key: self._move_pipeline_repair_stage(stage_key, 1))
+            button_row.addWidget(up_button)
+            button_row.addWidget(down_button)
+        layout.addLayout(button_row)
         self.pipeline_stage_controls[key] = {
             "checkbox": checkbox,
             "status": status,
             "summary": summary,
+            "up_button": up_button,
+            "down_button": down_button,
         }
         return card
 
@@ -680,6 +812,7 @@ class PipelinePanelMixin:
 
         return {
             "pipeline_stages": stages,
+            "pipeline_repair_stage_order": list(self._pipeline_repair_stage_order()),
             "pipeline_prefix": _text_or_setting("pipeline_prefix_edit", "pipeline_prefix", ""),
             "pipeline_suffix": _text_or_setting("pipeline_suffix_edit", "pipeline_suffix", "processed"),
             "current_output_prefix": _text_or_setting(
@@ -744,6 +877,10 @@ class PipelinePanelMixin:
             interpolation_anchor=self._selected_interpolation_anchor(),
             interpolation_enabled=self._interpolation_enabled(),
             interpolation_extrapolate=self._interpolation_extrapolation_enabled(),
+            smoothing_method=self._selected_smoothing_method(),
+            smoothing_anchor=self._selected_smoothing_anchor(),
+            smoothing_window_size=self._selected_smoothing_window_size(),
+            repair_stage_order=self._pipeline_repair_stage_order(),
             chamber_mask=chamber_mask,
             chamber_geometry=clone_mask_geometry(getattr(self, "chamber_geometry", None)),
             chamber_boundary_mode=getattr(self, "chamber_boundary_mode", "custom"),
@@ -765,6 +902,13 @@ class PipelinePanelMixin:
                     errors.append("Draw an automatic-removal region in Interpolation.")
                 if snapshot.interpolation_anchor is None:
                     errors.append("Select an anchor node in Interpolation.")
+        elif stage_key == "smoothing":
+            if snapshot.smoothing_method not in SMOOTHING_METHODS:
+                errors.append("Select a valid smoothing method.")
+            if snapshot.smoothing_anchor is None:
+                errors.append("Select an anchor node in Smoothing.")
+            if snapshot.smoothing_window_size not in {3, 5}:
+                errors.append("Select a 3-frame or 5-frame smoothing window.")
         elif stage_key == "chamber":
             if snapshot.chamber_mask is None or not np.any(snapshot.chamber_mask):
                 errors.append("Define a chamber area in Chamber Mark.")
@@ -814,14 +958,14 @@ class PipelinePanelMixin:
     def _pipeline_stage_summary(self, snapshot: PipelineSnapshot, stage_key: str) -> str:
         if stage_key == "duplicate_removal":
             return (
-                "Deletes only lower-confidence duplicate rows · "
+                "Deletes only lower-confidence duplicate rows ??"
                 f"Distance threshold: {snapshot.duplicate_distance_threshold:.2f}px sum"
             )
         if stage_key == "zscore_removal":
             mode = snapshot.zscore_deviation_mode.replace("_", " ")
             return (
-                f"Keeps rows; skeleton x/y/score → NaN · Side: {mode} · "
-                f"High: {snapshot.zscore_high_threshold:.2f} · Low: {snapshot.zscore_low_threshold:.2f}"
+                f"Keeps rows; skeleton x/y/score ??NaN ??Side: {mode} ??"
+                f"High: {snapshot.zscore_high_threshold:.2f} ??Low: {snapshot.zscore_low_threshold:.2f}"
             )
         if stage_key == "clean_repair":
             removal = snapshot.interpolation_removal_mode.replace("none", "off")
@@ -832,20 +976,25 @@ class PipelinePanelMixin:
                 interpolation = "on (original + newly invalidated internal gaps)"
             else:
                 interpolation = "off"
-            return f"Removal: {removal} · Anchor: {anchor} · Interpolation: {interpolation}"
+            return f"Removal: {removal} ??Anchor: {anchor} ??Interpolation: {interpolation}"
+        if stage_key == "smoothing":
+            anchor = snapshot.smoothing_anchor or "-"
+            method = SMOOTHING_METHODS.get(snapshot.smoothing_method)
+            label = method.label if method is not None else snapshot.smoothing_method
+            return f"{label} | Anchor: {anchor} | Window: {snapshot.smoothing_window_size} frames"
         if stage_key == "chamber":
             chamber_ready = snapshot.chamber_mask is not None and bool(np.any(snapshot.chamber_mask))
             boundary = "full frame" if snapshot.chamber_boundary_mode == "full_frame" else "custom"
-            return f"Chamber: {boundary if chamber_ready else 'not set'} · Rooms: {len(snapshot.rooms)}"
+            return f"Chamber: {boundary if chamber_ready else 'not set'} ??Rooms: {len(snapshot.rooms)}"
         if stage_key == "circle":
             if snapshot.circle_geometry is None:
                 return "Circle: not set"
             center, _base_radius, adjusted_radius = snapshot.circle_geometry
-            return f"Center: ({center[0]:.1f}, {center[1]:.1f}) · Radius: {adjusted_radius:.1f}px"
+            return f"Center: ({center[0]:.1f}, {center[1]:.1f}) ??Radius: {adjusted_radius:.1f}px"
         if stage_key == "occlusion":
             geometric = sum(record.margin_mode == "geometric" for record in snapshot.masks)
             return (
-                f"Masks: {len(snapshot.masks)} · Geometric masks: {geometric} · "
+                f"Masks: {len(snapshot.masks)} ??Geometric masks: {geometric} ??"
                 f"Reference points: {len(snapshot.occlusion_quad_points)}/4"
             )
         return f"Square points: {len(snapshot.square_points)}/4"
@@ -888,7 +1037,7 @@ class PipelinePanelMixin:
             self.pipeline_status_label.setToolTip("\n".join(errors))
         else:
             self.pipeline_status_label.setText(
-                f"Ready · {len(snapshot.enabled_stages)} stage(s) · new combined CSV; source unchanged"
+                f"Ready ??{len(snapshot.enabled_stages)} stage(s) ??new combined CSV; source unchanged"
             )
             self.pipeline_status_label.setToolTip("")
         ready = not errors
@@ -931,9 +1080,7 @@ class PipelinePanelMixin:
     @staticmethod
     def _ordered_pipeline_stage_keys(snapshot: PipelineSnapshot) -> tuple[str, ...]:
         order = (
-            "duplicate_removal",
-            "zscore_removal",
-            "clean_repair",
+            *snapshot.repair_stage_order,
             "square",
             "chamber",
             "circle",
@@ -952,62 +1099,80 @@ class PipelinePanelMixin:
         snapshot: PipelineSnapshot,
     ) -> list[DataFramePipelineStage]:
         stages: list[DataFramePipelineStage] = []
-        if "duplicate_removal" in snapshot.enabled_stages:
-            stages.append(
-                DataFramePipelineStage(
-                    key="duplicate_removal",
-                    label=PIPELINE_STAGE_LABELS["duplicate_removal"],
-                    output_mode="replace",
-                    allow_row_removal=True,
-                    transform=partial(
-                        _duplicate_stage_dataframe,
-                        bodyparts=item.bodyparts,
-                        criteria=snapshot.duplicate_distance_threshold,
-                        width=item.width,
-                        height=item.height,
-                    ),
+        for repair_key in snapshot.repair_stage_order:
+            if repair_key not in snapshot.enabled_stages:
+                continue
+            if repair_key == "duplicate_removal":
+                stages.append(
+                    DataFramePipelineStage(
+                        key="duplicate_removal",
+                        label=PIPELINE_STAGE_LABELS["duplicate_removal"],
+                        output_mode="replace",
+                        allow_row_removal=True,
+                        transform=partial(
+                            _duplicate_stage_dataframe,
+                            bodyparts=item.bodyparts,
+                            criteria=snapshot.duplicate_distance_threshold,
+                            width=item.width,
+                            height=item.height,
+                        ),
+                    )
                 )
-            )
-        if "zscore_removal" in snapshot.enabled_stages:
-            stages.append(
-                DataFramePipelineStage(
-                    key="zscore_removal",
-                    label=PIPELINE_STAGE_LABELS["zscore_removal"],
-                    output_mode="replace",
-                    transform=partial(
-                        _zscore_stage_dataframe,
-                        bodyparts=item.bodyparts,
-                        high_z_threshold=snapshot.zscore_high_threshold,
-                        low_z_threshold=snapshot.zscore_low_threshold,
-                        deviation_mode=snapshot.zscore_deviation_mode,
-                        width=item.width,
-                        height=item.height,
-                    ),
+            elif repair_key == "zscore_removal":
+                stages.append(
+                    DataFramePipelineStage(
+                        key="zscore_removal",
+                        label=PIPELINE_STAGE_LABELS["zscore_removal"],
+                        output_mode="replace",
+                        transform=partial(
+                            _zscore_stage_dataframe,
+                            bodyparts=item.bodyparts,
+                            high_z_threshold=snapshot.zscore_high_threshold,
+                            low_z_threshold=snapshot.zscore_low_threshold,
+                            deviation_mode=snapshot.zscore_deviation_mode,
+                            width=item.width,
+                            height=item.height,
+                        ),
+                    )
                 )
-            )
-        if "clean_repair" in snapshot.enabled_stages:
-            region_mask = None
-            if snapshot.interpolation_removal_mode != "none":
-                assert snapshot.interpolation_mask is not None
-                region_mask = self._resize_mask(snapshot.interpolation_mask, item.width, item.height)
-            stages.append(
-                DataFramePipelineStage(
-                    key="clean_repair",
-                    label=PIPELINE_STAGE_LABELS["clean_repair"],
-                    output_mode="replace",
-                    transform=partial(
-                        build_interpolation_pipeline_dataframe,
-                        bodyparts=item.bodyparts,
-                        region_mask=region_mask,
-                        width=item.width,
-                        height=item.height,
-                        removal_mode=snapshot.interpolation_removal_mode,
-                        anchor_bodypart=snapshot.interpolation_anchor,
-                        interpolate=snapshot.interpolation_enabled,
-                        extrapolate=snapshot.interpolation_extrapolate,
-                    ),
+            elif repair_key == "clean_repair":
+                region_mask = None
+                if snapshot.interpolation_removal_mode != "none":
+                    assert snapshot.interpolation_mask is not None
+                    region_mask = self._resize_mask(snapshot.interpolation_mask, item.width, item.height)
+                stages.append(
+                    DataFramePipelineStage(
+                        key="clean_repair",
+                        label=PIPELINE_STAGE_LABELS["clean_repair"],
+                        output_mode="replace",
+                        transform=partial(
+                            build_interpolation_pipeline_dataframe,
+                            bodyparts=item.bodyparts,
+                            region_mask=region_mask,
+                            width=item.width,
+                            height=item.height,
+                            removal_mode=snapshot.interpolation_removal_mode,
+                            anchor_bodypart=snapshot.interpolation_anchor,
+                            interpolate=snapshot.interpolation_enabled,
+                            extrapolate=snapshot.interpolation_extrapolate,
+                        ),
+                    )
                 )
-            )
+            elif repair_key == "smoothing":
+                stages.append(
+                    DataFramePipelineStage(
+                        key="smoothing",
+                        label=PIPELINE_STAGE_LABELS["smoothing"],
+                        output_mode="replace",
+                        transform=partial(
+                            build_smoothed_dataframe,
+                            bodyparts=item.bodyparts,
+                            method=snapshot.smoothing_method,
+                            anchor_bodypart=snapshot.smoothing_anchor,
+                            window_size=snapshot.smoothing_window_size,
+                        ),
+                    )
+                )
 
         if "square" in snapshot.enabled_stages:
             square_points = tuple(

@@ -26,22 +26,20 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from mask_tools import build_circle_mask, build_polygon_mask, merge_mask, paint_brush_segment, parse_draw_shape_payload
 from shared import (
     MASK_PALETTE,
     MaskRecord,
     adjust_mask_by_mode,
     build_occlusion_dataframe,
     circle_mask_geometry,
-    fill_circle_from_diameter,
-    fill_polygon,
     mask_geometry_for_export,
     mask_geometry_is_exact,
     mask_polygon_geometry,
-    paint_brush,
-    validated_quad_points,
     scale_mask_geometry,
     smooth_binary_mask_low,
 )
+from shortcuts import ANNOTATE_SHORTCUT_HELP_GROUPS
 from ui_controls import NoWheelComboBox, NoWheelSpinBox
 
 
@@ -105,7 +103,7 @@ class OcclusionTabMixin:
 
         self.mask_shape_combo = NoWheelComboBox()
         self.mask_shape_combo.addItems(
-            ["Rectangle 4 Points", "Circle Drag", "Free Drawing"]
+            ["Rectangle Drag", "Rectangle 4 Points", "Polygon", "Circle Drag", "Brush"]
         )
         self.mask_shape_combo.setMinimumWidth(0)
         self.mask_shape_combo.setToolTip("Choose how mask pixels are drawn in the viewer.")
@@ -292,26 +290,8 @@ class OcclusionTabMixin:
             grid.setColumnStretch(1, 1)
             content_layout.addWidget(section)
 
-        add_shortcut_group(
-            "Shared",
-            [
-                ("D", "Draw mode"),
-                ("T", "Transform mode"),
-                ("E  or  [", "Scale down"),
-                ("R  or  ]", "Scale up"),
-                ("Ctrl+E  or  Ctrl+[", "Rotate left (Chamber / Occlusion)"),
-                ("Ctrl+R  or  Ctrl+]", "Rotate right (Chamber / Occlusion)"),
-                ("Ctrl+Z", "Undo the latest mask content edit in the current tab"),
-                ("F1", "Open this shortcut guide"),
-            ],
-        )
-        add_shortcut_group(
-            "Occlusion only",
-            [
-                ("1 - 9", "Select mask 1 - 9"),
-                ("0", "Select mask 10"),
-            ],
-        )
+        for section_title, rows in ANNOTATE_SHORTCUT_HELP_GROUPS:
+            add_shortcut_group(section_title, list(rows))
         content_layout.addStretch(1)
         scroll.setWidget(content)
         layout.addWidget(scroll, stretch=1)
@@ -332,8 +312,16 @@ class OcclusionTabMixin:
         if self.mode_tabs.currentIndex() != self.TAB_OCCLUSION:
             self.frame_viewer.set_occ_margin_pick_mode(False)
             return
-        mapping = {0: "occ_rect", 1: "occ_circle", 2: "occ_free"}
-        self.frame_viewer.set_mode(mapping.get(self.mask_shape_combo.currentIndex(), "occ_rect"))
+        mapping = {
+            0: "occ_rect_drag",
+            1: "occ_rect",
+            2: "occ_polygon",
+            3: "occ_circle",
+            4: "occ_free",
+        }
+        self.frame_viewer.clear_occ_rect_points()
+        self.frame_viewer.clear_occ_circle()
+        self.frame_viewer.set_mode(mapping.get(self.mask_shape_combo.currentIndex(), "occ_rect_drag"))
         self.frame_viewer.set_margin_value(float(self.mask_margin_slider.value()))
         self.frame_viewer.set_occ_transform_mode(self.mask_transform_radio.isChecked())
         if not self.mask_margin_geometric_radio.isChecked():
@@ -346,7 +334,10 @@ class OcclusionTabMixin:
         self._refresh_output_ui()
 
     def _sync_draw_mode(self) -> None:
-        self.frame_viewer.free_draw_add = self.mask_add_radio.isChecked()
+        self.frame_viewer.set_occlusion_draw_mode(
+            add=self.mask_add_radio.isChecked(),
+            brush_radius=int(self.mask_brush_slider.value()),
+        )
 
     def reset_masks(self) -> None:
         self._invalidate_mask_transform_source()
@@ -530,6 +521,11 @@ class OcclusionTabMixin:
 
     def _on_mask_brush_changed(self, value: int) -> None:
         self.default_mask_brush = int(value)
+        if hasattr(self, "frame_viewer"):
+            self.frame_viewer.set_occlusion_draw_mode(
+                add=self.mask_add_radio.isChecked(),
+                brush_radius=int(value),
+            )
         if self.mask_brush_slider.value() != value:
             self.mask_brush_slider.blockSignals(True)
             self.mask_brush_slider.setValue(value)
@@ -635,7 +631,7 @@ class OcclusionTabMixin:
         self._invalidate_mask_transform_source(current.name)
         current.geometry = None
         brush_radius = max(1, int(self.mask_brush_slider.value()))
-        paint_brush(current.mask, point, point, brush_radius, 0)
+        paint_brush_segment(current.mask, point, point, radius=brush_radius, add=False)
         self.frame_viewer.refresh_mask_record(current.name, include_margin=False)
 
     def erase_occ_transform_segment(self, payload: tuple[tuple[float, float], tuple[float, float]]) -> None:
@@ -650,7 +646,7 @@ class OcclusionTabMixin:
         current.geometry = None
         start, end = payload
         brush_radius = max(1, int(self.mask_brush_slider.value()))
-        paint_brush(current.mask, start, end, brush_radius, 0)
+        paint_brush_segment(current.mask, start, end, radius=brush_radius, add=False)
         now = time.monotonic()
         if now - getattr(self, "_last_mask_preview_refresh", 0.0) >= 0.03:
             self._last_mask_preview_refresh = now
@@ -660,45 +656,28 @@ class OcclusionTabMixin:
         current = self._selected_mask()
         if current is None or self.mask_transform_radio.isChecked():
             return
-        add = self.mask_add_radio.isChecked()
-        points: list[tuple[float, float]]
-        if (
-            isinstance(payload, tuple)
-            and len(payload) == 2
-            and isinstance(payload[0], list)
-            and isinstance(payload[1], bool)
-        ):
-            points = payload[0]
-            add = payload[1]
-        elif isinstance(payload, list):
-            points = payload
-        else:
+        parsed = parse_draw_shape_payload(
+            payload,
+            default_add=self.mask_add_radio.isChecked(),
+            default_shape="rectangle",
+        )
+        if parsed is None:
             return
-        if hasattr(self, "_push_occlusion_undo"):
-            self._push_occlusion_undo("draw occlusion rectangle")
-        self._invalidate_mask_transform_source(current.name)
-        had_pixels = bool(np.any(current.mask))
-        ordered = validated_quad_points(points)
-        if ordered is None:
-            self.statusBar().showMessage("Rectangle needs four distinct corner points.", 3000)
+        built = build_polygon_mask(current.mask, parsed.points, shape_kind=parsed.shape_kind)
+        if built is None:
+            message = "Polygon needs at least three points." if parsed.shape_kind == "polygon" else "Rectangle needs four distinct corner points."
+            self.statusBar().showMessage(message, 3000)
             self.frame_viewer.clear_occ_rect_points()
             return
-        ordered_points = ordered.tolist()
-        shape_mask = np.zeros_like(current.mask, dtype=np.uint8)
-        fill_polygon(shape_mask, ordered_points, 1)
-        if add:
-            current.mask = np.logical_or(
-                current.mask.astype(bool),
-                shape_mask.astype(bool),
-            ).astype(np.uint8)
-        else:
-            current.mask = np.logical_and(
-                current.mask.astype(bool),
-                ~shape_mask.astype(bool),
-            ).astype(np.uint8)
+        shape_mask, ordered_points, geometry_shape = built
+        if hasattr(self, "_push_occlusion_undo"):
+            self._push_occlusion_undo("draw occlusion mask")
+        self._invalidate_mask_transform_source(current.name)
+        had_pixels = bool(np.any(current.mask))
+        current.mask = merge_mask(current.mask, shape_mask, add=parsed.add)
         current.geometry = (
-            mask_polygon_geometry(ordered_points, source="exact", shape="rectangle")
-            if add and not had_pixels
+            mask_polygon_geometry(ordered_points, source="exact", shape=geometry_shape)
+            if parsed.add and not had_pixels
             else None
         )
         self.frame_viewer.refresh_mask_record(current.name, include_margin=True)
@@ -720,18 +699,8 @@ class OcclusionTabMixin:
             self._push_occlusion_undo("draw occlusion circle")
         self._invalidate_mask_transform_source(current.name)
         had_pixels = bool(np.any(current.mask))
-        shape_mask = np.zeros_like(current.mask, dtype=np.uint8)
-        fill_circle_from_diameter(shape_mask, start, end, 1)
-        if add:
-            current.mask = np.logical_or(
-                current.mask.astype(bool),
-                shape_mask.astype(bool),
-            ).astype(np.uint8)
-        else:
-            current.mask = np.logical_and(
-                current.mask.astype(bool),
-                ~shape_mask.astype(bool),
-            ).astype(np.uint8)
+        shape_mask = build_circle_mask(current.mask, start, end)
+        current.mask = merge_mask(current.mask, shape_mask, add=add)
         current.geometry = (
             circle_mask_geometry(
                 ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0),
@@ -757,7 +726,7 @@ class OcclusionTabMixin:
         start, end, add = payload
         self._invalidate_mask_transform_source(current.name)
         current.geometry = None
-        paint_brush(current.mask, start, end, self.mask_brush_slider.value(), 1 if add else 0)
+        paint_brush_segment(current.mask, start, end, radius=self.mask_brush_slider.value(), add=bool(add))
         now = time.monotonic()
         if now - getattr(self, "_last_mask_preview_refresh", 0.0) >= 0.03:
             self._last_mask_preview_refresh = now

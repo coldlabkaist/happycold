@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
 from batch import BatchItem, BatchRunResult
 from heatmap import calculate_body_occupancy_heatmap
 from heatmap_plot import build_heatmap_figure
+from trajectory_plot import build_trajectory_figure
 from shared import (
     build_normalized_dataframe,
     build_rectified_geometry,
@@ -141,8 +142,8 @@ class SquareTabMixin:
         layout.setSpacing(8)
 
         info = QLabel(
-            "Choose an optional time or spatial range, then open a trajectory or heatmap "
-            "preview. This tab never changes the source CSV."
+            "Set the shared coordinate and range options first, then preview trajectory "
+            "or heatmap in separate sections. This tab never changes the source CSV."
         )
         info.setWordWrap(True)
         info.setToolTip(tooltip)
@@ -153,9 +154,9 @@ class SquareTabMixin:
         self.trajectory_coordinate_mode_label.setProperty("muted", True)
         layout.addWidget(self.trajectory_coordinate_mode_label)
 
-        self.square_limit_trajectory_checkbox = QCheckBox("Limit preview to a time range")
+        self.square_limit_trajectory_checkbox = QCheckBox("Limit trajectory and heatmap to a time range")
         self.square_limit_trajectory_checkbox.setToolTip(
-            "When enabled, only frames in the resolved range are used by previews and batch heatmaps."
+            "When enabled, only frames in the resolved range are used by previews and batch exports."
         )
 
         self.square_cut_group = QGroupBox("Time Range Settings")
@@ -239,22 +240,22 @@ class SquareTabMixin:
         cut_layout.addWidget(self.square_end_use_current_button, 3, 2)
         cut_layout.addWidget(self.square_cut_range_label, 4, 0, 1, 3)
 
-        range_group = QGroupBox("1. Choose Data Range")
+        range_group = QGroupBox("1. Shared Data Range")
         range_layout = QVBoxLayout(range_group)
         range_layout.addWidget(self.square_limit_trajectory_checkbox)
         range_layout.addWidget(self.square_cut_group)
 
         self.trajectory_limit_region_checkbox = QCheckBox(
-            "Limit preview and heatmap to a rectangle"
+            "Limit trajectory and heatmap to a 4-point range"
         )
         self.trajectory_limit_region_checkbox.setToolTip(
-            "Coordinates outside the rectangle are ignored; rows and source data remain unchanged."
+            "Coordinates outside the selected range are ignored; heatmaps are cropped to the same range."
         )
         self.trajectory_region_status_label = QLabel("Spatial range: Full frame")
         self.trajectory_region_status_label.setWordWrap(True)
         self.trajectory_region_status_label.setProperty("muted", True)
-        self.trajectory_draw_region_button = QPushButton("Draw / Redraw Rectangle")
-        self.trajectory_clear_region_button = QPushButton("Clear Rectangle")
+        self.trajectory_draw_region_button = QPushButton("Select 4 Points")
+        self.trajectory_clear_region_button = QPushButton("Clear Range")
         region_button_row = QHBoxLayout()
         region_button_row.setSpacing(6)
         region_button_row.addWidget(self.trajectory_draw_region_button, stretch=1)
@@ -267,11 +268,11 @@ class SquareTabMixin:
         range_layout.addWidget(spatial_group)
         layout.addWidget(range_group)
 
-        preview_help = QLabel(
-            "Trajectory shows paths by bodypart. Heatmap shows spatial occupancy, with or without the video frame."
+        trajectory_help = QLabel(
+            "Review bodypart paths with the coordinate space and range settings above."
         )
-        preview_help.setWordWrap(True)
-        preview_help.setProperty("muted", True)
+        trajectory_help.setWordWrap(True)
+        trajectory_help.setProperty("muted", True)
         self.square_preview_button = QPushButton("Preview Trajectory")
         self.square_preview_button.setProperty("primary", True)
         self.square_preview_button.setEnabled(False)
@@ -289,16 +290,26 @@ class SquareTabMixin:
             "Show a body-volume probability heatmap without the video frame."
         )
 
-        preview_group = QGroupBox("2. Open a Preview")
-        preview_layout = QVBoxLayout(preview_group)
-        preview_layout.addWidget(preview_help)
-        preview_layout.addWidget(self.square_preview_button)
-        preview_layout.addWidget(self.square_heatmap_overlay_button)
-        preview_layout.addWidget(self.square_heatmap_plain_button)
-        layout.addWidget(preview_group)
+        trajectory_group = QGroupBox("2. Trajectory")
+        trajectory_layout = QVBoxLayout(trajectory_group)
+        trajectory_layout.addWidget(trajectory_help)
+        trajectory_layout.addWidget(self.square_preview_button)
+        layout.addWidget(trajectory_group)
+
+        heatmap_help = QLabel(
+            "Review body-volume occupancy with or without the current video frame."
+        )
+        heatmap_help.setWordWrap(True)
+        heatmap_help.setProperty("muted", True)
+        heatmap_group = QGroupBox("3. Heatmap")
+        heatmap_layout = QVBoxLayout(heatmap_group)
+        heatmap_layout.addWidget(heatmap_help)
+        heatmap_layout.addWidget(self.square_heatmap_overlay_button)
+        heatmap_layout.addWidget(self.square_heatmap_plain_button)
+        layout.addWidget(heatmap_group)
 
         output_hint = QLabel(
-            "Need files for several videos? Use TRAJECTORY OUTPUT below for batch heatmap saving."
+            "Need files for several videos? Use VISUALIZE OUTPUT below for batch trajectory and heatmap saving."
         )
         output_hint.setWordWrap(True)
         output_hint.setProperty("muted", True)
@@ -362,24 +373,29 @@ class SquareTabMixin:
 
     def _on_trajectory_region_changed(self) -> None:
         self._refresh_trajectory_region_controls()
-        # Keep drag feedback light; update dependent output only when the drag finishes.
-        if not self.frame_viewer._trajectory_region_dragging:
-            self._refresh_square_ui()
+        self._refresh_square_ui()
 
     def _refresh_trajectory_region_controls(self) -> None:
         if not hasattr(self, "trajectory_limit_region_checkbox"):
             return
         enabled = self.trajectory_limit_region_checkbox.isChecked()
         self.trajectory_draw_region_button.setEnabled(enabled)
-        self.trajectory_clear_region_button.setEnabled(
-            enabled and self.frame_viewer.trajectory_region_bounds() is not None
-        )
+        point_count = len(getattr(self.frame_viewer, "trajectory_region_points", []))
+        self.trajectory_clear_region_button.setEnabled(enabled and point_count > 0)
         if not enabled:
             self.trajectory_region_status_label.setText("Spatial range: Full frame")
             return
         bounds = self.frame_viewer.trajectory_region_bounds()
         if bounds is None:
-            self.trajectory_region_status_label.setText("Spatial range: Drag a rectangle in the viewer.")
+            remaining = max(0, 4 - point_count)
+            if point_count:
+                self.trajectory_region_status_label.setText(
+                    f"Spatial range: Click {remaining} more point(s) ({point_count}/4)."
+                )
+            else:
+                self.trajectory_region_status_label.setText(
+                    "Spatial range: Click 4 rectangle corners in the viewer."
+                )
             return
         left, top, right, bottom = bounds
         self.trajectory_region_status_label.setText(
@@ -413,12 +429,18 @@ class SquareTabMixin:
             or not self.trajectory_limit_region_checkbox.isChecked()
             or self.frame_viewer.trajectory_region_bounds() is not None
         )
-        self.square_preview_button.setEnabled(
-            self.csv_df is not None and point_count in {0, 4} and region_ready
+        trajectory_ready = (
+            self.csv_df is not None
+            and self.video_state is not None
+            and point_count in {0, 4}
+            and region_ready
         )
+        self.square_preview_button.setEnabled(trajectory_ready)
         heatmap_ready = self._square_heatmap_ready()
         self.square_heatmap_overlay_button.setEnabled(heatmap_ready)
         self.square_heatmap_plain_button.setEnabled(heatmap_ready)
+        if hasattr(self, "square_batch_trajectory_button"):
+            self.square_batch_trajectory_button.setEnabled(trajectory_ready)
         if hasattr(self, "square_batch_heatmap_overlay_button"):
             self.square_batch_heatmap_overlay_button.setEnabled(heatmap_ready)
             self.square_batch_heatmap_plain_button.setEnabled(heatmap_ready)
@@ -693,7 +715,7 @@ class SquareTabMixin:
                 QMessageBox.information(
                     self,
                     message_title,
-                    "Draw a rectangular spatial range in the viewer first.",
+                    "Select 4 spatial range points in the viewer first.",
                 )
             return None
         left, top, right, bottom = bounds
@@ -722,7 +744,7 @@ class SquareTabMixin:
                 QMessageBox.information(
                     self,
                     message_title,
-                    "No trajectory coordinates were found inside the selected rectangle.",
+                    "No trajectory coordinates were found inside the selected spatial range.",
                 )
             return None
         return filtered
@@ -810,13 +832,81 @@ class SquareTabMixin:
     def _square_heatmap_output_path_for(self, csv_path: Path, with_background: bool) -> Path:
         return self.save_folder / f"{self._square_heatmap_export_name_for(csv_path, with_background)}.png"
 
+    @staticmethod
+    def _clamped_heatmap_region(
+        bounds: tuple[float, float, float, float] | None,
+        frame_width: int,
+        frame_height: int,
+    ) -> tuple[int, int, int, int] | None:
+        if bounds is None:
+            return None
+        left, top, right, bottom = (float(value) for value in bounds)
+        if not all(np.isfinite((left, top, right, bottom))):
+            return None
+        left, right = sorted((left, right))
+        top, bottom = sorted((top, bottom))
+        width = max(1, int(frame_width))
+        height = max(1, int(frame_height))
+        left_i = max(0, min(width - 1, int(np.floor(left))))
+        top_i = max(0, min(height - 1, int(np.floor(top))))
+        right_i = max(left_i + 1, min(width, int(np.ceil(right))))
+        bottom_i = max(top_i + 1, min(height, int(np.ceil(bottom))))
+        return left_i, top_i, right_i, bottom_i
+
+    @classmethod
+    def _crop_heatmap_background(
+        cls,
+        frame_rgb: np.ndarray,
+        bounds: tuple[float, float, float, float] | None,
+    ) -> np.ndarray:
+        region = cls._clamped_heatmap_region(bounds, frame_rgb.shape[1], frame_rgb.shape[0])
+        if region is None:
+            return frame_rgb
+        left, top, right, bottom = region
+        return frame_rgb[top:bottom, left:right]
+
+    @staticmethod
+    def _rectified_heatmap_region_bounds(
+        bounds: tuple[float, float, float, float] | None,
+        quad_points: list[tuple[float, float]],
+    ) -> tuple[float, float, float, float] | None:
+        if bounds is None or len(quad_points) != 4:
+            return None
+        left, top, right, bottom = bounds
+        matrix, _inverse, _rectified_size = build_rectified_geometry(quad_points)
+        corners = np.array(
+            [[[left, top]], [[right, top]], [[right, bottom]], [[left, bottom]]],
+            dtype=np.float32,
+        )
+        transformed = cv2.perspectiveTransform(corners, matrix).reshape(-1, 2)
+        return (
+            float(np.nanmin(transformed[:, 0])),
+            float(np.nanmin(transformed[:, 1])),
+            float(np.nanmax(transformed[:, 0])),
+            float(np.nanmax(transformed[:, 1])),
+        )
+
+    def _square_heatmap_display_bounds(self, normalized: bool) -> tuple[float, float, float, float] | None:
+        if not (
+            hasattr(self, "trajectory_limit_region_checkbox")
+            and self.trajectory_limit_region_checkbox.isChecked()
+        ):
+            return None
+        bounds = self.frame_viewer.trajectory_region_bounds()
+        if not normalized:
+            return bounds
+        return self._rectified_heatmap_region_bounds(bounds, self.frame_viewer.square_points)
+
     def _square_heatmap_background_image(self, normalized: bool) -> np.ndarray | None:
         if self.current_frame_rgb is None:
             return None
         if not normalized:
-            return self.current_frame_rgb
+            return self._crop_heatmap_background(
+                self.current_frame_rgb,
+                self._square_heatmap_display_bounds(normalized=False),
+            )
         matrix, _inverse, (rect_width, rect_height) = build_rectified_geometry(self.frame_viewer.square_points)
-        return cv2.warpPerspective(
+        background = cv2.warpPerspective(
             self.current_frame_rgb,
             matrix,
             (rect_width, rect_height),
@@ -824,19 +914,24 @@ class SquareTabMixin:
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=(0, 0, 0),
         )
+        return self._crop_heatmap_background(
+            background,
+            self._square_heatmap_display_bounds(normalized=True),
+        )
 
     @staticmethod
     def _square_heatmap_background_image_from_frame(
         frame_rgb: np.ndarray | None,
         normalized: bool,
         quad_points: list[tuple[float, float]],
+        region_bounds: tuple[float, float, float, float] | None = None,
     ) -> np.ndarray | None:
         if frame_rgb is None:
             return None
         if not normalized:
-            return frame_rgb
+            return SquareTabMixin._crop_heatmap_background(frame_rgb, region_bounds)
         matrix, _inverse, (rect_width, rect_height) = build_rectified_geometry(quad_points)
-        return cv2.warpPerspective(
+        background = cv2.warpPerspective(
             frame_rgb,
             matrix,
             (rect_width, rect_height),
@@ -844,6 +939,7 @@ class SquareTabMixin:
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=(0, 0, 0),
         )
+        return SquareTabMixin._crop_heatmap_background(background, region_bounds)
 
     @staticmethod
     def _read_video_frame_rgb(video_path: Path, frame_number: int) -> np.ndarray | None:
@@ -864,6 +960,7 @@ class SquareTabMixin:
     def _build_square_heatmap_figure(self, df: pd.DataFrame, normalized: bool, with_background: bool) -> Figure:
         if self.video_state is None:
             raise ValueError("Load a video before building a heatmap.")
+        display_bounds = self._square_heatmap_display_bounds(normalized)
         background = self._square_heatmap_background_image(normalized) if with_background else None
         rectified_size = None
         if normalized:
@@ -876,6 +973,7 @@ class SquareTabMixin:
             with_background=with_background,
             frame_size=(self.video_state.width, self.video_state.height),
             rectified_size=rectified_size,
+            display_bounds=display_bounds,
         )
 
     def _build_square_heatmap_figure_with_background(
@@ -887,6 +985,7 @@ class SquareTabMixin:
         with_background: bool,
         frame_size: tuple[int, int],
         rectified_size: tuple[int, int] | None,
+        display_bounds: tuple[float, float, float, float] | None = None,
     ) -> Figure:
         heatmap = calculate_body_occupancy_heatmap(
             df=df,
@@ -894,6 +993,7 @@ class SquareTabMixin:
             frame_size=frame_size,
             normalized=normalized,
             rectified_size=rectified_size,
+            display_bounds=display_bounds,
         )
         return build_heatmap_figure(
             heatmap=heatmap,
@@ -1012,6 +1112,151 @@ class SquareTabMixin:
         figure.savefig(output_path, dpi=220, transparent=transparent)
         figure.clear()
 
+    def _save_trajectory_figure_to_path(self, figure: Figure, output_path: Path) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output_path, dpi=220)
+        figure.clear()
+
+    def save_multiple_square_trajectories(self) -> None:
+        if self._focus_active_batch_progress():
+            return
+        if self.video_state is None or self.csv_df is None:
+            QMessageBox.warning(self, "Batch Trajectory Save", "Load a reference video and CSV first.")
+            return
+        point_count = len(self.frame_viewer.square_points)
+        if point_count not in {0, 4}:
+            QMessageBox.warning(
+                self,
+                "Batch Trajectory Save",
+                "Trajectory export needs either zero points for raw mode or four points for normalized mode.",
+            )
+            return
+
+        source_width = max(1, int(self.video_state.width))
+        source_height = max(1, int(self.video_state.height))
+        source_square_points = [tuple(point) for point in self.frame_viewer.square_points]
+        limit_trajectory = self.square_limit_trajectory_checkbox.isChecked()
+        limit_spatial_region = self.trajectory_limit_region_checkbox.isChecked()
+        source_region_bounds = self.frame_viewer.trajectory_region_bounds()
+        cut_range = (
+            self._resolve_square_cut_range_frames(show_message=True)
+            if limit_trajectory
+            else None
+        )
+        if limit_trajectory and cut_range is None:
+            return
+        if limit_spatial_region and source_region_bounds is None:
+            QMessageBox.information(
+                self, "Batch Trajectory", "Select 4 spatial range points first."
+            )
+            return
+
+        selected_videos = self._select_videos_for_batch(
+            dialog_title="Select Videos For Batch Trajectory Save",
+            info_text="Select videos to export trajectory PNG images using the current Visualize settings.",
+            warning_text=(
+                "Warning:\n"
+                "- Only videos with auto-detected CSV candidates are exported.\n"
+                "- The top auto-detected CSV candidate is used for each video.\n"
+                "- Current normalization points and optional time/spatial ranges are applied to all selected videos."
+            ),
+            start_button_text="Start Batch Trajectory Save",
+        )
+        if not selected_videos:
+            return
+
+        save_folder = Path(self.save_folder)
+        trajectory_mode = "normalized" if len(source_square_points) == 4 else "raw"
+
+        def _export_item(item: BatchItem) -> Path:
+            source_df = item.source_df
+            if limit_spatial_region and source_region_bounds is not None:
+                left, top, right, bottom = source_region_bounds
+                scaled_region_bounds = (
+                    left * item.scale_x,
+                    top * item.scale_y,
+                    right * item.scale_x,
+                    bottom * item.scale_y,
+                )
+                source_df = self._filter_trajectory_spatial_region(
+                    source_df,
+                    item.bodyparts,
+                    item.width,
+                    item.height,
+                    scaled_region_bounds,
+                    message_title="Batch Trajectory",
+                    show_message=False,
+                )
+                if source_df is None:
+                    raise ValueError(
+                        "No trajectory coordinates were found inside the selected spatial range."
+                    )
+
+            if limit_trajectory:
+                frame_col = self._find_matching_column(
+                    source_df,
+                    self.FRAME_COLUMN_CANDIDATES,
+                )
+                if frame_col is None:
+                    raise ValueError("Could not find a frame column for the selected time range.")
+                start_frame, end_frame = cut_range
+                frame_values = pd.to_numeric(source_df[frame_col], errors="coerce")
+                source_df = source_df.loc[
+                    frame_values.between(start_frame, end_frame, inclusive="both")
+                ].copy()
+                if source_df.empty:
+                    raise ValueError("No trajectory data was found in the selected time range.")
+
+            scaled_square_points = [
+                (x * item.scale_x, y * item.scale_y)
+                for x, y in source_square_points
+            ]
+            normalized_display_size = None
+            if scaled_square_points:
+                export_df = build_normalized_dataframe(
+                    source_df,
+                    item.bodyparts,
+                    scaled_square_points,
+                    item.width,
+                    item.height,
+                )
+                normalized = True
+                _matrix, _inverse, normalized_display_size = build_rectified_geometry(
+                    scaled_square_points
+                )
+            else:
+                export_df = source_df
+                normalized = False
+
+            figure = build_trajectory_figure(
+                export_df,
+                item.bodyparts,
+                normalized,
+                item.width,
+                item.height,
+                normalized_display_size,
+            )
+            output_path = save_folder / f"{item.csv_path.stem}_{trajectory_mode}_trajectory.png"
+            self._save_trajectory_figure_to_path(figure, output_path)
+            return output_path
+
+        def _on_completed(result: BatchRunResult) -> None:
+            state = "cancelled" if result.cancelled else "finished"
+            self.statusBar().showMessage(
+                f"Batch trajectory save {state}: saved={result.saved_count}, "
+                f"skipped={len(result.skipped_auto_missing)}, failed={len(result.failed)}"
+            )
+
+        self._start_batch_export(
+            title="Batch Trajectory Save Progress",
+            activity_text="Saving trajectory images in the background...",
+            selected_videos=selected_videos,
+            source_width=source_width,
+            source_height=source_height,
+            export_item=_export_item,
+            on_completed=_on_completed,
+        )
+
     def _save_multiple_square_heatmaps(self, with_background: bool) -> None:
         if self._focus_active_batch_progress():
             return
@@ -1056,7 +1301,7 @@ class SquareTabMixin:
             return
         if limit_spatial_region and source_region_bounds is None:
             QMessageBox.information(
-                self, "Batch Heatmap", "Draw a rectangular spatial range first."
+                self, "Batch Heatmap", "Select 4 spatial range points first."
             )
             return
         save_folder = Path(self.save_folder)
@@ -1065,9 +1310,10 @@ class SquareTabMixin:
 
         def _export_item(item: BatchItem) -> Path:
             source_df = item.source_df
+            scaled_region_bounds = None
             if limit_spatial_region and source_region_bounds is not None:
                 left, top, right, bottom = source_region_bounds
-                scaled_bounds = (
+                scaled_region_bounds = (
                     left * item.scale_x,
                     top * item.scale_y,
                     right * item.scale_x,
@@ -1078,13 +1324,13 @@ class SquareTabMixin:
                     item.bodyparts,
                     item.width,
                     item.height,
-                    scaled_bounds,
+                    scaled_region_bounds,
                     message_title="Batch Heatmap",
                     show_message=False,
                 )
                 if source_df is None:
                     raise ValueError(
-                        "No trajectory coordinates were found inside the selected rectangle."
+                        "No trajectory coordinates were found inside the selected spatial range."
                     )
             scaled_square_points = [
                 (x * item.scale_x, y * item.scale_y)
@@ -1121,6 +1367,11 @@ class SquareTabMixin:
             if normalized:
                 _matrix, _inverse, rectified_size = build_rectified_geometry(scaled_square_points)
 
+            display_bounds = (
+                self._rectified_heatmap_region_bounds(scaled_region_bounds, scaled_square_points)
+                if normalized
+                else scaled_region_bounds
+            )
             background = None
             if with_background:
                 background_frame = self._read_video_frame_rgb(item.video_path, frame_number)
@@ -1130,6 +1381,7 @@ class SquareTabMixin:
                     background_frame,
                     normalized,
                     scaled_square_points,
+                    region_bounds=display_bounds,
                 )
 
             figure = self._build_square_heatmap_figure_with_background(
@@ -1140,6 +1392,7 @@ class SquareTabMixin:
                 with_background=with_background,
                 frame_size=(item.width, item.height),
                 rectified_size=rectified_size,
+                display_bounds=display_bounds,
             )
             output_path = save_folder / (
                 f"{item.csv_path.stem}_{heatmap_mode}_location_heatmap_{image_suffix}.png"

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import math
@@ -152,7 +152,10 @@ from shared import (
     translate_mask_geometry,
 )
 from interpolation import build_interpolation_pipeline_dataframe
+from smoothing import build_smoothed_dataframe
+from shortcuts import APP_SHORTCUTS
 from trajectory import resolve_bodypart_coordinate_columns
+from trajectory_plot import build_trajectory_figure
 from ui_controls import NoWheelComboBox, NoWheelSpinBox
 from ui_theme import build_app_stylesheet
 from tab_mixins import (
@@ -162,6 +165,7 @@ from tab_mixins import (
     OcclusionTabMixin,
     PinTabMixin,
     PipelinePanelMixin,
+    SmoothingTabMixin,
     SquareTabMixin,
     TrackingRepairTabMixin,
 )
@@ -195,7 +199,14 @@ class TrajectoryPreviewDialog(QDialog):
         self._normalized = normalized
 
         layout = QVBoxLayout(self)
-        self.figure = Figure(figsize=(10, 7), tight_layout=True)
+        self.figure = build_trajectory_figure(
+            df,
+            bodyparts,
+            normalized,
+            frame_width,
+            frame_height,
+            normalized_display_size,
+        )
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.canvas.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.canvas.customContextMenuRequested.connect(self._show_context_menu)
@@ -207,28 +218,6 @@ class TrajectoryPreviewDialog(QDialog):
             layout.addWidget(empty_label)
             return
 
-        colors = ["#2563eb", "#ea580c", "#16a34a", "#dc2626", "#7c3aed", "#0891b2", "#4f46e5", "#a16207"]
-        columns = min(3, max(1, len(bodyparts)))
-        rows = math.ceil(len(bodyparts) / columns)
-        track_col = self._find_matching_column(df, self.TRACK_COLUMN_CANDIDATES)
-        frame_col = self._find_matching_column(df, self.FRAME_COLUMN_CANDIDATES)
-        x_limit, y_limit = self._plot_limits(
-            df,
-            bodyparts,
-            normalized,
-            frame_width,
-            frame_height,
-            normalized_display_size,
-        )
-
-        for index, bodypart in enumerate(bodyparts, start=1):
-            ax = self.figure.add_subplot(rows, columns, index)
-            self._plot_bodypart(ax, df, bodypart, track_col, frame_col, colors)
-            ax.set_title(bodypart, fontsize=10)
-            ax.set_xlim(0, x_limit)
-            ax.set_ylim(y_limit, 0)
-            ax.set_aspect("equal", adjustable="box")
-            ax.grid(alpha=0.2)
         self.canvas.draw_idle()
 
     def _show_context_menu(self, position: QPoint) -> None:
@@ -370,6 +359,8 @@ class FrameViewer(QWidget):
     chamber_rect_completed = pyqtSignal(object)
     chamber_circle_changed = pyqtSignal()
     chamber_circle_completed = pyqtSignal(object)
+    chamber_free_segment = pyqtSignal(object)
+    chamber_free_finished = pyqtSignal()
     chamber_transform_requested = pyqtSignal(object)
     chamber_transform_finished = pyqtSignal()
     circle_changed = pyqtSignal()
@@ -423,19 +414,23 @@ class FrameViewer(QWidget):
         self._interpolation_transform_last_point: tuple[float, float] | None = None
         self._interpolation_transform_preview_shift = (0, 0)
         self._interpolation_transform_shift_limits = (0, 0, 0, 0)
+        self._interpolation_transform_erase_dragging = False
+        self._interpolation_transform_erase_last_point: tuple[float, float] | None = None
 
 
         self.square_points: list[tuple[float, float]] = []
         self._square_drag_index: int | None = None
-        self.trajectory_region_start: tuple[float, float] | None = None
-        self.trajectory_region_end: tuple[float, float] | None = None
-        self._trajectory_region_current: tuple[float, float] | None = None
+        self.trajectory_region_points: list[tuple[float, float]] = []
         self._trajectory_region_dragging = False
         self.chamber_rect_points: list[tuple[float, float]] = []
         self.chamber_circle_start: tuple[float, float] | None = None
         self.chamber_circle_end: tuple[float, float] | None = None
         self._chamber_circle_dragging = False
         self._chamber_circle_current: tuple[float, float] | None = None
+        self._chamber_free_dragging = False
+        self._chamber_free_last_point: tuple[float, float] | None = None
+        self.chamber_draw_add = True
+        self.chamber_brush_radius = 20
         self.chamber_transform_mode = False
         self._chamber_transform_target_key: str | None = None
         self._chamber_transform_target_mask: np.ndarray | None = None
@@ -462,6 +457,7 @@ class FrameViewer(QWidget):
         self._occ_margin_drag_index: int | None = None
         self._free_dragging = False
         self._free_last_point: tuple[float, float] | None = None
+        self.occ_brush_radius = 12
         self._occ_rect_draw_override_add: bool | None = None
         self._occ_circle_draw_override_add: bool | None = None
         self.occ_transform_mode = False
@@ -471,6 +467,14 @@ class FrameViewer(QWidget):
         self._occ_transform_shift_limits = (0, 0, 0, 0)
         self._occ_transform_erase_dragging = False
         self._occ_transform_erase_last_point: tuple[float, float] | None = None
+        self._rect_drag_mode: str | None = None
+        self._rect_drag_start: tuple[float, float] | None = None
+        self._rect_drag_current: tuple[float, float] | None = None
+        self._rect_drag_add = True
+        self._polygon_draw_add: bool | None = None
+        self._polygon_preview_point: tuple[float, float] | None = None
+        self._cursor_image_point: tuple[float, float] | None = None
+        self._cursor_modifiers = Qt.KeyboardModifier.NoModifier
 
         self._pan_dragging = False
         self._pan_drag_start = QPoint()
@@ -564,6 +568,17 @@ class FrameViewer(QWidget):
     def set_interpolation_draw_mode(self, add: bool, brush_radius: int) -> None:
         self.interpolation_draw_add = bool(add)
         self.interpolation_brush_radius = max(1, int(brush_radius))
+        self.update()
+
+    def set_chamber_draw_mode(self, add: bool, brush_radius: int) -> None:
+        self.chamber_draw_add = bool(add)
+        self.chamber_brush_radius = max(1, int(brush_radius))
+        self.update()
+
+    def set_occlusion_draw_mode(self, add: bool, brush_radius: int) -> None:
+        self.free_draw_add = bool(add)
+        self.occ_brush_radius = max(1, int(brush_radius))
+        self.update()
 
     def set_interpolation_transform_mode(self, enabled: bool) -> None:
         self.interpolation_transform_mode = bool(enabled)
@@ -610,6 +625,8 @@ class FrameViewer(QWidget):
         self._interpolation_transform_last_point = None
         self._interpolation_transform_preview_shift = (0, 0)
         self._interpolation_transform_shift_limits = (0, 0, 0, 0)
+        self._interpolation_transform_erase_dragging = False
+        self._interpolation_transform_erase_last_point: tuple[float, float] | None = None
         self.update()
 
     def _finish_interpolation_transform_drag(self) -> None:
@@ -740,6 +757,11 @@ class FrameViewer(QWidget):
     def set_mode(self, mode: str) -> None:
         if self.mode != mode:
             self._set_mask_hover_info(None)
+            self._rect_drag_mode = None
+            self._rect_drag_start = None
+            self._rect_drag_current = None
+            self._polygon_draw_add = None
+            self._polygon_preview_point = None
         self.mode = mode
         self.update()
 
@@ -1288,29 +1310,31 @@ class FrameViewer(QWidget):
         self.square_points_changed.emit()
 
     def clear_trajectory_region(self) -> None:
-        self.trajectory_region_start = None
-        self.trajectory_region_end = None
-        self._trajectory_region_current = None
+        self.trajectory_region_points.clear()
         self._trajectory_region_dragging = False
         self.update()
         self.trajectory_region_changed.emit()
 
     def trajectory_region_bounds(self) -> tuple[float, float, float, float] | None:
-        end = (
-            self._trajectory_region_current
-            if self._trajectory_region_dragging and self._trajectory_region_current is not None
-            else self.trajectory_region_end
-        )
-        if self.trajectory_region_start is None or end is None:
+        if len(self.trajectory_region_points) != 4:
             return None
-        x1, y1 = self.trajectory_region_start
-        x2, y2 = end
-        if abs(x2 - x1) < 1.0 or abs(y2 - y1) < 1.0:
+        xs = [float(point[0]) for point in self.trajectory_region_points]
+        ys = [float(point[1]) for point in self.trajectory_region_points]
+        left, right = min(xs), max(xs)
+        top, bottom = min(ys), max(ys)
+        if right - left < 1.0 or bottom - top < 1.0:
             return None
-        return min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)
+        return left, top, right, bottom
 
     def clear_interpolation_rect_points(self) -> None:
         self.interpolation_rect_points.clear()
+        if self._rect_drag_mode and self._rect_drag_mode.startswith("interp_"):
+            self._rect_drag_mode = None
+            self._rect_drag_start = None
+            self._rect_drag_current = None
+        if self.mode.startswith("interp_"):
+            self._polygon_draw_add = None
+            self._polygon_preview_point = None
         self.update()
         self.interpolation_rect_points_changed.emit()
 
@@ -1324,6 +1348,13 @@ class FrameViewer(QWidget):
 
     def clear_chamber_rect_points(self) -> None:
         self.chamber_rect_points.clear()
+        if self._rect_drag_mode and self._rect_drag_mode.startswith("chamber_"):
+            self._rect_drag_mode = None
+            self._rect_drag_start = None
+            self._rect_drag_current = None
+        if self.mode.startswith("chamber_"):
+            self._polygon_draw_add = None
+            self._polygon_preview_point = None
         self.update()
         self.chamber_rect_points_changed.emit()
 
@@ -1349,6 +1380,13 @@ class FrameViewer(QWidget):
     def clear_occ_rect_points(self) -> None:
         self.occ_rect_points.clear()
         self._occ_rect_draw_override_add = None
+        if self._rect_drag_mode and self._rect_drag_mode.startswith("occ_"):
+            self._rect_drag_mode = None
+            self._rect_drag_start = None
+            self._rect_drag_current = None
+        if self.mode.startswith("occ_"):
+            self._polygon_draw_add = None
+            self._polygon_preview_point = None
         self.update()
         self.occ_rect_points_changed.emit()
 
@@ -1840,6 +1878,244 @@ class FrameViewer(QWidget):
             return False
         return self.free_draw_add
 
+    def _effective_interpolation_draw_add_with_modifiers(
+        self,
+        modifiers: Qt.KeyboardModifiers,
+    ) -> bool:
+        if self._control_pressed(modifiers):
+            return False
+        return self.interpolation_draw_add
+
+    def _effective_chamber_draw_add_with_modifiers(
+        self,
+        modifiers: Qt.KeyboardModifiers,
+    ) -> bool:
+        if self._control_pressed(modifiers):
+            return False
+        return self.chamber_draw_add
+
+    def _active_shape_add_with_modifiers(self, modifiers: Qt.KeyboardModifiers) -> bool:
+        if self.mode.startswith("interp_"):
+            return self._effective_interpolation_draw_add_with_modifiers(modifiers)
+        if self.mode.startswith("chamber_"):
+            return self._effective_chamber_draw_add_with_modifiers(modifiers)
+        if self.mode.startswith("occ_"):
+            return self._effective_draw_add_with_modifiers(modifiers)
+        return True
+
+    def _rect_drag_mode_active(self) -> bool:
+        return self.mode in {"interp_rect_drag", "chamber_rect_drag", "occ_rect_drag"}
+
+    def _polygon_mode_active(self) -> bool:
+        return self.mode in {"interp_polygon", "chamber_polygon", "occ_polygon"}
+
+    def _shape_points_for_mode(self, mode: str | None = None) -> list[tuple[float, float]] | None:
+        mode = self.mode if mode is None else mode
+        if mode.startswith("interp_"):
+            return self.interpolation_rect_points
+        if mode.startswith("chamber_"):
+            return self.chamber_rect_points
+        if mode.startswith("occ_"):
+            return self.occ_rect_points
+        return None
+
+    def _emit_shape_points_changed(self, mode: str | None = None) -> None:
+        mode = self.mode if mode is None else mode
+        if mode.startswith("interp_"):
+            self.interpolation_rect_points_changed.emit()
+        elif mode.startswith("chamber_"):
+            self.chamber_rect_points_changed.emit()
+        elif mode.startswith("occ_"):
+            self.occ_rect_points_changed.emit()
+
+    def _emit_shape_completed(
+        self,
+        mode: str,
+        points: list[tuple[float, float]],
+        add: bool,
+        shape_kind: str,
+    ) -> None:
+        payload = (list(points), bool(add), shape_kind)
+        if mode.startswith("interp_"):
+            self.interpolation_rect_completed.emit(payload)
+        elif mode.startswith("chamber_"):
+            self.chamber_rect_completed.emit(payload)
+        elif mode.startswith("occ_"):
+            self.occ_rect_completed.emit(payload)
+
+    @staticmethod
+    def _axis_aligned_rect_points(
+        start: tuple[float, float],
+        end: tuple[float, float],
+    ) -> list[tuple[float, float]]:
+        left, right = sorted((float(start[0]), float(end[0])))
+        top, bottom = sorted((float(start[1]), float(end[1])))
+        return [(left, top), (right, top), (right, bottom), (left, bottom)]
+
+    def _begin_rect_drag(self, point: tuple[float, float], modifiers: Qt.KeyboardModifiers) -> None:
+        draw_point = self._snapped_drawing_point(point)
+        self._rect_drag_mode = self.mode
+        self._rect_drag_start = draw_point
+        self._rect_drag_current = draw_point
+        self._rect_drag_add = self._active_shape_add_with_modifiers(modifiers)
+        points = self._shape_points_for_mode()
+        if points is not None:
+            points[:] = self._axis_aligned_rect_points(draw_point, draw_point)
+            self.update()
+            self._emit_shape_points_changed()
+
+    def _update_rect_drag(self, point: tuple[float, float]) -> bool:
+        if self._rect_drag_mode != self.mode or self._rect_drag_start is None:
+            return False
+        draw_point = self._snapped_drawing_point(point)
+        self._rect_drag_current = draw_point
+        points = self._shape_points_for_mode(self._rect_drag_mode)
+        if points is not None:
+            points[:] = self._axis_aligned_rect_points(self._rect_drag_start, draw_point)
+            self.update()
+            self._emit_shape_points_changed(self._rect_drag_mode)
+        return True
+
+    def _finish_rect_drag(self, point: tuple[float, float] | None) -> bool:
+        if self._rect_drag_mode != self.mode or self._rect_drag_start is None:
+            return False
+        end_point = point if point is not None else self._rect_drag_current
+        mode = self._rect_drag_mode
+        start_point = self._rect_drag_start
+        add = self._rect_drag_add
+        self._rect_drag_mode = None
+        self._rect_drag_start = None
+        self._rect_drag_current = None
+        if end_point is None:
+            self._clear_active_shape_points(mode)
+            return True
+        points = self._axis_aligned_rect_points(start_point, self._snapped_drawing_point(end_point))
+        width = abs(points[1][0] - points[0][0])
+        height = abs(points[2][1] - points[1][1])
+        self._clear_active_shape_points(mode)
+        if width >= 1.0 and height >= 1.0:
+            self._emit_shape_completed(mode, points, add, "rectangle_drag")
+        return True
+
+    def _clear_active_shape_points(self, mode: str | None = None) -> None:
+        mode = self.mode if mode is None else mode
+        points = self._shape_points_for_mode(mode)
+        if points is not None:
+            points.clear()
+        self._polygon_draw_add = None
+        self._polygon_preview_point = None
+        self.update()
+        self._emit_shape_points_changed(mode)
+
+    def _append_polygon_point(self, point: tuple[float, float], modifiers: Qt.KeyboardModifiers) -> None:
+        points = self._shape_points_for_mode()
+        if points is None:
+            return
+        if not points:
+            self._polygon_draw_add = self._active_shape_add_with_modifiers(modifiers)
+        elif self._polygon_draw_add is None and self._control_pressed(modifiers):
+            self._polygon_draw_add = False
+        points.append(self._snapped_drawing_point(point))
+        self._polygon_preview_point = None
+        self.update()
+        self._emit_shape_points_changed()
+
+    def _finish_polygon_if_active(self) -> bool:
+        if not self._polygon_mode_active():
+            return False
+        points = self._shape_points_for_mode()
+        if not points:
+            return False
+        mode = self.mode
+        add = self.chamber_draw_add if mode.startswith("chamber_") else self.interpolation_draw_add if mode.startswith("interp_") else self.free_draw_add
+        if self._polygon_draw_add is not None:
+            add = self._polygon_draw_add
+        completed = len(points) >= 3
+        completed_points = list(points)
+        self._clear_active_shape_points(mode)
+        if completed:
+            self._emit_shape_completed(mode, completed_points, bool(add), "polygon")
+        return True
+
+    def _update_polygon_preview(self, point: tuple[float, float]) -> bool:
+        if not self._polygon_mode_active():
+            return False
+        points = self._shape_points_for_mode()
+        if not points:
+            return False
+        self._polygon_preview_point = self._snapped_drawing_point(point)
+        self.update()
+        return True
+
+    def _shape_display_widget_points(
+        self,
+        prefix: str,
+        points: list[tuple[float, float]],
+    ) -> list[QPointF]:
+        display_points = list(points)
+        if self.mode == f"{prefix}_polygon" and display_points and self._polygon_preview_point is not None:
+            display_points.append(self._polygon_preview_point)
+        widget_points = [self._image_to_widget(point) for point in display_points]
+        return [point for point in widget_points if point is not None]
+
+    def _brush_cursor_info(
+        self,
+        modifiers: Qt.KeyboardModifiers | None = None,
+    ) -> tuple[float, bool] | None:
+        modifiers = self._cursor_modifiers if modifiers is None else modifiers
+        if self.mode == "interp_free" or (self.mode.startswith("interp_") and self.interpolation_transform_mode and self._control_pressed(modifiers)):
+            return float(self.interpolation_brush_radius), self._effective_interpolation_draw_add_with_modifiers(modifiers)
+        if self.mode == "chamber_free":
+            return float(self.chamber_brush_radius), self._effective_chamber_draw_add_with_modifiers(modifiers)
+        if self.mode == "occ_free" or (self.mode.startswith("occ_") and self.occ_transform_mode and self._control_pressed(modifiers)):
+            return float(self.occ_brush_radius), self._effective_draw_add_with_modifiers(modifiers)
+        return None
+
+    def _brush_cursor_update_rect(
+        self,
+        image_point: tuple[float, float] | None = None,
+        modifiers: Qt.KeyboardModifiers | None = None,
+    ):
+        image_point = self._cursor_image_point if image_point is None else image_point
+        if image_point is None:
+            return None
+        image_rect = self._image_rect()
+        center = self._image_to_widget(image_point)
+        info = self._brush_cursor_info(modifiers)
+        if image_rect is None or center is None or info is None:
+            return None
+        radius, _add = info
+        scale = min(
+            image_rect.width() / max(1, self._frame_width),
+            image_rect.height() / max(1, self._frame_height),
+        )
+        widget_radius = max(1.0, radius * scale) + 6.0
+        return QRectF(
+            center.x() - widget_radius,
+            center.y() - widget_radius,
+            widget_radius * 2.0,
+            widget_radius * 2.0,
+        ).toAlignedRect()
+
+    def _set_brush_cursor_position(
+        self,
+        image_point: tuple[float, float] | None,
+        modifiers: Qt.KeyboardModifiers,
+    ) -> None:
+        old_rect = self._brush_cursor_update_rect()
+        self._cursor_modifiers = modifiers
+        self._cursor_image_point = image_point
+        new_rect = self._brush_cursor_update_rect()
+        if old_rect is not None and new_rect is not None:
+            self.update(old_rect.united(new_rect))
+        elif old_rect is not None:
+            self.update(old_rect)
+        elif new_rect is not None:
+            self.update(new_rect)
+
+    def _brush_cursor_active(self) -> bool:
+        return self._brush_cursor_info() is not None
+
     def wheelEvent(self, event) -> None:
         if not self.has_frame():
             return
@@ -1890,6 +2166,10 @@ class FrameViewer(QWidget):
             return
 
         if event.button() == Qt.MouseButton.RightButton:
+            image_point = self._widget_to_image(event.position())
+            if image_point is not None and self._finish_polygon_if_active():
+                event.accept()
+                return
             self._set_mask_hover_info(None, event.position())
             self._pan_dragging = True
             self._right_button_drag_moved = False
@@ -1905,22 +2185,37 @@ class FrameViewer(QWidget):
 
         if self.mode == "trajectory_region":
             draw_point = self._snapped_drawing_point(image_point)
-            self.trajectory_region_start = draw_point
-            self.trajectory_region_end = None
-            self._trajectory_region_current = draw_point
-            self._trajectory_region_dragging = True
+            if len(self.trajectory_region_points) >= 4:
+                self.trajectory_region_points.clear()
+            self.trajectory_region_points.append(draw_point)
+            self._trajectory_region_dragging = False
             self.update()
             self.trajectory_region_changed.emit()
         elif self.mode.startswith("interp_") and self.interpolation_transform_mode:
+            if self._control_pressed(event.modifiers()):
+                self._interpolation_transform_erase_dragging = True
+                self._interpolation_transform_erase_last_point = image_point
+                self.interpolation_free_segment.emit((image_point, image_point, False))
+                return
             self._begin_interpolation_transform_drag(image_point)
+        elif self.mode == "interp_rect_drag":
+            self._begin_rect_drag(image_point, event.modifiers())
+        elif self.mode == "interp_polygon":
+            self._append_polygon_point(image_point, event.modifiers())
         elif self.mode == "interp_rect":
+            if len(self.interpolation_rect_points) == 0:
+                self._polygon_draw_add = self._active_shape_add_with_modifiers(event.modifiers())
+            elif self._polygon_draw_add is None and self._control_pressed(event.modifiers()):
+                self._polygon_draw_add = False
             draw_point = self._snapped_drawing_point(image_point)
             self.interpolation_rect_points.append(draw_point)
             self.update()
             self.interpolation_rect_points_changed.emit()
             if len(self.interpolation_rect_points) == 4:
-                self.interpolation_rect_completed.emit(list(self.interpolation_rect_points))
+                add_value = self.interpolation_draw_add if self._polygon_draw_add is None else self._polygon_draw_add
+                self.interpolation_rect_completed.emit((list(self.interpolation_rect_points), bool(add_value), "rectangle"))
                 self.interpolation_rect_points.clear()
+                self._polygon_draw_add = None
                 self.update()
                 self.interpolation_rect_points_changed.emit()
         elif self.mode == "interp_circle":
@@ -1935,7 +2230,7 @@ class FrameViewer(QWidget):
             self._interpolation_free_dragging = True
             self._interpolation_free_last_point = image_point
             self.interpolation_free_segment.emit(
-                (image_point, image_point, self.interpolation_draw_add)
+                (image_point, image_point, self._effective_interpolation_draw_add_with_modifiers(event.modifiers()))
             )
         elif self.mode.startswith("occ_") and self.occ_margin_pick_mode:
             hit_index = self._point_hit_index(event.position(), self.occ_margin_points)
@@ -1956,14 +2251,24 @@ class FrameViewer(QWidget):
             self.pin_added.emit(image_point)
         elif self.mode.startswith("chamber_") and self.chamber_transform_mode:
             self._begin_chamber_transform_drag(image_point)
+        elif self.mode == "chamber_rect_drag":
+            self._begin_rect_drag(image_point, event.modifiers())
+        elif self.mode == "chamber_polygon":
+            self._append_polygon_point(image_point, event.modifiers())
         elif self.mode == "chamber_rect":
+            if len(self.chamber_rect_points) == 0:
+                self._polygon_draw_add = self._active_shape_add_with_modifiers(event.modifiers())
+            elif self._polygon_draw_add is None and self._control_pressed(event.modifiers()):
+                self._polygon_draw_add = False
             draw_point = self._snapped_drawing_point(image_point)
             self.chamber_rect_points.append(draw_point)
             self.update()
             self.chamber_rect_points_changed.emit()
             if len(self.chamber_rect_points) == 4:
-                self.chamber_rect_completed.emit(list(self.chamber_rect_points))
+                add_value = self.chamber_draw_add if self._polygon_draw_add is None else self._polygon_draw_add
+                self.chamber_rect_completed.emit((list(self.chamber_rect_points), bool(add_value), "rectangle"))
                 self.chamber_rect_points.clear()
+                self._polygon_draw_add = None
                 self.update()
                 self.chamber_rect_points_changed.emit()
         elif self.mode == "chamber_circle":
@@ -1974,6 +2279,10 @@ class FrameViewer(QWidget):
             self._chamber_circle_current = draw_point
             self.update()
             self.chamber_circle_changed.emit()
+        elif self.mode == "chamber_free":
+            self._chamber_free_dragging = True
+            self._chamber_free_last_point = image_point
+            self.chamber_free_segment.emit((image_point, image_point, self._effective_chamber_draw_add_with_modifiers(event.modifiers())))
         elif self.mode == "square":
             hit_index = self._point_hit_index(event.position(), self.square_points)
             if hit_index is not None:
@@ -1999,6 +2308,10 @@ class FrameViewer(QWidget):
             self._circle_current = draw_point
             self.update()
             self.circle_changed.emit()
+        elif self.mode == "occ_rect_drag":
+            self._begin_rect_drag(image_point, event.modifiers())
+        elif self.mode == "occ_polygon":
+            self._append_polygon_point(image_point, event.modifiers())
         elif self.mode == "occ_rect":
             if len(self.occ_rect_points) == 0:
                 self._occ_rect_draw_override_add = False if self._control_pressed(event.modifiers()) else None
@@ -2010,7 +2323,7 @@ class FrameViewer(QWidget):
             self.occ_rect_points_changed.emit()
             if len(self.occ_rect_points) == 4:
                 add_value = self.free_draw_add if self._occ_rect_draw_override_add is None else self._occ_rect_draw_override_add
-                self.occ_rect_completed.emit((list(self.occ_rect_points), bool(add_value)))
+                self.occ_rect_completed.emit((list(self.occ_rect_points), bool(add_value), "rectangle"))
                 self.occ_rect_points.clear()
                 self._occ_rect_draw_override_add = None
                 self.update()
@@ -2030,12 +2343,6 @@ class FrameViewer(QWidget):
             self.free_draw_segment.emit((image_point, image_point, self._effective_draw_add_with_modifiers(event.modifiers())))
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._trajectory_region_dragging and not (event.buttons() & Qt.MouseButton.LeftButton):
-            self.trajectory_region_end = self._trajectory_region_current
-            self._trajectory_region_current = None
-            self._trajectory_region_dragging = False
-            self.update()
-            self.trajectory_region_changed.emit()
         if self._circle_move_dragging and not (event.buttons() & Qt.MouseButton.LeftButton):
             self._circle_move_dragging = False
             self._circle_move_last_point = None
@@ -2060,6 +2367,16 @@ class FrameViewer(QWidget):
             self._interpolation_free_dragging = False
             self._interpolation_free_last_point = None
             self.interpolation_free_finished.emit()
+        if self._chamber_free_dragging and not (event.buttons() & Qt.MouseButton.LeftButton):
+            self._chamber_free_dragging = False
+            self._chamber_free_last_point = None
+            self.chamber_free_finished.emit()
+        if self._rect_drag_mode is not None and not (event.buttons() & Qt.MouseButton.LeftButton):
+            self._finish_rect_drag(None)
+        if self._interpolation_transform_erase_dragging and not (event.buttons() & Qt.MouseButton.LeftButton):
+            self._interpolation_transform_erase_dragging = False
+            self._interpolation_transform_erase_last_point = None
+            self.interpolation_free_finished.emit()
         if self._occ_transform_erase_dragging and not (event.buttons() & Qt.MouseButton.LeftButton):
             self._occ_transform_erase_dragging = False
             self._occ_transform_erase_last_point = None
@@ -2075,26 +2392,32 @@ class FrameViewer(QWidget):
 
         image_point = self._widget_to_image(event.position())
         if image_point is None:
+            self._set_brush_cursor_position(None, event.modifiers())
             self._set_mask_hover_info(None, event.position())
             return
+        self._set_brush_cursor_position(image_point, event.modifiers())
 
-        if self.mode == "trajectory_region" and self._trajectory_region_dragging:
-            self._trajectory_region_current = image_point
-            self.update()
-            self.trajectory_region_changed.emit()
-        elif (
+        if (
             self.mode.startswith("interp_")
             and self.interpolation_transform_mode
             and self._interpolation_transform_dragging
         ):
             self._update_interpolation_transform_preview(image_point)
+        elif self._rect_drag_mode == self.mode and self._rect_drag_start is not None:
+            self._update_rect_drag(image_point)
         elif self.mode == "interp_circle" and self._interpolation_circle_dragging:
             self._interpolation_circle_current = image_point
             self.update()
             self.interpolation_circle_changed.emit()
         elif self.mode == "interp_free" and self._interpolation_free_dragging and self._interpolation_free_last_point is not None:
-            self.interpolation_free_segment.emit((self._interpolation_free_last_point, image_point, self.interpolation_draw_add))
+            self.interpolation_free_segment.emit((self._interpolation_free_last_point, image_point, self._effective_interpolation_draw_add_with_modifiers(event.modifiers())))
             self._interpolation_free_last_point = image_point
+        elif self.mode.startswith("interp_") and self.interpolation_transform_mode and self._interpolation_transform_erase_dragging:
+            if self._interpolation_transform_erase_last_point is not None:
+                self.interpolation_free_segment.emit((self._interpolation_transform_erase_last_point, image_point, False))
+            else:
+                self.interpolation_free_segment.emit((image_point, image_point, False))
+            self._interpolation_transform_erase_last_point = image_point
         elif self.mode.startswith("occ_") and self.occ_margin_pick_mode and self._occ_margin_drag_index is not None:
             self.occ_margin_points[self._occ_margin_drag_index] = image_point
             self.update()
@@ -2113,6 +2436,9 @@ class FrameViewer(QWidget):
             self._chamber_circle_current = image_point
             self.update()
             self.chamber_circle_changed.emit()
+        elif self.mode == "chamber_free" and self._chamber_free_dragging and self._chamber_free_last_point is not None:
+            self.chamber_free_segment.emit((self._chamber_free_last_point, image_point, self._effective_chamber_draw_add_with_modifiers(event.modifiers())))
+            self._chamber_free_last_point = image_point
         elif self.mode == "circle" and self._circle_move_dragging and self._circle_move_last_point is not None:
             dx = image_point[0] - self._circle_move_last_point[0]
             dy = image_point[1] - self._circle_move_last_point[1]
@@ -2147,8 +2473,12 @@ class FrameViewer(QWidget):
             self._occ_transform_erase_last_point = image_point
         elif self.mode.startswith("occ_") and self.occ_transform_mode and self._occ_transform_dragging and self._occ_transform_last_point is not None:
             self._update_occ_transform_preview(image_point)
+        elif self._polygon_mode_active():
+            self._update_polygon_preview(image_point)
 
         if event.buttons() & Qt.MouseButton.LeftButton:
+            self._set_mask_hover_info(None, event.position())
+        elif self._brush_cursor_active():
             self._set_mask_hover_info(None, event.position())
         else:
             self._update_mask_hover(event.position(), image_point)
@@ -2169,24 +2499,21 @@ class FrameViewer(QWidget):
             return
 
         image_point = self._widget_to_image(event.position())
+        if event.button() == Qt.MouseButton.LeftButton and self._rect_drag_mode == self.mode:
+            if self._finish_rect_drag(image_point):
+                return
         if (
-            self.mode == "trajectory_region"
-            and self._trajectory_region_dragging
-            and event.button() == Qt.MouseButton.LeftButton
-        ):
-            self.trajectory_region_end = (
-                image_point if image_point is not None else self._trajectory_region_current
-            )
-            self._trajectory_region_current = None
-            self._trajectory_region_dragging = False
-            self.update()
-            self.trajectory_region_changed.emit()
-        elif (
             self.mode.startswith("interp_")
             and self.interpolation_transform_mode
             and event.button() == Qt.MouseButton.LeftButton
         ):
-            self._finish_interpolation_transform_drag()
+            was_erase_dragging = self._interpolation_transform_erase_dragging
+            if self._interpolation_transform_dragging:
+                self._finish_interpolation_transform_drag()
+            self._interpolation_transform_erase_dragging = False
+            self._interpolation_transform_erase_last_point = None
+            if was_erase_dragging:
+                self.interpolation_free_finished.emit()
         elif self.mode == "interp_circle" and self._interpolation_circle_dragging and event.button() == Qt.MouseButton.LeftButton:
             self.interpolation_circle_end = image_point if image_point is not None else self._interpolation_circle_current
             self._interpolation_circle_current = None
@@ -2195,7 +2522,9 @@ class FrameViewer(QWidget):
             geometry = self.interpolation_circle_geometry()
             self.interpolation_circle_changed.emit()
             if geometry is not None:
-                self.interpolation_circle_completed.emit(geometry)
+                center, radius = geometry
+                add_value = self._effective_interpolation_draw_add_with_modifiers(event.modifiers())
+                self.interpolation_circle_completed.emit((center, radius, self.interpolation_circle_start, self.interpolation_circle_end, bool(add_value)))
         elif self.mode == "interp_free" and event.button() == Qt.MouseButton.LeftButton:
             self._interpolation_free_dragging = False
             self._interpolation_free_last_point = None
@@ -2220,7 +2549,13 @@ class FrameViewer(QWidget):
             geometry = self.chamber_circle_geometry()
             self.chamber_circle_changed.emit()
             if geometry is not None:
-                self.chamber_circle_completed.emit(geometry)
+                center, base_radius, start, end = geometry
+                add_value = self._effective_chamber_draw_add_with_modifiers(event.modifiers())
+                self.chamber_circle_completed.emit((center, base_radius, start, end, bool(add_value)))
+        elif self.mode == "chamber_free" and event.button() == Qt.MouseButton.LeftButton:
+            self._chamber_free_dragging = False
+            self._chamber_free_last_point = None
+            self.chamber_free_finished.emit()
         elif self.mode == "circle" and self._circle_move_dragging and event.button() == Qt.MouseButton.LeftButton:
             self._circle_move_dragging = False
             self._circle_move_last_point = None
@@ -2258,11 +2593,8 @@ class FrameViewer(QWidget):
 
     def leaveEvent(self, event) -> None:
         was_interpolation_free_dragging = self._interpolation_free_dragging
-        if self._trajectory_region_dragging:
-            self.trajectory_region_end = self._trajectory_region_current
-            self._trajectory_region_current = None
-            self._trajectory_region_dragging = False
-            self.trajectory_region_changed.emit()
+        was_interpolation_transform_erase_dragging = self._interpolation_transform_erase_dragging
+        was_chamber_free_dragging = self._chamber_free_dragging
         was_free_dragging = self._free_dragging
         was_transform_erase_dragging = self._occ_transform_erase_dragging
         self._pan_dragging = False
@@ -2276,6 +2608,15 @@ class FrameViewer(QWidget):
         self._interpolation_circle_current = None
         self._interpolation_free_dragging = False
         self._interpolation_free_last_point = None
+        self._interpolation_transform_erase_dragging = False
+        self._interpolation_transform_erase_last_point = None
+        self._chamber_free_dragging = False
+        self._chamber_free_last_point = None
+        self._rect_drag_mode = None
+        self._rect_drag_start = None
+        self._rect_drag_current = None
+        self._polygon_preview_point = None
+        self._set_brush_cursor_position(None, self._cursor_modifiers)
 
         self._square_drag_index = None
         self._occ_margin_drag_index = None
@@ -2293,8 +2634,10 @@ class FrameViewer(QWidget):
             self._finish_chamber_transform_drag()
         self._occ_transform_erase_dragging = False
         self._occ_transform_erase_last_point = None
-        if was_interpolation_free_dragging:
+        if was_interpolation_free_dragging or was_interpolation_transform_erase_dragging:
             self.interpolation_free_finished.emit()
+        if was_chamber_free_dragging:
+            self.chamber_free_finished.emit()
         if was_free_dragging:
             self.free_draw_finished.emit()
         if was_transform_erase_dragging:
@@ -2358,6 +2701,7 @@ class FrameViewer(QWidget):
         self._draw_circle_overlay(painter)
         self._draw_occ_shape_overlay(painter)
         self._draw_node_overlay(painter)
+        self._draw_brush_cursor_overlay(painter)
         self._draw_mask_hover_overlay(painter)
 
     def _draw_node_overlay(self, painter: QPainter) -> None:
@@ -2385,6 +2729,35 @@ class FrameViewer(QWidget):
             painter.setPen(QPen(QColor("#0f172a"), 2))
             painter.setBrush(color)
             painter.drawEllipse(widget_point, radius, radius)
+        painter.restore()
+
+    def _draw_brush_cursor_overlay(self, painter: QPainter) -> None:
+        info = self._brush_cursor_info()
+        if info is None or self._cursor_image_point is None:
+            return
+        image_rect = self._image_rect()
+        center = self._image_to_widget(self._cursor_image_point)
+        if image_rect is None or center is None:
+            return
+        radius, add = info
+        scale = min(
+            image_rect.width() / max(1, self._frame_width),
+            image_rect.height() / max(1, self._frame_height),
+        )
+        widget_radius = max(1.0, radius * scale)
+        color = QColor("#9ca3af") if add else QColor("#ef4444")
+        painter.save()
+        painter.setClipRect(image_rect)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        outer_pen = QPen(QColor(color.red(), color.green(), color.blue(), 230), 1.8)
+        outer_pen.setCosmetic(True)
+        painter.setPen(outer_pen)
+        painter.drawEllipse(center, widget_radius, widget_radius)
+        inner_pen = QPen(QColor(15, 23, 42, 210), 1.0, Qt.PenStyle.DashLine)
+        inner_pen.setCosmetic(True)
+        painter.setPen(inner_pen)
+        painter.drawEllipse(center, widget_radius + 1.8, widget_radius + 1.8)
         painter.restore()
 
     def _draw_mask_hover_overlay(self, painter: QPainter) -> None:
@@ -2464,8 +2837,7 @@ class FrameViewer(QWidget):
                 )
 
         if self.interpolation_rect_points:
-            widget_points = [self._image_to_widget(point) for point in self.interpolation_rect_points]
-            widget_points = [point for point in widget_points if point is not None]
+            widget_points = self._shape_display_widget_points("interp", self.interpolation_rect_points)
             if len(widget_points) >= 3:
                 painter.setBrush(QColor(16, 185, 129, 45))
                 painter.setPen(QPen(QColor("#a7f3d0"), 2))
@@ -2570,8 +2942,7 @@ class FrameViewer(QWidget):
                 draft_color = selected.color
 
         if self.chamber_rect_points:
-            widget_points = [self._image_to_widget(point) for point in self.chamber_rect_points]
-            widget_points = [point for point in widget_points if point is not None]
+            widget_points = self._shape_display_widget_points("chamber", self.chamber_rect_points)
             if len(widget_points) >= 3:
                 painter.setBrush(QColor(draft_color.red(), draft_color.green(), draft_color.blue(), 55))
                 painter.setPen(QPen(draft_color.lighter(145), 2))
@@ -2693,22 +3064,33 @@ class FrameViewer(QWidget):
     def _draw_trajectory_region_overlay(self, painter: QPainter) -> None:
         if self.mode != "trajectory_region":
             return
-        bounds = self.trajectory_region_bounds()
-        if bounds is None:
+        widget_points = [self._image_to_widget(point) for point in self.trajectory_region_points]
+        widget_points = [point for point in widget_points if point is not None]
+        if not widget_points:
             return
-        left, top, right, bottom = bounds
-        top_left = self._image_to_widget((left, top))
-        bottom_right = self._image_to_widget((right, bottom))
         image_rect = self._image_rect()
-        if top_left is None or bottom_right is None or image_rect is None:
+        if image_rect is None:
             return
         painter.save()
         painter.setClipRect(image_rect)
-        painter.setBrush(QColor(37, 99, 235, 48))
         pen = QPen(QColor("#93c5fd"), 2.0, Qt.PenStyle.DashLine)
         pen.setCosmetic(True)
         painter.setPen(pen)
-        painter.drawRect(QRectF(top_left, bottom_right).normalized())
+        bounds = self.trajectory_region_bounds()
+        if bounds is not None:
+            left, top, right, bottom = bounds
+            top_left = self._image_to_widget((left, top))
+            bottom_right = self._image_to_widget((right, bottom))
+            if top_left is not None and bottom_right is not None:
+                painter.setBrush(QColor(37, 99, 235, 48))
+                painter.drawRect(QRectF(top_left, bottom_right).normalized())
+        elif len(widget_points) >= 2:
+            painter.drawPolyline(QPolygonF(widget_points))
+        painter.setPen(QPen(QColor("#f8fafc"), 2))
+        for index, point in enumerate(widget_points, start=1):
+            painter.setBrush(QColor("#2563eb"))
+            painter.drawEllipse(point, 5.5, 5.5)
+            painter.drawText(point + QPointF(8, -8), str(index))
         painter.restore()
 
     def _draw_circle_overlay(self, painter: QPainter) -> None:
@@ -2751,8 +3133,7 @@ class FrameViewer(QWidget):
                 painter.drawEllipse(point, 5.0, 5.0)
                 painter.drawText(point + QPointF(7, -7), str(index))
         if self.occ_rect_points:
-            widget_points = [self._image_to_widget(point) for point in self.occ_rect_points]
-            widget_points = [point for point in widget_points if point is not None]
+            widget_points = self._shape_display_widget_points("occ", self.occ_rect_points)
             if len(widget_points) >= 3:
                 painter.setBrush(QColor(selected_color.red(), selected_color.green(), selected_color.blue(), 55))
                 painter.setPen(QPen(selected_color.lighter(140), 2))
@@ -2780,6 +3161,7 @@ class FrameViewer(QWidget):
 class MainWindow(
     TrackingRepairTabMixin,
     InterpolationTabMixin,
+    SmoothingTabMixin,
     SquareTabMixin,
     ChamberTabMixin,
     CircleTabMixin,
@@ -2790,13 +3172,14 @@ class MainWindow(
 ):
     TAB_TRACKING_REPAIR = 0
     TAB_INTERPOLATION = 1
-    TAB_SQUARE = 2
-    TAB_CHAMBER = 3
-    TAB_CIRCLE = 4
-    TAB_OCCLUSION = 5
-    TAB_TRAJECTORY = 6
-    TAB_PIN = 7
-    TAB_PIPELINE = 8
+    TAB_SMOOTHING = 2
+    TAB_SQUARE = 3
+    TAB_CHAMBER = 4
+    TAB_CIRCLE = 5
+    TAB_OCCLUSION = 6
+    TAB_TRAJECTORY = 7
+    TAB_PIN = 8
+    TAB_PIPELINE = 9
     CATEGORY_PREPARE = 0
     CATEGORY_ANNOTATE = 1
     CATEGORY_INSPECT = 2
@@ -2805,7 +3188,7 @@ class MainWindow(
     FILE_SIDEBAR_DEFAULT_WIDTH = 230
     FILE_SIDEBAR_MIN_RESTORE_WIDTH = 160
     FILE_SIDEBAR_MAX_WIDTH = 360
-    TAB_VISIBILITY_SCHEMA_VERSION = 2
+    TAB_VISIBILITY_SCHEMA_VERSION = 3
     PERSISTENT_SPINBOX_SETTINGS_KEY = "spinbox_values"
     PERSISTENT_SPINBOX_NAMES = (
         "tracking_duplicate_criteria_spinbox",
@@ -2903,6 +3286,7 @@ class MainWindow(
         }
         self._mask_undo_restoring = False
         self._interpolation_free_undo_open = False
+        self._chamber_free_undo_open = False
         self._occlusion_free_undo_open = False
         self._occlusion_transform_undo_open = False
         self.default_mask_margin = int(self.settings.get("occlusion_mask_margin", 0))
@@ -3042,7 +3426,7 @@ class MainWindow(
         )
         viewer_title = QLabel("VIEWER")
         viewer_title.setProperty("sectionTitle", True)
-        self.viewer_help_label = QLabel("Wheel: zoom  ·  Right drag: pan  ·  ← / →: frame")
+        self.viewer_help_label = QLabel("Wheel: zoom  勇? Right drag: pan  勇? ??/ ?? frame")
         self.viewer_help_label.setProperty("muted", True)
         self.viewer_help_label.setMinimumWidth(0)
         self.viewer_help_label.setSizePolicy(
@@ -3158,10 +3542,13 @@ class MainWindow(
         self.mode_tabs.setObjectName("modeTabs")
         self.mode_tabs.tabBar().setObjectName("modeToolTabBar")
         self.mode_tabs.tabBar().setExpanding(False)
+        self.mode_tabs.tabBar().setUsesScrollButtons(True)
+        self.mode_tabs.setElideMode(Qt.TextElideMode.ElideRight)
         self.mode_tabs.setMinimumHeight(300)
         self.mode_tabs.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self.tracking_repair_tab = self._build_tracking_repair_tab()
         self.interpolation_tab = self._build_interpolation_tab()
+        self.smoothing_tab = self._build_smoothing_tab()
         self.square_tab = self._build_square_tab()
         self.chamber_tab = self._build_chamber_tab()
         self.circle_tab = self._build_circle_tab()
@@ -3169,13 +3556,14 @@ class MainWindow(
         self.trajectory_tab = self._build_trajectory_tab()
         self.pin_tab = self._build_pin_tab()
         self.pipeline_tab = self._build_pipeline_tab()
-        self.mode_tabs.addTab(self.tracking_repair_tab, "1. Tracking Repair")
-        self.mode_tabs.addTab(self.interpolation_tab, "2. Region / Interpolate")
-        self.mode_tabs.addTab(self.square_tab, "3. Normalize")
+        self.mode_tabs.addTab(self.tracking_repair_tab, "Tracking Repair")
+        self.mode_tabs.addTab(self.interpolation_tab, "Interpolate")
+        self.mode_tabs.addTab(self.smoothing_tab, "Smoothing")
+        self.mode_tabs.addTab(self.square_tab, "Normalize")
         self.mode_tabs.addTab(self.chamber_tab, "Chamber")
         self.mode_tabs.addTab(self.circle_tab, "Circle")
         self.mode_tabs.addTab(self.occlusion_tab, "Occlusion")
-        self.mode_tabs.addTab(self.trajectory_tab, "Trajectory")
+        self.mode_tabs.addTab(self.trajectory_tab, "Visualize")
         self.mode_tabs.addTab(self.pin_tab, "Pin Coordinates")
         self.mode_tabs.addTab(self.pipeline_tab, "Multi Pipeline")
         self.mode_tabs.setTabToolTip(
@@ -3186,6 +3574,7 @@ class MainWindow(
             self.TAB_INTERPOLATION,
             "Remove skeletons by an anchor node and region, then optionally interpolate missing coordinates.",
         )
+        self.mode_tabs.setTabToolTip(self.TAB_SMOOTHING, "Smooth tracked coordinates by shifting skeletons around an anchor-node temporal median.")
         self.mode_tabs.setTabToolTip(self.TAB_SQUARE, "Choose four points and append normalized coordinates without replacing source coordinates.")
         self.mode_tabs.setTabToolTip(self.TAB_TRAJECTORY, "Preview raw or normalized trajectories and heatmaps without changing the CSV.")
         self.mode_tabs.setTabToolTip(self.TAB_CHAMBER, "Define a chamber and named rooms, then export room masks and per-frame room membership.")
@@ -3436,11 +3825,12 @@ class MainWindow(
         return (
             (self.TAB_TRACKING_REPAIR, "tracking_repair", "Tracking Repair"),
             (self.TAB_INTERPOLATION, "interpolation", "Region / Interpolate"),
+            (self.TAB_SMOOTHING, "smoothing", "Smoothing"),
             (self.TAB_SQUARE, "square", "Normalize"),
             (self.TAB_CHAMBER, "chamber", "Chamber"),
             (self.TAB_CIRCLE, "circle", "Circle"),
             (self.TAB_OCCLUSION, "occlusion", "Occlusion"),
-            (self.TAB_TRAJECTORY, "trajectory", "Trajectory"),
+            (self.TAB_TRAJECTORY, "trajectory", "Visualize"),
             (self.TAB_PIN, "pin", "Pin Coordinates"),
             (self.TAB_PIPELINE, "pipeline", "Multi Pipeline"),
         )
@@ -3449,6 +3839,7 @@ class MainWindow(
         if tab_index in {
             self.TAB_TRACKING_REPAIR,
             self.TAB_INTERPOLATION,
+            self.TAB_SMOOTHING,
             self.TAB_SQUARE,
         }:
             return self.CATEGORY_PREPARE
@@ -3595,6 +3986,7 @@ class MainWindow(
             visibility_schema_version = 1
         if visibility_schema_version < self.TAB_VISIBILITY_SCHEMA_VERSION:
             visible_keys.add("trajectory")
+            visible_keys.add("smoothing")
         if not visible_keys:
             visible_keys = set(valid_keys)
         default_key_by_category = {
@@ -3761,6 +4153,9 @@ class MainWindow(
         self.chamber_transform_radio.toggled.connect(
             self._on_chamber_target_or_mode_changed
         )
+        self.chamber_draw_add_radio.toggled.connect(self._sync_chamber_draw_mode)
+        self.chamber_draw_erase_radio.toggled.connect(self._sync_chamber_draw_mode)
+        self.chamber_brush_spinbox.valueChanged.connect(self._sync_chamber_draw_mode)
         self.room_combo.currentIndexChanged.connect(self._on_room_selection_changed)
         self.room_add_button.clicked.connect(self.add_room)
         self.room_rename_button.clicked.connect(self.rename_room)
@@ -3824,6 +4219,8 @@ class MainWindow(
         self.frame_viewer.chamber_rect_points_changed.connect(self._refresh_chamber_ui)
         self.frame_viewer.chamber_circle_completed.connect(self.apply_chamber_circle)
         self.frame_viewer.chamber_circle_changed.connect(self._refresh_chamber_ui)
+        self.frame_viewer.chamber_free_segment.connect(self.apply_chamber_free_segment)
+        self.frame_viewer.chamber_free_finished.connect(self._finalize_chamber_free_draw)
         self.frame_viewer.chamber_transform_requested.connect(
             self.translate_selected_chamber_layer
         )
@@ -3850,31 +4247,13 @@ class MainWindow(
         self._connect_persistent_spinbox_settings()
 
     def _register_shortcuts(self) -> None:
-        QShortcut(QKeySequence("Ctrl+B"), self, activated=self._toggle_file_sidebar)
-        QShortcut(QKeySequence("Ctrl+Z"), self, activated=self.undo_active_mask_edit)
-        QShortcut(QKeySequence("Left"), self, activated=lambda: self.step_frame(-1))
-        QShortcut(QKeySequence("Right"), self, activated=lambda: self.step_frame(1))
-        QShortcut(QKeySequence("D"), self, activated=lambda: self._switch_region_edit_mode_shortcut(transform_mode=False))
-        QShortcut(QKeySequence("T"), self, activated=lambda: self._switch_region_edit_mode_shortcut(transform_mode=True))
-        QShortcut(QKeySequence("E"), self, activated=self._handle_e_shortcut)
-        QShortcut(QKeySequence("R"), self, activated=self._handle_r_shortcut)
-        QShortcut(QKeySequence("Ctrl+E"), self, activated=self._handle_ctrl_e_shortcut)
-        QShortcut(QKeySequence("Ctrl+R"), self, activated=self._handle_ctrl_r_shortcut)
-        QShortcut(QKeySequence("["), self, activated=lambda: self._scale_active_region_shortcut(0.96))
-        QShortcut(QKeySequence("]"), self, activated=lambda: self._scale_active_region_shortcut(1.04))
-        QShortcut(QKeySequence("Ctrl+["), self, activated=lambda: self._rotate_active_region_shortcut(-4.0))
-        QShortcut(QKeySequence("Ctrl+]"), self, activated=lambda: self._rotate_active_region_shortcut(4.0))
-        QShortcut(QKeySequence("F1"), self, activated=self._open_context_help)
-        QShortcut(QKeySequence("1"), self, activated=lambda: self._select_mask_by_slot(0))
-        QShortcut(QKeySequence("2"), self, activated=lambda: self._select_mask_by_slot(1))
-        QShortcut(QKeySequence("3"), self, activated=lambda: self._select_mask_by_slot(2))
-        QShortcut(QKeySequence("4"), self, activated=lambda: self._select_mask_by_slot(3))
-        QShortcut(QKeySequence("5"), self, activated=lambda: self._select_mask_by_slot(4))
-        QShortcut(QKeySequence("6"), self, activated=lambda: self._select_mask_by_slot(5))
-        QShortcut(QKeySequence("7"), self, activated=lambda: self._select_mask_by_slot(6))
-        QShortcut(QKeySequence("8"), self, activated=lambda: self._select_mask_by_slot(7))
-        QShortcut(QKeySequence("9"), self, activated=lambda: self._select_mask_by_slot(8))
-        QShortcut(QKeySequence("0"), self, activated=lambda: self._select_mask_by_slot(9))
+        self._registered_shortcuts = []
+        for spec in APP_SHORTCUTS:
+            shortcut = QShortcut(QKeySequence(spec.sequence), self)
+            shortcut.activated.connect(
+                lambda spec=spec: getattr(self, spec.handler_name)(*spec.args)
+            )
+            self._registered_shortcuts.append(shortcut)
 
     def _switch_region_edit_mode_shortcut(self, transform_mode: bool) -> None:
         current_tab = self.mode_tabs.currentIndex()
@@ -3902,18 +4281,6 @@ class MainWindow(
         else:
             self.mask_draw_radio.setChecked(True)
 
-    def _handle_e_shortcut(self) -> None:
-        self._scale_active_region_shortcut(0.96)
-
-    def _handle_r_shortcut(self) -> None:
-        self._scale_active_region_shortcut(1.04)
-
-    def _handle_ctrl_e_shortcut(self) -> None:
-        self._rotate_active_region_shortcut(-4.0)
-
-    def _handle_ctrl_r_shortcut(self) -> None:
-        self._rotate_active_region_shortcut(4.0)
-
     def _select_mask_by_slot(self, slot_index: int) -> None:
         if self.mode_tabs.currentIndex() != self.TAB_OCCLUSION:
             return
@@ -3930,6 +4297,7 @@ class MainWindow(
 
     def _open_context_help(self) -> None:
         if self.mode_tabs.currentIndex() in {
+            self.TAB_INTERPOLATION,
             self.TAB_CHAMBER,
             self.TAB_CIRCLE,
             self.TAB_OCCLUSION,
@@ -4077,6 +4445,7 @@ class MainWindow(
         data.update(self._pipeline_settings_payload())
         data.update(self._tracking_repair_settings_payload())
         data.update(self._interpolation_settings_payload())
+        data.update(self._smoothing_settings_payload())
         data.update(self._pin_settings_payload())
         data.update(self._persistent_spinbox_settings_payload())
         try:
@@ -4521,6 +4890,7 @@ class MainWindow(
         supported_modes = {
             self.TAB_TRACKING_REPAIR,
             self.TAB_INTERPOLATION,
+            self.TAB_SMOOTHING,
             self.TAB_SQUARE,
             self.TAB_CHAMBER,
             self.TAB_CIRCLE,
@@ -4544,10 +4914,14 @@ class MainWindow(
         source_interpolation_anchor = self._selected_interpolation_anchor()
         source_interpolation_enabled = self._interpolation_enabled()
         source_interpolation_extrapolate = self._interpolation_extrapolation_enabled()
+        source_smoothing_method = self._selected_smoothing_method()
+        source_smoothing_anchor = self._selected_smoothing_anchor()
+        source_smoothing_window = self._selected_smoothing_window_size()
 
         source_square_points = [tuple(point) for point in self.frame_viewer.square_points]
-        source_chamber_boundary_mode = getattr(self, "chamber_boundary_mode", "custom")
-        source_chamber_mask = None if self.chamber_mask is None else self.chamber_mask.copy().astype(np.uint8)
+        source_chamber_mask = self._current_chamber_mask()
+        source_chamber_boundary_mode = self._resolved_chamber_boundary_mode()
+        source_chamber_mask = None if source_chamber_mask is None else source_chamber_mask.copy().astype(np.uint8)
         source_rooms = [
             RoomRecord(
                 name=room.name,
@@ -4590,6 +4964,9 @@ class MainWindow(
             if source_interpolation_removal_mode == "none" and not source_interpolation_enabled:
                 QMessageBox.warning(self, "Batch Save", "Enable automatic removal or interpolation first.")
                 return
+        if mode_index == self.TAB_SMOOTHING and source_smoothing_anchor is None:
+            QMessageBox.warning(self, "Batch Save", "Smoothing needs an anchor node.")
+            return
         if mode_index == self.TAB_SQUARE and len(source_square_points) != 4:
             QMessageBox.warning(self, "Batch Save", "Square mode needs four points.")
             return
@@ -4653,6 +5030,15 @@ class MainWindow(
                 else:
                     analysis_suffix = "interpolated"
                 output_path = _batch_csv_output_path(item.csv_path, analysis_suffix)
+            elif mode_index == self.TAB_SMOOTHING:
+                result_df = build_smoothed_dataframe(
+                    item.source_df,
+                    item.bodyparts,
+                    source_smoothing_method,
+                    source_smoothing_anchor,
+                    source_smoothing_window,
+                )
+                output_path = _batch_csv_output_path(item.csv_path, "smoothed")
             elif mode_index == self.TAB_SQUARE:
                 quad_points = [(x * item.scale_x, y * item.scale_y) for x, y in source_square_points]
                 result_df = build_normalized_dataframe(
@@ -4832,6 +5218,15 @@ class MainWindow(
                 and bool(self.bodyparts)
             )
             self.save_current_button.setEnabled(output is not None and interpolation_ready)
+        elif current_index == self.TAB_SMOOTHING:
+            output = self._smoothing_output_path()
+            self.save_current_button.setEnabled(
+                output is not None
+                and self.csv_df is not None
+                and self.video_state is not None
+                and bool(self.bodyparts)
+                and self._selected_smoothing_anchor() is not None
+            )
         elif current_index == self.TAB_SQUARE:
             output = self._normalized_output_path()
             self.save_current_button.setEnabled(
@@ -4839,9 +5234,10 @@ class MainWindow(
             )
         elif current_index == self.TAB_CHAMBER:
             output = self._chamber_csv_output_path()
+            chamber_mask = self._current_chamber_mask()
             chamber_ready = (
-                self.chamber_mask is not None
-                and bool(np.any(self.chamber_mask))
+                chamber_mask is not None
+                and bool(np.any(chamber_mask))
                 and bool(self.room_records)
             )
             self.save_current_button.setEnabled(
@@ -5048,6 +5444,9 @@ class MainWindow(
                 self.video_state.width,
                 self.video_state.height,
             )
+        stale_layers = self._clear_incompatible_video_masks()
+        if stale_layers:
+            cleared_mask_layers = tuple(dict.fromkeys((*cleared_mask_layers, *stale_layers)))
         self.frame_viewer.reset_view()
         self.frame_viewer.clear_chamber_rect_points()
         self.frame_viewer.clear_chamber_circle()
@@ -5127,6 +5526,7 @@ class MainWindow(
         self._refresh_square_ui()
         self._refresh_circle_ui()
         self._refresh_interpolation_ui()
+        self._refresh_smoothing_ui()
 
     def _load_frame(self, frame_number: int) -> None:
         if self.video_state is None:
@@ -5233,6 +5633,39 @@ class MainWindow(
                         review_role=review_role,
                     )
                 )
+        if (
+            self.mode_tabs.currentIndex() == self.TAB_SMOOTHING
+            and getattr(self, "_smoothing_preview_active", False)
+            and getattr(self, "_smoothing_preview_df", None) is not None
+        ):
+            preview_df = self._smoothing_preview_df
+            preview_rows = preview_df.loc[preview_df.index.intersection(frame_rows.index)]
+            preview_instance_column = TrajectoryPreviewDialog._find_matching_column(
+                preview_rows,
+                NODE_INSTANCE_COLUMN_CANDIDATES,
+            )
+            preview_identities = self._node_instance_identities(preview_rows, preview_instance_column)
+            for (row_index, row), (instance_label, instance_key) in zip(preview_rows.iterrows(), preview_identities):
+                for bodypart in self.bodyparts:
+                    try:
+                        x = float(pd.to_numeric(row[f"{bodypart}.x"], errors="coerce"))
+                        y = float(pd.to_numeric(row[f"{bodypart}.y"], errors="coerce"))
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(x) or not math.isfinite(y):
+                        continue
+                    x_scale, y_scale = self._node_coordinate_scales[bodypart]
+                    label = f"{bodypart} smooth ({instance_label})" if show_instance else f"{bodypart} smooth"
+                    points.append(
+                        NodeOverlayPoint(
+                            label=label,
+                            x=x * x_scale,
+                            y=y * y_scale,
+                            instance_key=f"smooth:{instance_key}",
+                            bodypart=bodypart,
+                            review_role="compare",
+                        )
+                    )
         return points
 
     @staticmethod
@@ -5302,6 +5735,38 @@ class MainWindow(
             return
         self.frame_slider.setValue(max(1, min(self.current_frame_number + delta, self.video_state.frame_count)))
 
+    def _clear_incompatible_video_masks(self) -> tuple[str, ...]:
+        if self.video_state is None:
+            return ()
+        expected_shape = (self.video_state.height, self.video_state.width)
+        cleared: list[str] = []
+
+        if self.interpolation_mask is not None and self.interpolation_mask.shape[:2] != expected_shape:
+            self.reset_interpolation_region()
+            cleared.append("interpolation region")
+
+        chamber_bad = self.chamber_mask is not None and self.chamber_mask.shape[:2] != expected_shape
+        room_bad = any(room.mask.shape[:2] != expected_shape for room in self.room_records.values())
+        if chamber_bad:
+            self.reset_chamber()
+            cleared.append("chamber/room masks")
+        elif room_bad:
+            self._invalidate_chamber_transform_source()
+            self.room_records.clear()
+            self.selected_room_name = None
+            self.room_combo.blockSignals(True)
+            self.room_combo.clear()
+            self.room_combo.blockSignals(False)
+            self._refresh_chamber_viewer(refresh=True)
+            self._refresh_chamber_ui()
+            cleared.append("room masks")
+
+        if any(record.mask.shape[:2] != expected_shape for record in self.mask_records.values()):
+            self.reset_masks()
+            cleared.append("occlusion masks")
+
+        return tuple(cleared)
+
     def _mask_layers_with_data(self) -> tuple[str, ...]:
         layers: list[str] = []
         if self._has_interpolation_region():
@@ -5352,12 +5817,10 @@ class MainWindow(
         scale_y = new_height / old_height
 
         self.frame_viewer.square_points = [(x * scale_x, y * scale_y) for x, y in self.frame_viewer.square_points]
-        if self.frame_viewer.trajectory_region_start is not None:
-            x, y = self.frame_viewer.trajectory_region_start
-            self.frame_viewer.trajectory_region_start = (x * scale_x, y * scale_y)
-        if self.frame_viewer.trajectory_region_end is not None:
-            x, y = self.frame_viewer.trajectory_region_end
-            self.frame_viewer.trajectory_region_end = (x * scale_x, y * scale_y)
+        self.frame_viewer.trajectory_region_points = [
+            (x * scale_x, y * scale_y)
+            for x, y in self.frame_viewer.trajectory_region_points
+        ]
         self.frame_viewer.chamber_rect_points = [(x * scale_x, y * scale_y) for x, y in self.frame_viewer.chamber_rect_points]
         if self.frame_viewer.chamber_circle_start is not None:
             self.frame_viewer.chamber_circle_start = (self.frame_viewer.chamber_circle_start[0] * scale_x, self.frame_viewer.chamber_circle_start[1] * scale_y)
@@ -5395,6 +5858,8 @@ class MainWindow(
         self._refresh_circle_ui()
         self._refresh_pin_ui()
         self._refresh_mask_ui()
+        self.clear_smoothing_preview(refresh_ui=False)
+        self._refresh_smoothing_ui()
         return tuple(cleared_mask_layers)
 
     def _refresh_view_ui(self) -> None:
@@ -5409,6 +5874,10 @@ class MainWindow(
             self._refresh_tracking_repair_ui()
         elif index == self.TAB_INTERPOLATION:
             self._sync_interpolation_mode()
+        elif index == self.TAB_SMOOTHING:
+            self.frame_viewer.set_mode("inspect")
+            self.frame_viewer.set_margin_value(0.0)
+            self._refresh_smoothing_ui()
         elif index == self.TAB_SQUARE:
             self.frame_viewer.set_mode("square")
             self.frame_viewer.set_margin_value(0.0)
@@ -5441,6 +5910,7 @@ class MainWindow(
         for stack in self._mask_undo_stacks.values():
             stack.clear()
         self._interpolation_free_undo_open = False
+        self._chamber_free_undo_open = False
         self._occlusion_free_undo_open = False
         self._occlusion_transform_undo_open = False
 
@@ -5627,6 +6097,7 @@ class MainWindow(
         finally:
             self._mask_undo_restoring = False
             self._interpolation_free_undo_open = False
+            self._chamber_free_undo_open = False
             self._occlusion_free_undo_open = False
             self._occlusion_transform_undo_open = False
         self.statusBar().showMessage(f"Undid {snapshot.label}.", 2500)
@@ -5677,12 +6148,13 @@ class MainWindow(
         tab_index = self.mode_tabs.currentIndex()
         if tab_index == self.TAB_CHAMBER:
             if self.chamber_edit_chamber_radio.isChecked():
-                if self.chamber_mask is None or not np.any(self.chamber_mask):
+                chamber_mask = self._current_chamber_mask()
+                if chamber_mask is None or not np.any(chamber_mask):
                     return None
                 return MaskClipboardItem(
                     label="chamber",
                     source="Chamber",
-                    mask=self.chamber_mask.copy().astype(np.uint8),
+                    mask=chamber_mask.copy().astype(np.uint8),
                     color_name="#d1d5db",
                     geometry=clone_mask_geometry(getattr(self, "chamber_geometry", None)),
                 )
@@ -5862,7 +6334,8 @@ class MainWindow(
             )
             return
 
-        if self.chamber_mask is None or not np.any(self.chamber_mask):
+        chamber_mask = self._current_chamber_mask()
+        if chamber_mask is None or not np.any(chamber_mask):
             QMessageBox.information(
                 self,
                 "Paste Mask",
@@ -5890,7 +6363,7 @@ class MainWindow(
             self.chamber_edit_room_radio.setChecked(True)
 
         blocked = self._occupied_room_mask(exclude_name=current.name)
-        allowed = (mask > 0) & self.chamber_mask.astype(bool)
+        allowed = (mask > 0) & chamber_mask.astype(bool)
         if blocked is not None:
             allowed &= ~blocked.astype(bool)
         if not np.any(allowed):
@@ -6161,7 +6634,9 @@ class MainWindow(
             self._scale_selected_mask_shortcut(scale_factor)
 
     def _rotate_active_region_shortcut(self, angle_degrees: float) -> None:
-        if self._chamber_transform_shortcuts_enabled():
+        if self._interpolation_transform_shortcuts_enabled():
+            self.rotate_interpolation_region(angle_degrees)
+        elif self._chamber_transform_shortcuts_enabled():
             self.rotate_selected_chamber_layer(angle_degrees)
         elif self._mask_transform_shortcuts_enabled():
             self._rotate_selected_mask_shortcut(angle_degrees)
@@ -6294,6 +6769,36 @@ class MainWindow(
                 _completed,
             )
 
+        if index == self.TAB_SMOOTHING:
+            if self.csv_df is None or self.video_state is None or not self.bodyparts:
+                QMessageBox.warning(self, "Smoothing", "Load a video and CSV first.")
+                return None
+            if self._selected_smoothing_anchor() is None:
+                QMessageBox.warning(self, "Smoothing", "Select an anchor node.")
+                return None
+            output = self._smoothing_output_path()
+            if output is None:
+                return None
+            source_df = self.csv_df.copy()
+
+            def _export_item(*, should_cancel=None) -> Path:
+                raise_if_cancelled(should_cancel)
+                result_df = self._build_smoothing_dataframe(source_df)
+                return self._write_csv_output(output, result_df, should_cancel)
+
+            def _completed(result) -> None:
+                if getattr(result, "cancelled", False):
+                    self.statusBar().showMessage("Smoothing save cancelled.")
+                    return
+                self.statusBar().showMessage(f"Smoothed CSV saved: {output}")
+
+            return (
+                "Save CSV Progress",
+                "Saving smoothed CSV in the background...",
+                _export_item,
+                _completed,
+            )
+
         if index == self.TAB_SQUARE:
             if self.csv_df is None or self.video_state is None:
                 QMessageBox.warning(self, "Save", "Load a video and CSV first.")
@@ -6335,7 +6840,8 @@ class MainWindow(
             if self.video_state is None or self.csv_df is None:
                 QMessageBox.warning(self, "Save", "Load a video and CSV first.")
                 return None
-            if self.chamber_mask is None or not np.any(self.chamber_mask):
+            chamber_mask = self._current_chamber_mask()
+            if chamber_mask is None or not np.any(chamber_mask):
                 QMessageBox.warning(self, "Save", "Define the chamber area first.")
                 return None
             if not self.room_records:
@@ -6375,7 +6881,7 @@ class MainWindow(
             ]
             chamber_metadata_geometry = mask_geometry_for_export(
                 getattr(self, "chamber_geometry", None),
-                self.chamber_mask,
+                chamber_mask,
             )
             boundary_mode = self._resolved_chamber_boundary_mode()
             mask_rgb = mask_rgb.copy()
