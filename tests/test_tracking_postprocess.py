@@ -185,6 +185,30 @@ class TrackingPostprocessTests(unittest.TestCase):
         self.assertTrue(pd.isna(source.loc[1, "nose.x"]))
         self.assertEqual(float(source.loc[3, "nose.x"]), 100.0)
 
+    def test_interpolation_prefers_track_over_changing_instance_id(self) -> None:
+        source = pd.DataFrame(
+            {
+                "frame_idx": [1, 2, 3],
+                "track": ["mouse", "mouse", "mouse"],
+                "instance.id": [101, 102, 103],
+                "nose.x": [10.0, None, 30.0],
+                "nose.y": [10.0, None, 10.0],
+            }
+        )
+
+        result = build_interpolation_pipeline_dataframe(
+            source,
+            bodyparts=["nose"],
+            region_mask=None,
+            width=50,
+            height=50,
+            removal_mode="none",
+            anchor_bodypart=None,
+            interpolate=True,
+        )
+
+        self.assertEqual(float(result.loc[1, "nose.x"]), 20.0)
+        self.assertEqual(float(result.loc[1, "nose.y"]), 10.0)
 
 if __name__ == "__main__":
     unittest.main()

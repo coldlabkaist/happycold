@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from smoothing import SMOOTHING_METHODS, build_smoothed_dataframe
+from smoothing import SMOOTHING_METHODS, build_smoothed_dataframe, build_smoothing_preview_dataframe
 from ui_controls import NoWheelComboBox
 
 
@@ -91,7 +91,8 @@ class SmoothingTabMixin:
         self.smoothing_window_combo.currentIndexChanged.connect(self._on_smoothing_option_changed)
         self.smoothing_preview_button.clicked.connect(self.preview_smoothing_current_frame)
         self.smoothing_clear_preview_button.clicked.connect(self.clear_smoothing_preview)
-        self._smoothing_preview_df = None
+        self._smoothing_preview_records = []
+        self._smoothing_preview_frame_number = None
         self._smoothing_preview_active = False
         self._refresh_smoothing_ui()
         return tab
@@ -161,7 +162,11 @@ class SmoothingTabMixin:
         elif not has_anchor:
             self.smoothing_preview_label.setText("Select an anchor node.")
         elif getattr(self, "_smoothing_preview_active", False):
-            self.smoothing_preview_label.setText("Smoothing preview is displayed on the current frame.")
+            frame_number = getattr(self, "_smoothing_preview_frame_number", None)
+            shifted = self._smoothing_preview_shift_count(frame_number) if frame_number is not None else 0
+            self.smoothing_preview_label.setText(
+                f"Preview frame {frame_number}: {shifted:,} shifted node(s)."
+            )
         else:
             window = self._selected_smoothing_window_size()
             self.smoothing_preview_label.setText(f"Ready: anchor median smoothing with a {window}-frame window.")
@@ -201,22 +206,30 @@ class SmoothingTabMixin:
         if self._selected_smoothing_anchor() is None:
             QMessageBox.warning(self, "Smoothing", "Select an anchor node.")
             return
+        preview_frame = self.current_frame_number
         try:
-            smoothed = self._build_smoothing_dataframe()
+            smoothed = build_smoothing_preview_dataframe(
+                self.csv_df,
+                list(self.bodyparts),
+                self._selected_smoothing_method(),
+                self._selected_smoothing_anchor(),
+                self._selected_smoothing_window_size(),
+                preview_frame,
+                frame_zero_based=bool(getattr(self, "_node_frame_zero_based", False)),
+            )
         except Exception as exc:
             QMessageBox.warning(self, "Smoothing", f"Could not build smoothing preview.\n\n{exc}")
             return
-        self._smoothing_preview_df = smoothed
+        source_rows = self._csv_rows_for_frame(preview_frame)
+        self._smoothing_preview_records = self._smoothing_preview_records_from_frames(source_rows, smoothed)
+        self._smoothing_preview_frame_number = preview_frame
         self._smoothing_preview_active = True
-        shifted = self._smoothing_preview_shift_count(self.current_frame_number)
-        self.smoothing_preview_label.setText(
-            f"Preview frame {self.current_frame_number}: {shifted:,} node(s) shifted."
-        )
         self._refresh_node_overlay()
         self._refresh_smoothing_ui()
 
     def clear_smoothing_preview(self, refresh_ui: bool = True) -> None:
-        self._smoothing_preview_df = None
+        self._smoothing_preview_records = []
+        self._smoothing_preview_frame_number = None
         self._smoothing_preview_active = False
         if hasattr(self, "frame_viewer"):
             self._refresh_node_overlay()
@@ -224,26 +237,40 @@ class SmoothingTabMixin:
             self._refresh_smoothing_ui()
 
     def _smoothing_preview_shift_count(self, frame_number: int) -> int:
-        if self.csv_df is None or self._smoothing_preview_df is None:
+        if getattr(self, "_smoothing_preview_frame_number", None) != frame_number:
             return 0
-        source_rows = self._csv_rows_for_frame(frame_number)
-        if source_rows.empty:
-            return 0
-        preview_rows = self._smoothing_preview_df.loc[
-            self._smoothing_preview_df.index.intersection(source_rows.index)
-        ]
-        shifted = 0
+        return len(getattr(self, "_smoothing_preview_records", []))
+
+    def _smoothing_preview_records_from_frames(self, source_rows, preview_rows) -> list[dict]:
+        if self.csv_df is None or source_rows.empty or preview_rows.empty:
+            return []
+        source_lookup = source_rows.loc[source_rows.index.intersection(preview_rows.index)]
+        records: list[dict] = []
         for row_index in preview_rows.index:
+            if row_index not in source_lookup.index:
+                continue
             for bodypart in self.bodyparts:
                 x_col = f"{bodypart}.x"
                 y_col = f"{bodypart}.y"
                 if x_col not in self.csv_df.columns or y_col not in self.csv_df.columns:
                     continue
-                before = self.csv_df.loc[row_index, [x_col, y_col]].to_numpy(dtype=np.float64)
-                after = self._smoothing_preview_df.loc[row_index, [x_col, y_col]].to_numpy(dtype=np.float64)
-                if np.all(np.isfinite(before)) and np.all(np.isfinite(after)) and not np.allclose(before, after):
-                    shifted += 1
-        return shifted
+                before = source_lookup.loc[row_index, [x_col, y_col]].to_numpy(dtype=np.float64)
+                after = preview_rows.loc[row_index, [x_col, y_col]].to_numpy(dtype=np.float64)
+                if not (np.all(np.isfinite(before)) and np.all(np.isfinite(after))):
+                    continue
+                if np.allclose(before, after):
+                    continue
+                records.append(
+                    {
+                        "row_index": row_index,
+                        "bodypart": bodypart,
+                        "source_x": float(before[0]),
+                        "source_y": float(before[1]),
+                        "x": float(after[0]),
+                        "y": float(after[1]),
+                    }
+                )
+        return records
 
     def save_smoothed_csv(self) -> None:
         if self.csv_df is None or self.video_state is None or not self.bodyparts:

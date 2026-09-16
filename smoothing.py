@@ -186,6 +186,53 @@ def anchor_median_smoothing(
     return result
 
 
+def build_smoothing_preview_dataframe(
+    df: pd.DataFrame,
+    bodyparts: list[str],
+    method: str,
+    anchor_bodypart: str | None,
+    window_size: int,
+    frame_number: int,
+    frame_zero_based: bool = False,
+) -> pd.DataFrame:
+    """Return smoothed rows for one displayed frame using only its local window."""
+    if df.empty:
+        return df.copy()
+
+    half_window = int(window_size) // 2
+    frame_column = _find_matching_column(df, FRAME_COLUMN_CANDIDATES)
+    if frame_column is None:
+        row_position = max(0, min(len(df) - 1, int(frame_number) - 1))
+        start = max(0, row_position - half_window)
+        stop = min(len(df), row_position + half_window + 1)
+        subset = df.iloc[start:stop].copy()
+        target_index = pd.Index([df.index[row_position]])
+    else:
+        frame_values = pd.to_numeric(df[frame_column], errors="coerce")
+        target_frame = int(frame_number) - 1 if frame_zero_based else int(frame_number)
+        finite_values = frame_values.to_numpy(dtype=np.float64)
+        in_window = (
+            np.isfinite(finite_values)
+            & (finite_values >= target_frame - half_window)
+            & (finite_values <= target_frame + half_window)
+        )
+        is_target = np.isfinite(finite_values) & (finite_values == target_frame)
+        if not np.any(is_target):
+            return df.iloc[0:0].copy()
+        subset = df.loc[in_window].copy()
+        target_index = df.index[is_target]
+
+    if subset.empty:
+        return df.iloc[0:0].copy()
+    smoothed = build_smoothed_dataframe(
+        subset,
+        bodyparts=bodyparts,
+        method=method,
+        anchor_bodypart=anchor_bodypart,
+        window_size=window_size,
+    )
+    return smoothed.loc[smoothed.index.intersection(target_index)]
+
 SMOOTHING_METHODS: dict[str, SmoothingMethodSpec] = {
     "anchor_median_smoothing": SmoothingMethodSpec(
         key="anchor_median_smoothing",

@@ -2,7 +2,7 @@ import unittest
 
 import pandas as pd
 
-from smoothing import anchor_median_smoothing
+from smoothing import anchor_median_smoothing, build_smoothing_preview_dataframe
 
 
 class AnchorMedianSmoothingTests(unittest.TestCase):
@@ -79,5 +79,57 @@ class AnchorMedianSmoothingTests(unittest.TestCase):
         self.assertEqual(result.loc[4, "tail.x"], 1013.0)
 
 
+
+    def test_preview_returns_only_target_frame_and_matches_full_smoothing(self) -> None:
+        df = pd.DataFrame(
+            {
+                "frame": [1, 2, 3],
+                "anchor.x": [0.0, 100.0, 20.0],
+                "anchor.y": [0.0, 100.0, 20.0],
+                "tail.x": [3.0, 103.0, 23.0],
+                "tail.y": [4.0, 104.0, 24.0],
+            }
+        )
+
+        full = anchor_median_smoothing(df, ["anchor", "tail"], "anchor", 3)
+        preview = build_smoothing_preview_dataframe(
+            df,
+            ["anchor", "tail"],
+            "anchor_median_smoothing",
+            "anchor",
+            3,
+            frame_number=2,
+        )
+
+        self.assertEqual(list(preview.index), [1])
+        self.assertEqual(preview.loc[1, "anchor.x"], full.loc[1, "anchor.x"])
+        self.assertEqual(preview.loc[1, "tail.x"], full.loc[1, "tail.x"])
+
+    def test_preview_respects_zero_based_frame_numbers(self) -> None:
+        df = pd.DataFrame(
+            {
+                "frame": [0, 1, 2],
+                "anchor.x": [0.0, 100.0, 20.0],
+                "anchor.y": [0.0, 100.0, 20.0],
+                "tail.x": [3.0, 103.0, 23.0],
+                "tail.y": [4.0, 104.0, 24.0],
+            }
+        )
+
+        preview = build_smoothing_preview_dataframe(
+            df,
+            ["anchor", "tail"],
+            "anchor_median_smoothing",
+            "anchor",
+            3,
+            frame_number=2,
+            frame_zero_based=True,
+        )
+
+        self.assertEqual(list(preview.index), [1])
+        self.assertEqual(preview.loc[1, "anchor.x"], 20.0)
+        self.assertEqual(preview.loc[1, "tail.x"], 23.0)
+
 if __name__ == "__main__":
+
     unittest.main()

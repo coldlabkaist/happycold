@@ -12,9 +12,6 @@ INSTANCE_COLUMN_CANDIDATES = (
     "instance",
     "instance_id",
     "instance id",
-    "track",
-    "track_id",
-    "track id",
 )
 
 
@@ -33,7 +30,8 @@ def _find_matching_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> str 
 
 def _ordered_groups(df: pd.DataFrame) -> list[np.ndarray]:
     positions = np.arange(len(df), dtype=np.int64)
-    instance_column = _find_matching_column(df, INSTANCE_COLUMN_CANDIDATES)
+    track_column = _find_matching_column(df, TRACK_COLUMN_CANDIDATES)
+    instance_column = track_column or _find_matching_column(df, INSTANCE_COLUMN_CANDIDATES)
     frame_column = _find_matching_column(df, FRAME_COLUMN_CANDIDATES)
 
     if instance_column is None:

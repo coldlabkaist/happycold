@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import math
@@ -70,6 +70,8 @@ class NodeOverlayPoint:
     instance_key: str
     bodypart: str
     review_role: str = ""
+    source_x: float | None = None
+    source_y: float | None = None
 
 
 @dataclass(frozen=True)
@@ -2720,6 +2722,20 @@ class FrameViewer(QWidget):
             if node.review_role == "delete":
                 color = QColor("#ef4444")
                 radius = 7.0
+            elif node.review_role == "preview":
+                source_point = None
+                if node.source_x is not None and node.source_y is not None:
+                    source_point = self._image_to_widget((node.source_x, node.source_y))
+                if source_point is not None:
+                    painter.setPen(QPen(QColor(56, 189, 248, 190), 1.6, Qt.PenStyle.DashLine))
+                    painter.drawLine(source_point, widget_point)
+                painter.setPen(QPen(QColor("#bae6fd"), 2.2))
+                painter.setBrush(QColor(56, 189, 248, 92))
+                painter.drawEllipse(widget_point, 7.0, 7.0)
+                painter.setPen(QPen(QColor("#082f49"), 1.0))
+                painter.setBrush(QColor("#38bdf8"))
+                painter.drawEllipse(widget_point, 3.0, 3.0)
+                continue
             elif node.review_role == "compare":
                 color = QColor("#f59e0b")
                 radius = 6.0
@@ -3228,6 +3244,7 @@ class MainWindow(
         self.bodyparts: list[str] = []
         self._node_frame_column: str | None = None
         self._node_frame_values: pd.Series | None = None
+        self._node_frame_row_indices: dict[int, list] = {}
         self._node_frame_zero_based = False
         self._node_coordinate_scales: dict[str, tuple[float, float]] = {}
         self.current_folder = Path()
@@ -5572,17 +5589,30 @@ class MainWindow(
         available = self.video_state is not None and self.csv_df is not None and bool(self.bodyparts)
         self.show_nodes_checkbox.setEnabled(available)
         self.node_color_combo.setEnabled(available)
-        if not available or not self.show_nodes_checkbox.isChecked():
+        smoothing_preview_visible = (
+            self.mode_tabs.currentIndex() == self.TAB_SMOOTHING
+            and getattr(self, "_smoothing_preview_active", False)
+            and getattr(self, "_smoothing_preview_frame_number", None) == self.current_frame_number
+        )
+        show_source_nodes = self.show_nodes_checkbox.isChecked()
+        if not available or (not show_source_nodes and not smoothing_preview_visible):
             self.frame_viewer.set_node_overlay_points([])
             return
-        points = self._node_overlay_points_for_frame(self.current_frame_number)
+        points = self._node_overlay_points_for_frame(
+            self.current_frame_number,
+            include_source_nodes=show_source_nodes,
+        )
         self.frame_viewer.set_node_overlay_points(points)
 
     def _on_node_color_mode_changed(self, _index: int) -> None:
         mode = str(self.node_color_combo.currentData())
         self.frame_viewer.set_node_overlay_color_mode(mode)
 
-    def _node_overlay_points_for_frame(self, frame_number: int) -> list[NodeOverlayPoint]:
+    def _node_overlay_points_for_frame(
+        self,
+        frame_number: int,
+        include_source_nodes: bool = True,
+    ) -> list[NodeOverlayPoint]:
         if self.csv_df is None or self.video_state is None:
             return []
         frame_rows = self._csv_rows_for_frame(frame_number)
@@ -5609,43 +5639,11 @@ class MainWindow(
         show_instance = len(frame_rows) > 1
         instance_identities = self._node_instance_identities(frame_rows, instance_column)
         points: list[NodeOverlayPoint] = []
-        for (row_index, row), (instance_label, instance_key) in zip(frame_rows.iterrows(), instance_identities):
-            review_role = ""
-            if review_active:
-                review_role = "delete" if row_index in deleted_rows else "compare"
-            for bodypart in self.bodyparts:
-                try:
-                    x = float(pd.to_numeric(row[f"{bodypart}.x"], errors="coerce"))
-                    y = float(pd.to_numeric(row[f"{bodypart}.y"], errors="coerce"))
-                except (TypeError, ValueError):
-                    continue
-                if not math.isfinite(x) or not math.isfinite(y):
-                    continue
-                x_scale, y_scale = self._node_coordinate_scales[bodypart]
-                label = f"{bodypart} ({instance_label})" if show_instance else bodypart
-                points.append(
-                    NodeOverlayPoint(
-                        label=label,
-                        x=x * x_scale,
-                        y=y * y_scale,
-                        instance_key=instance_key,
-                        bodypart=bodypart,
-                        review_role=review_role,
-                    )
-                )
-        if (
-            self.mode_tabs.currentIndex() == self.TAB_SMOOTHING
-            and getattr(self, "_smoothing_preview_active", False)
-            and getattr(self, "_smoothing_preview_df", None) is not None
-        ):
-            preview_df = self._smoothing_preview_df
-            preview_rows = preview_df.loc[preview_df.index.intersection(frame_rows.index)]
-            preview_instance_column = TrajectoryPreviewDialog._find_matching_column(
-                preview_rows,
-                NODE_INSTANCE_COLUMN_CANDIDATES,
-            )
-            preview_identities = self._node_instance_identities(preview_rows, preview_instance_column)
-            for (row_index, row), (instance_label, instance_key) in zip(preview_rows.iterrows(), preview_identities):
+        if include_source_nodes:
+            for (row_index, row), (instance_label, instance_key) in zip(frame_rows.iterrows(), instance_identities):
+                review_role = ""
+                if review_active:
+                    review_role = "delete" if row_index in deleted_rows else "compare"
                 for bodypart in self.bodyparts:
                     try:
                         x = float(pd.to_numeric(row[f"{bodypart}.x"], errors="coerce"))
@@ -5655,17 +5653,46 @@ class MainWindow(
                     if not math.isfinite(x) or not math.isfinite(y):
                         continue
                     x_scale, y_scale = self._node_coordinate_scales[bodypart]
-                    label = f"{bodypart} smooth ({instance_label})" if show_instance else f"{bodypart} smooth"
+                    label = f"{bodypart} ({instance_label})" if show_instance else bodypart
                     points.append(
                         NodeOverlayPoint(
                             label=label,
                             x=x * x_scale,
                             y=y * y_scale,
-                            instance_key=f"smooth:{instance_key}",
+                            instance_key=instance_key,
                             bodypart=bodypart,
-                            review_role="compare",
+                            review_role=review_role,
                         )
                     )
+        if (
+            self.mode_tabs.currentIndex() == self.TAB_SMOOTHING
+            and getattr(self, "_smoothing_preview_active", False)
+            and getattr(self, "_smoothing_preview_frame_number", None) == frame_number
+        ):
+            identity_by_row = {
+                row_index: identity
+                for row_index, identity in zip(frame_rows.index, instance_identities)
+            }
+            for record in getattr(self, "_smoothing_preview_records", []):
+                row_index = record.get("row_index")
+                bodypart = str(record.get("bodypart"))
+                if row_index not in identity_by_row or bodypart not in self._node_coordinate_scales:
+                    continue
+                instance_label, instance_key = identity_by_row[row_index]
+                x_scale, y_scale = self._node_coordinate_scales[bodypart]
+                label = f"{bodypart} preview ({instance_label})" if show_instance else f"{bodypart} preview"
+                points.append(
+                    NodeOverlayPoint(
+                        label=label,
+                        x=float(record["x"]) * x_scale,
+                        y=float(record["y"]) * y_scale,
+                        instance_key=f"preview:{instance_key}",
+                        bodypart=bodypart,
+                        review_role="preview",
+                        source_x=float(record["source_x"]) * x_scale,
+                        source_y=float(record["source_y"]) * y_scale,
+                    )
+                )
         return points
 
     @staticmethod
@@ -5698,6 +5725,7 @@ class MainWindow(
             self.frame_viewer.reset_node_overlay_color_assignments()
         self._node_frame_column = None
         self._node_frame_values = None
+        self._node_frame_row_indices = {}
         self._node_frame_zero_based = False
         self._node_coordinate_scales = {}
         if self.csv_df is None:
@@ -5710,6 +5738,13 @@ class MainWindow(
         if self._node_frame_column is not None:
             self._node_frame_values = pd.to_numeric(self.csv_df[self._node_frame_column], errors="coerce")
             self._node_frame_zero_based = bool((self._node_frame_values == 0).any())
+            for row_index, frame_value in self._node_frame_values.items():
+                if pd.isna(frame_value):
+                    continue
+                numeric_frame = float(frame_value)
+                if not math.isfinite(numeric_frame) or not numeric_frame.is_integer():
+                    continue
+                self._node_frame_row_indices.setdefault(int(numeric_frame), []).append(row_index)
 
         if self.video_state is not None:
             self._node_coordinate_scales = {
@@ -5728,7 +5763,10 @@ class MainWindow(
             return self.csv_df.iloc[row_index : row_index + 1]
 
         target_frame = int(frame_number) - 1 if self._node_frame_zero_based else int(frame_number)
-        return self.csv_df.loc[self._node_frame_values == target_frame]
+        row_indices = self._node_frame_row_indices.get(target_frame, [])
+        if not row_indices:
+            return self.csv_df.iloc[0:0]
+        return self.csv_df.loc[row_indices]
 
     def step_frame(self, delta: int) -> None:
         if self.video_state is None:
