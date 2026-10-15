@@ -21,12 +21,15 @@ class DataFramePipelineStage:
     transform: Callable[[pd.DataFrame], pd.DataFrame]
     output_mode: str = "append"
     allow_row_removal: bool = False
+    allow_row_addition: bool = False
 
     def __post_init__(self) -> None:
         if self.output_mode not in {"append", "replace"}:
             raise ValueError("Pipeline stage output_mode must be 'append' or 'replace'.")
         if self.allow_row_removal and self.output_mode != "replace":
             raise ValueError("Only replace stages may remove rows.")
+        if self.allow_row_addition and self.output_mode != "replace":
+            raise ValueError("Only replace stages may add rows.")
 
 
 @dataclass(frozen=True)
@@ -44,6 +47,10 @@ class PipelineStageSummary:
     @property
     def removed_rows(self) -> int:
         return max(0, self.input_rows - self.output_rows)
+
+    @property
+    def added_rows(self) -> int:
+        return max(0, self.output_rows - self.input_rows)
 
 
 @dataclass(frozen=True)
@@ -117,7 +124,7 @@ def run_dataframe_pipeline(
 ) -> PipelineRunResult:
     """Run stages in memory without mutating the source dataframe.
 
-    ``replace`` stages update the working data (and may remove existing rows when
+    ``replace`` stages update the working data (and may remove or add rows when
     explicitly allowed). ``append`` stages keep the working data intact and only
     accumulate new result columns. If an append stage changes an existing column,
     that value is stored under a stage-suffixed derived column instead.
@@ -143,26 +150,28 @@ def run_dataframe_pipeline(
             )
         rows_changed = len(next_df) != len(before_df) or not next_df.index.equals(before_df.index)
         if rows_changed:
-            if not stage.allow_row_removal:
+            if not stage.allow_row_removal and not stage.allow_row_addition:
                 raise ValueError(
                     f"Pipeline stage '{stage.label}' changed the row count or index. "
-                    "Pipeline stages must preserve rows unless row removal is explicitly enabled."
+                    "Pipeline stages must preserve rows unless row removal or addition is explicitly enabled."
                 )
             if (
-                len(next_df) > len(before_df)
-                or not next_df.index.is_unique
-                or not next_df.index.isin(before_df.index).all()
+                not next_df.index.is_unique
+                or not before_df.index.is_unique
+                or (not stage.allow_row_addition and not next_df.index.isin(before_df.index).all())
+                or (not stage.allow_row_removal and not before_df.index.isin(next_df.index).all())
             ):
                 raise ValueError(
-                    f"Pipeline stage '{stage.label}' added or re-keyed rows. "
-                    "Repair stages may only remove existing rows."
+                    f"Pipeline stage '{stage.label}' changed rows without permission. "
+                    "Existing row labels must be preserved unless removal is enabled; "
+                    "new labels require addition to be enabled."
                 )
 
         added_columns: list[str] = []
         derived_columns: list[str] = []
         replaced_columns: list[str] = []
         changed_cells = 0
-        before_aligned = before_df.loc[next_df.index]
+        before_aligned = before_df.reindex(next_df.index)
 
         if stage.output_mode == "replace":
             active_df = next_df.copy()

@@ -4733,6 +4733,7 @@ class MainWindow(
             dialog.mark_crashed(message)
         self._active_single_save_completion = None
         self.statusBar().showMessage(f"Save worker stopped: {message}")
+        QMessageBox.warning(self, "CSV Save Failed", message or "Unknown save error")
 
     def _on_single_save_thread_finished(self) -> None:
         self._active_single_save_thread = None
@@ -4760,11 +4761,16 @@ class MainWindow(
             len(selected_videos),
             parent=self,
         )
+        # Capture input paths on the UI thread so a later video selection cannot
+        # change which CSV the background worker processes.
+        csv_candidates = {
+            path: self._batch_csv_candidates(path) for path in selected_videos
+        }
         worker = BatchExportWorker(
             selected_videos=selected_videos,
             source_width=source_width,
             source_height=source_height,
-            csv_candidates_for=self._matching_csv_candidates,
+            csv_candidates_for=lambda path: csv_candidates.get(path, []),
             video_size_for=self._video_size,
             export_item=export_item,
             require_bodyparts=require_bodyparts,
@@ -4826,6 +4832,20 @@ class MainWindow(
         self._active_batch_completion = None
         if callback is not None:
             callback(result)
+        if result.failed or result.skipped_auto_missing:
+            details = [f"{path.name}: {reason}" for path, reason in result.failed[:6]]
+            details.extend(
+                f"{path.name}: no matching CSV was found; select a CSV or check the CSV folder."
+                for path in result.skipped_auto_missing[:6]
+            )
+            QMessageBox.warning(
+                self,
+                "Batch Save Warnings",
+                f"Saved: {result.saved_count} | Failed: {len(result.failed)} | "
+                f"Skipped: {len(result.skipped_auto_missing)}\n\n"
+                + "\n\n".join(details)
+                + "\n\nSee the progress window for all file results.",
+            )
 
     def _on_batch_export_crashed(self, message: str) -> None:
         dialog = getattr(self, "_active_batch_dialog", None)
@@ -4833,6 +4853,7 @@ class MainWindow(
             dialog.mark_crashed(message)
         self._active_batch_completion = None
         self.statusBar().showMessage(f"Batch worker stopped: {message}")
+        QMessageBox.warning(self, "Batch Save Failed", message or "Unknown batch error")
 
     def _on_batch_thread_finished(self) -> None:
         self._active_batch_thread = None
@@ -4857,8 +4878,8 @@ class MainWindow(
         if warning_text is None:
             warning_text = (
                 "Warning:\n"
-                "- Only videos with auto-detected CSV candidates are converted.\n"
-                "- The top auto-detected CSV candidate is used for each video.\n"
+                "- A selected or auto-detected CSV is required for each video.\n"
+                "- The current video's selected CSV is used; other videos use their top auto-detected candidate.\n"
                 "- The same condition is applied to all selected videos."
             )
 
@@ -4878,7 +4899,7 @@ class MainWindow(
             if not path_data:
                 continue
             video_path = Path(str(path_data))
-            csv_candidates = self._matching_csv_candidates(video_path)
+            csv_candidates = self._batch_csv_candidates(video_path)
             choices.append(
                 BatchVideoChoice(
                     path=video_path,
@@ -5363,6 +5384,16 @@ class MainWindow(
                 suffix = stem[len(prefix) + 1 :]
                 return (exact_rank + 2, suffix.lower(), stem)
         return (4, stem.lower(), stem)
+
+    def _batch_csv_candidates(self, video_path: Path) -> list[Path]:
+        if (
+            self.video_state is not None
+            and self.video_state.path == video_path
+            and self.csv_path is not None
+            and self.csv_path.is_file()
+        ):
+            return [self.csv_path]
+        return self._matching_csv_candidates(video_path)
 
     def _matching_csv_candidates(self, video_path: Path) -> list[Path]:
         video_name = video_path.stem

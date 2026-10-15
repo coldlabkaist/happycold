@@ -7,7 +7,7 @@ from trajectory import infer_pixel_scale
 
 
 FRAME_COLUMN_CANDIDATES = ("frame idx", "frame_idx", "frame index", "frame_index", "frame")
-TRACK_COLUMN_CANDIDATES = ("track", "track_id", "track id")
+TRACK_COLUMN_CANDIDATES = ("_coop_track_id", "track", "track_id", "track id")
 INSTANCE_COLUMN_CANDIDATES = (
     "instance",
     "instance_id",
@@ -28,10 +28,70 @@ def _find_matching_column(df: pd.DataFrame, candidates: tuple[str, ...]) -> str 
     return None
 
 
-def _ordered_groups(df: pd.DataFrame) -> list[np.ndarray]:
+class InterpolationIdentityError(ValueError):
+    """The rows cannot be assigned to unambiguous temporal tracks."""
+
+
+def _identity_values(df: pd.DataFrame, column: str) -> pd.Series:
+    return df[column].astype("string").str.strip().replace("", pd.NA)
+
+
+def _interpolation_identity_column(df: pd.DataFrame) -> str | None:
+    frame_column = _find_matching_column(df, FRAME_COLUMN_CANDIDATES)
+    columns = list(dict.fromkeys(
+        column for candidate in (*TRACK_COLUMN_CANDIDATES, *INSTANCE_COLUMN_CANDIDATES)
+        if (column := _find_matching_column(df, (candidate,))) is not None
+    ))
+    if frame_column is None:
+        return columns[0] if columns else None
+    frames = pd.to_numeric(df[frame_column], errors="coerce")
+    if not np.isfinite(frames.to_numpy(dtype=float)).all():
+        raise InterpolationIdentityError(
+            f"Interpolation stopped: '{frame_column}' contains missing or invalid frame numbers."
+        )
+    problems: list[str] = []
+    for column in columns:
+        identities = _identity_values(df, column)
+        if identities.isna().all():
+            continue
+        if identities.isna().any():
+            problems.append(f"'{column}' has {int(identities.isna().sum())} rows without an ID")
+            continue
+        keys = pd.DataFrame({"frame": frames.to_numpy(), "id": identities.to_numpy()})
+        duplicates = keys.duplicated(["frame", "id"], keep=False)
+        if duplicates.any():
+            examples = keys.loc[duplicates].drop_duplicates().head(3)
+            details = ", ".join(f"frame {row.frame:g}, ID {row.id!r}" for row in examples.itertuples())
+            problems.append(f"'{column}' has duplicate IDs within the same frame ({details})")
+            continue
+        if problems and not identities.duplicated().any() and frames.nunique() > 1:
+            problems.append(f"'{column}' contains only one-use detection IDs, not stable animal IDs")
+            continue
+        # A detection-level instance.id can change every frame. In a single-animal
+        # CSV, use its one-row-per-frame sequence if no temporal track is supplied.
+        if (
+            _canonical_column_name(column) not in {
+                _canonical_column_name(candidate) for candidate in TRACK_COLUMN_CANDIDATES
+            }
+            and not identities.duplicated().any()
+            and not frames.duplicated().any()
+            and not problems
+        ):
+            return None
+        return column
+    if problems or frames.duplicated().any():
+        reason = "; ".join(problems) or "multiple detections in one frame have no usable identity column"
+        raise InterpolationIdentityError(
+            f"Interpolation stopped: {reason}. Animals cannot be separated safely. "
+            "Assign a unique, stable track ID to each animal in each frame, or resolve duplicate detections first. "
+            "No interpolated CSV was saved."
+        )
+    return None
+
+
+def _ordered_groups(df: pd.DataFrame, identity_column: str | None) -> list[np.ndarray]:
     positions = np.arange(len(df), dtype=np.int64)
-    track_column = _find_matching_column(df, TRACK_COLUMN_CANDIDATES)
-    instance_column = track_column or _find_matching_column(df, INSTANCE_COLUMN_CANDIDATES)
+    instance_column = identity_column
     frame_column = _find_matching_column(df, FRAME_COLUMN_CANDIDATES)
 
     if instance_column is None:
@@ -40,7 +100,7 @@ def _ordered_groups(df: pd.DataFrame) -> list[np.ndarray]:
         grouping_frame = pd.DataFrame(
             {
                 "_position": positions,
-                "_instance": df[instance_column].to_numpy(copy=False),
+                "_instance": _identity_values(df, instance_column).to_numpy(),
             }
         )
         groups = [
@@ -61,17 +121,75 @@ def _ordered_groups(df: pd.DataFrame) -> list[np.ndarray]:
     return ordered_groups
 
 
+def _expand_internal_frames(df: pd.DataFrame, groups: list[np.ndarray]) -> pd.DataFrame:
+    """Add internal missing-frame rows; never invent a track's start or end."""
+    frame_column = _find_matching_column(df, FRAME_COLUMN_CANDIDATES)
+    if frame_column is None or df.empty:
+        return df
+    frames = pd.to_numeric(df[frame_column], errors="coerce").to_numpy(dtype=float)
+    if not np.equal(frames, np.floor(frames)).all():
+        return df
+    identity_names = {
+        _canonical_column_name(candidate)
+        for candidate in (*TRACK_COLUMN_CANDIDATES, *INSTANCE_COLUMN_CANDIDATES)
+    }
+    identity_columns = [
+        column for column in df.columns
+        if _canonical_column_name(column) in identity_names
+    ]
+    additions: list[pd.DataFrame] = []
+    for positions in groups:
+        if len(positions) < 2:
+            continue
+        group_frames = frames[positions].astype(np.int64)
+        missing = np.setdiff1d(np.arange(group_frames[0], group_frames[-1] + 1), group_frames)
+        if not len(missing):
+            continue
+        rows = pd.DataFrame(np.nan, index=range(len(missing)), columns=df.columns)
+        rows[frame_column] = missing
+        group = df.iloc[positions]
+        for column in identity_columns:
+            identities = _identity_values(group, column)
+            if identities.nunique() == 1:
+                rows[column] = group.loc[identities.notna(), column].iloc[0]
+        if "_coop_dense_placeholder" in rows.columns:
+            rows["_coop_dense_placeholder"] = 1
+        additions.append(rows)
+    if not additions:
+        return df
+    if not df.index.is_unique:
+        raise ValueError("Interpolation needs a unique row index to restore missing frames.")
+    extra = pd.concat(additions, ignore_index=True)
+    # Preserve all existing row labels for the pipeline and generate disjoint labels.
+    labels: list[int] = []
+    occupied = set(df.index)
+    candidate = len(df)
+    while len(labels) < len(extra):
+        if candidate not in occupied:
+            labels.append(candidate)
+        candidate += 1
+    extra.index = pd.Index(labels, name=df.index.name)
+    return pd.concat([df, extra]).sort_values(frame_column, kind="stable", key=pd.to_numeric)
+
+
 def _interpolate_internal(
     values: np.ndarray,
     groups: list[np.ndarray],
     extrapolate: bool = False,
+    frame_values: np.ndarray | None = None,
 ) -> np.ndarray:
     interpolated = values.copy()
     for positions in groups:
         if len(positions) < 2:
             continue
-        group_values = pd.Series(values[positions], dtype="float64")
-        filled = group_values.interpolate(method="linear", limit_area="inside")
+        group_values = pd.Series(
+            np.where(np.isfinite(values[positions]), values[positions], np.nan),
+            index=None if frame_values is None else frame_values[positions],
+            dtype="float64",
+        )
+        filled = group_values.interpolate(
+            method="linear" if frame_values is None else "index", limit_area="inside"
+        )
         if extrapolate:
             # Boundary extrapolation intentionally uses the nearest valid coordinate.
             # This avoids unstable long-range slopes at the start or end of a track.
@@ -200,8 +318,10 @@ def build_interpolated_dataframe(
 ) -> pd.DataFrame:
     """Fill internal coordinate gaps, optionally restricted by a spatial region filter.
 
-    Existing values are never overwritten. If a track column is present, each track is
-    interpolated independently. Internal gaps use linear interpolation. When ``extrapolate``
+    Existing values are never overwritten. Tracks must have at most one row per frame;
+    a stable instance ID is used if track labels are ambiguous. Internal missing-frame
+    rows are restored between each track's first and last observations. Coordinates
+    use frame-weighted linear interpolation. When ``extrapolate``
     is enabled, leading and trailing gaps use the nearest valid coordinate in that track.
     Region membership is evaluated after interpolation when ``region_mode`` is ``inside``
     or ``outside``; ``all`` skips the spatial filter.
@@ -214,8 +334,17 @@ def build_interpolated_dataframe(
         if not np.any(region_mask):
             raise ValueError("Draw an interpolation region first.")
 
+    if not any(f"{part}.x" in df.columns and f"{part}.y" in df.columns for part in bodyparts):
+        return df.copy()
+
+    identity_column = _interpolation_identity_column(df)
+    groups = _ordered_groups(df, identity_column)
+    original_index = df.index
+    df = _expand_internal_frames(df, groups)
+    groups = _ordered_groups(df, identity_column)
     result = df.copy()
-    groups = _ordered_groups(df)
+    frame_column = _find_matching_column(df, FRAME_COLUMN_CANDIDATES)
+    frame_values = None if frame_column is None else pd.to_numeric(df[frame_column]).to_numpy(dtype=float)
     region = None if region_mode == "all" else region_mask.astype(bool)
 
     for bodypart in bodyparts:
@@ -232,8 +361,8 @@ def build_interpolated_dataframe(
         if not candidate_missing.any():
             continue
 
-        interpolated_x = _interpolate_internal(original_x, groups, extrapolate)
-        interpolated_y = _interpolate_internal(original_y, groups, extrapolate)
+        interpolated_x = _interpolate_internal(original_x, groups, extrapolate, frame_values)
+        interpolated_y = _interpolate_internal(original_y, groups, extrapolate, frame_values)
         finite_pair = np.isfinite(interpolated_x) & np.isfinite(interpolated_y)
         candidates = candidate_missing & finite_pair
         if not candidates.any():
@@ -272,4 +401,14 @@ def build_interpolated_dataframe(
             output_y[fill_y] = interpolated_y[fill_y]
             result[y_column] = output_y
 
+    # Region filters and entirely missing tracks may leave synthetic rows unfilled.
+    coordinate_columns = [
+        f"{part}.{axis}"
+        for part in bodyparts
+        for axis in ("x", "y")
+        if f"{part}.{axis}" in result.columns
+    ]
+    if coordinate_columns:
+        has_coordinates = result[coordinate_columns].notna().any(axis=1)
+        result = result.loc[result.index.isin(original_index) | has_coordinates].copy()
     return result

@@ -1145,6 +1145,7 @@ class PipelinePanelMixin:
                         key="clean_repair",
                         label=PIPELINE_STAGE_LABELS["clean_repair"],
                         output_mode="replace",
+                        allow_row_addition=True,
                         transform=partial(
                             build_interpolation_pipeline_dataframe,
                             bodyparts=item.bodyparts,
@@ -1369,7 +1370,7 @@ class PipelinePanelMixin:
             info_text="Select videos that will use the enabled pipeline stages and current tab settings.",
             warning_text=(
                 "Warning:\n"
-                "- The top auto-detected CSV candidate is used for each video.\n"
+                "- The current video's selected CSV is used; other videos use their top auto-detected candidate.\n"
                 "- Regions, masks, circles, and square points are scaled from the current reference video.\n"
                 "- One combined CSV is saved per video. Existing files with the same name are overwritten."
             ),
