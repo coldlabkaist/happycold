@@ -2121,7 +2121,7 @@ class FrameViewer(QWidget):
             return float(self.interpolation_brush_radius), self._effective_interpolation_draw_add_with_modifiers(modifiers)
         if self.mode == "chamber_free":
             return float(self.chamber_brush_radius), self._effective_chamber_draw_add_with_modifiers(modifiers)
-        if self.mode == "occ_free" or (self.mode.startswith("occ_") and self.occ_transform_mode and self._control_pressed(modifiers)):
+        if (self.mode == "occ_free" and not self.occ_transform_mode) or (self.mode.startswith("occ_") and self.occ_transform_mode and self._control_pressed(modifiers)):
             return float(self.occ_brush_radius), self._effective_draw_add_with_modifiers(modifiers)
         return None
 
@@ -3076,7 +3076,11 @@ class FrameViewer(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         preview_dx, preview_dy = self._occ_transform_preview_shift
-        for name, record in self.mask_records.items():
+        records = list(self.mask_records.items())
+        if self.object3d_active:
+            # Keep the active face visible where face outlines overlap.
+            records.sort(key=lambda item: item[0] == self.selected_mask_name)
+        for name, record in records:
             previewing_selected = (
                 self._occ_transform_dragging
                 and name == self.selected_mask_name
@@ -3090,32 +3094,40 @@ class FrameViewer(QWidget):
                     preview_dy * rect.height() / max(1, self._frame_height),
                 )
             selected = name == self.selected_mask_name
+            is_face = self.object3d_active and name.startswith("face:")
+            if is_face:
+                fill_alpha = 40 if selected and self.occ_transform_mode else 0
+            else:
+                fill_alpha = 105 if selected else 55
             fill_path = self._mask_fill_path_cache.get(name)
             if not self._draw_mask_path(
                 painter,
                 fill_path,
                 target_rect,
                 fill_color=record.color,
-                fill_alpha=0 if self.object3d_active and name.startswith("face:") else (105 if selected else 55),
+                fill_alpha=fill_alpha,
             ):
                 fill_pixmap = self._mask_fill_cache.get(name)
                 if fill_pixmap is not None:
                     painter.drawPixmap(target_rect, fill_pixmap, QRectF(fill_pixmap.rect()))
-            if previewing_selected:
+            if previewing_selected and not is_face:
                 continue
+            # Keep the face outline at the preview position independently of
+            # its fill opacity, so outline-only faces remain visible too.
+            outline_rect = target_rect if is_face else rect
             margin_path = self._mask_margin_path_cache.get(name)
             edge_alpha = 220 if selected else 180
             if not self._draw_mask_path(
                 painter,
                 margin_path,
-                rect,
+                outline_rect,
                 outline_color=record.color,
                 outline_alpha=edge_alpha,
                 outline_width=2.0,
             ):
                 margin_pixmap = self._mask_margin_cache.get(name)
                 if margin_pixmap is not None:
-                    painter.drawPixmap(rect, margin_pixmap, QRectF(margin_pixmap.rect()))
+                    painter.drawPixmap(outline_rect, margin_pixmap, QRectF(margin_pixmap.rect()))
         painter.restore()
 
     def _reference_lines_for_display(self):
@@ -4501,6 +4513,7 @@ class MainWindow(
             self.TAB_CHAMBER,
             self.TAB_CIRCLE,
             self.TAB_OCCLUSION,
+            self.TAB_OCCLUSION_3D,
         }:
             self.show_annotate_controls_help()
 
@@ -6404,7 +6417,10 @@ class MainWindow(
         if not isinstance(global_pos, QPoint):
             global_pos = self.frame_viewer.mapToGlobal(self.frame_viewer.rect().center())
 
-        if self.mode_tabs.currentIndex() == self.TAB_OCCLUSION and image_point is not None:
+        select_mask = self.mode_tabs.currentIndex() == self.TAB_OCCLUSION or (
+            self._object3d_active() and self._object3d_edit_target != "line"
+        )
+        if select_mask and image_point is not None:
             mask_name = self.frame_viewer._mask_name_at_point(image_point, margin=8)
             if mask_name is not None:
                 self._on_occ_mask_double_clicked(mask_name)

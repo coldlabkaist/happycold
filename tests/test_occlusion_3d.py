@@ -298,6 +298,144 @@ class ObjectQtTests(unittest.TestCase):
         event = QMouseEvent(kind, position, position, button, buttons, modifiers)
         QApplication.sendEvent(viewer, event)
 
+    def test_drag_preview_shows_current_face_outline_and_commits_once(self):
+        w = self.window
+        w._object3d_object().color = "#ef4444"
+        w._object3d_changed()
+        w.resize(1320, 900)
+        w.show()
+        self.app.processEvents()
+        viewer = w.frame_viewer
+        for face, center_y, zoom in (("top", 50, 1.0), ("bottom", 110, 1.4)):
+            with self.subTest(face=face, zoom=zoom):
+                viewer._apply_zoom(zoom)
+                controls = w.object3d_face_controls[face]
+                controls["transform"].setChecked(True)
+                w._object3d_set_edit_target(face)
+                obj = w._object3d_object()
+                original = getattr(obj, face).mask.copy()
+                other_face = "bottom" if face == "top" else "top"
+                other = getattr(obj, other_face).mask.copy()
+                color = viewer.mask_records[f"face:{face}"].color
+                expected = (color.red(), color.green(), color.blue())
+
+                def edge_distance(image, point):
+                    position = viewer._image_to_widget(point).toPoint()
+                    samples = [image.pixelColor(position.x() + dx, position.y() + dy)
+                               for dx in range(-2, 3) for dy in range(-2, 3)]
+                    return min(sum(abs(a - b) for a, b in zip(c.getRgb()[:3], expected)) for c in samples)
+
+                before = viewer.grab().toImage()
+                destination_edge = (80, center_y + 15)
+                self.assertGreater(edge_distance(before, destination_edge), 150)
+                depth = len(w._object3d_undo)
+                self.mouse(viewer, QEvent.Type.MouseButtonPress, (50, center_y))
+                self.mouse(viewer, QEvent.Type.MouseMove, (90, center_y + 15))
+                preview = viewer.grab().toImage()
+                self.assertLess(edge_distance(preview, destination_edge), 125)
+                # The preview follows the cursor without modifying editable data.
+                np.testing.assert_array_equal(getattr(obj, face).mask, original)
+                np.testing.assert_array_equal(getattr(obj, other_face).mask, other)
+                self.assertEqual(len(w._object3d_undo), depth)
+                self.mouse(viewer, QEvent.Type.MouseButtonRelease, (90, center_y + 15))
+                expected_mask = cv2.warpAffine(original, np.float32([[1, 0, 40], [0, 1, 15]]), (200, 200))
+                np.testing.assert_array_equal(getattr(obj, face).mask, expected_mask)
+                np.testing.assert_array_equal(getattr(obj, other_face).mask, other)
+                self.assertEqual(len(w._object3d_undo), depth + 1)
+                self.assertLess(edge_distance(viewer.grab().toImage(), destination_edge), 125)
+                w.undo_active_mask_edit()
+                np.testing.assert_array_equal(getattr(w._object3d_object(), face).mask, original)
+
+    def test_legacy_occlusion_drag_still_displays_fill_preview(self):
+        from PyQt6.QtGui import QColor
+        from shared import MaskRecord
+        w = self.window
+        w._open_pipeline_settings(w.TAB_OCCLUSION)
+        original = rectangle((200, 200), (40, 40, 60, 60))
+        w.mask_records = {"Legacy": MaskRecord("Legacy", QColor("#06b6d4"), original.copy())}
+        w.selected_mask_name = "Legacy"
+        w._rebuild_mask_list()
+        w.mask_transform_radio.setChecked(True)
+        w.resize(1320, 900)
+        w.show()
+        self.app.processEvents()
+        viewer = w.frame_viewer
+        self.mouse(viewer, QEvent.Type.MouseButtonPress, (50, 50))
+        self.mouse(viewer, QEvent.Type.MouseMove, (90, 65))
+        image = viewer.grab().toImage()
+        pixel = image.pixelColor(viewer._image_to_widget((90, 65)).toPoint())
+        self.assertGreater(pixel.green() - pixel.red(), 40)
+        self.assertGreater(pixel.blue() - pixel.red(), 40)
+        np.testing.assert_array_equal(w.mask_records["Legacy"].mask, original)
+        self.mouse(viewer, QEvent.Type.MouseButtonRelease, (90, 65))
+        self.assertEqual(w.mask_records["Legacy"].mask[65, 90], 1)
+        self.assertEqual(w.mask_records["Legacy"].mask[50, 50], 0)
+
+    def test_brush_cursor_in_transform_only_appears_for_temporary_erasing(self):
+        w = self.window
+        controls = w.object3d_face_controls["top"]
+        controls["tool"].setCurrentIndex(5)
+        viewer = w.frame_viewer
+        self.assertIsNotNone(viewer._brush_cursor_info(Qt.KeyboardModifier.NoModifier))
+        controls["transform"].setChecked(True)
+        self.assertIsNone(viewer._brush_cursor_info(Qt.KeyboardModifier.NoModifier))
+        radius, add = viewer._brush_cursor_info(Qt.KeyboardModifier.ControlModifier)
+        self.assertEqual(radius, controls["brush"].value())
+        self.assertFalse(add)
+
+    def test_right_click_copy_targets_the_face_under_the_cursor(self):
+        w = self.window
+        w._object3d_set_edit_target("bottom")
+        original = w._object3d_object().top.mask.copy()
+        labels = []
+
+        def choose_copy(menu, _point):
+            labels.append(menu.actions()[0].text())
+            menu.actions()[0].trigger()
+
+        with patch.object(main.QMenu, "exec", new=choose_copy):
+            w._show_annotate_mask_context_menu((w.frame_viewer.mapToGlobal(w.frame_viewer.rect().center()), (50, 50)))
+        self.assertEqual(w._object3d_edit_target, "top")
+        self.assertIn("Box top", labels[0])
+        np.testing.assert_array_equal(w._mask_clipboard.mask, original)
+        # Reference editing remains a line operation, with no accidental face selection.
+        w._object3d_set_edit_target("line")
+        with patch.object(main.QMenu, "exec", return_value=None):
+            w._show_annotate_mask_context_menu((w.frame_viewer.mapToGlobal(w.frame_viewer.rect().center()), (50, 110)))
+        self.assertEqual(w._object3d_edit_target, "line")
+
+    def test_folder_import_selects_new_object_for_immediate_editing(self):
+        w = self.window
+        folder = self.root / "import-selection"
+        save_bundle(w.object3d_workspace, folder)
+        previous = w._object3d_selected_id
+        with patch("tab_mixins.occlusion_3d_tab.QFileDialog.getExistingDirectory", return_value=str(folder)):
+            w._object3d_import_folder()
+        self.assertNotEqual(w._object3d_selected_id, previous)
+        self.assertEqual(w._object3d_object().name, "Box imported")
+        self.assertIs(w.frame_viewer.mask_records["face:top"].mask, w._object3d_object().top.mask)
+
+    def test_f1_opens_annotate_help_in_3d_tab(self):
+        with patch.object(self.window, "show_annotate_controls_help") as show:
+            self.window._open_context_help()
+            show.assert_called_once_with()
+
+    def test_shrinking_face_to_no_pixels_keeps_source_and_undo_history(self):
+        w = self.window
+        obj = w._object3d_object()
+        obj.top.mask = rectangle((200, 200), (40, 40, 43, 43))
+        w._object3d_changed()
+        w.object3d_face_controls["top"]["transform"].setChecked(True)
+        original = obj.top.mask.copy()
+        depth = len(w._object3d_undo)
+        w._object3d_affine(scale=0.05)
+        np.testing.assert_array_equal(obj.top.mask, original)
+        self.assertEqual(len(w._object3d_undo), depth)
+        # A rejected shrink must not poison subsequent scale operations.
+        w._object3d_affine(scale=2)
+        self.assertGreater(int(obj.top.mask.sum()), int(original.sum()))
+        self.assertEqual(len(w._object3d_undo), depth + 1)
+
     def test_multiple_objects_export_real_csv_with_existing_column_format(self):
         ws = self.window.object3d_workspace
         obj = copy.deepcopy(ws.objects[0])

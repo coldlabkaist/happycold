@@ -707,15 +707,23 @@ class Occlusion3DTabMixin:
         face = getattr(obj, self._object3d_face)
         if not np.any(face.mask):
             return
-        self._object3d_push_undo()
+        if not np.isfinite(scale) or scale <= 0 or not np.isfinite(angle):
+            return
         source = self._object3d_transform_source
         if source is None:
             source = [MaskTransformSource.from_mask(face.mask), 1.0, 0.0]
-        source[1] = max(0.05, min(20.0, source[1] * scale))
-        source[2] += angle
-        face.mask = source[0].render(source[2], source[1])
+        next_scale = max(0.05, min(20.0, source[1] * scale))
+        next_angle = source[2] + angle
+        if next_scale == source[1] and next_angle == source[2]:
+            return
+        transformed = source[0].render(next_angle, next_scale)
+        if not np.any(transformed):
+            self.statusBar().showMessage("The face must retain at least one pixel. Transform skipped.", 3000)
+            return
+        self._object3d_push_undo()
+        face.mask = transformed
         self._object3d_changed(object_id=obj.id)
-        self._object3d_transform_source = source
+        self._object3d_transform_source = [source[0], next_scale, next_angle]
 
     def _object3d_save_errors(self):
         included = [o for o in self.object3d_workspace.objects if o.included]
@@ -803,6 +811,8 @@ class Occlusion3DTabMixin:
                 obj.name += " imported"
             self.object3d_workspace.objects.append(obj)
         self.object3d_workspace.references.extend(ws.references)
+        if ws.objects:
+            self._object3d_selected_id = ws.objects[-1].id
         self._object3d_changed()
         self._sync_object3d_mode()
         self.statusBar().showMessage("Objects imported. Check their references and the preview before saving.", 6000)

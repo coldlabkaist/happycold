@@ -44,17 +44,19 @@ ANNOTATE_SHORTCUT_HELP_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ..
             ("R  or  ]", "Scale up"),
             ("Ctrl+E  or  Ctrl+[", "Rotate left where supported"),
             ("Ctrl+R  or  Ctrl+]", "Rotate right where supported"),
-            ("Ctrl+drag", "Temporarily erase while free drawing where supported"),
+            ("Ctrl+drag", "Temporarily erase in Brush or Transform mode where supported"),
             ("Shift+rectangle drag", "Constrain the rectangle to a square"),
             ("Ctrl+Z", "Undo the latest mask content edit in the current tab"),
             ("F1", "Open this shortcut guide"),
         ),
     ),
     (
-        "Occlusion only",
+        "Occlusion / 3D Object",
         (
-            ("1 - 9", "Select mask 1 - 9"),
-            ("0", "Select mask 10"),
+            ("1 - 9", "Select mask or object 1 - 9"),
+            ("0", "Select mask or object 10"),
+            ("Double-click", "Select the mask, object, or face under the cursor"),
+            ("Right-click", "Copy or paste the mask or face under the cursor"),
         ),
     ),
 )

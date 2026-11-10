@@ -35,6 +35,8 @@ Open a video folder, select or load a matching CSV, configure the desired tools,
 
 In Annotate > Occlusion (3D Object), select or add an object first, then choose Line, Top, or Bottom below it. Measure references and edit the two faces with physical margins. Top and bottom references are independently selectable using the same compact face controls. References can be reused across faces and objects. The filled convex envelope is saved using the existing occlusion CSV columns and filename rules. Export Masks uses the same output/masks folder as Occlusion. Object folders preserve both editable faces and references; lengths keep their physical size when changing m/cm/mm units. New videos inherit the object layout but require reference measurements; returning to a video restores its session state. 3D object batch export and Multi Pipeline processing are unavailable.
 
+In 3D Transform mode, the active face remains shaded and outlined while dragging. Use D/T to switch modes, E/R to resize, Ctrl+E/R to rotate, and Ctrl+Z to undo. Right-click a face to copy or paste its mask, and press F1 for the shared annotation shortcuts.
+
 Use Square Drag in Chamber/Room, Occlusion, or 3D face tools, or hold Shift while dragging a rectangle. Room masks still respect chamber boundaries and other rooms.
 
 Interpolation uses frame numbers and processes each animal independently. It fills missing coordinates and restores absent rows between a track's first and last frames. Start/end coordinate gaps are filled only when extrapolation is enabled; synthesized rows have no invented confidence scores.
