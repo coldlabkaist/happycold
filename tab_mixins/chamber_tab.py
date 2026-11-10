@@ -145,7 +145,7 @@ class ChamberTabMixin:
         operation_row.addStretch(1)
 
         self.chamber_shape_combo = NoWheelComboBox()
-        self.chamber_shape_combo.addItems(["Rectangle Drag", "Rectangle 4 Points", "Polygon", "Circle Drag", "Brush"])
+        self.chamber_shape_combo.addItems(["Rectangle Drag", "Rectangle 4 Points", "Polygon", "Circle Drag", "Brush", "Square Drag"])
         self.chamber_shape_combo.setMinimumWidth(0)
         self.chamber_shape_combo.setToolTip("Choose the next shape drawn in the viewer.")
         self.chamber_draw_add_radio = QRadioButton("Add")
@@ -526,6 +526,7 @@ class ChamberTabMixin:
             2: "chamber_polygon",
             3: "chamber_circle",
             4: "chamber_free",
+            5: "chamber_rect_drag",
         }
         return mapping.get(self.chamber_shape_combo.currentIndex(), "chamber_rect_drag")
 
@@ -541,6 +542,7 @@ class ChamberTabMixin:
     def _sync_chamber_mode(self) -> None:
         if self.mode_tabs.currentIndex() != self.TAB_CHAMBER:
             return
+        self.frame_viewer.square_drag_enabled = self.chamber_shape_combo.currentIndex() == 5
         self.frame_viewer.clear_chamber_rect_points()
         self.frame_viewer.clear_chamber_circle()
         self.frame_viewer.set_mode(self._selected_chamber_draw_mode())
@@ -708,6 +710,8 @@ class ChamberTabMixin:
                 allowed = shape_bool & chamber_mask.astype(bool)
                 if blocked is not None:
                     allowed &= ~blocked.astype(bool)
+                if refresh and not np.array_equal(allowed, shape_bool):
+                    self.statusBar().showMessage("Shape clipped by the chamber boundary or another room.", 4000)
                 current.mask = merge_mask(current_mask, allowed.astype(np.uint8), add=True)
                 current.geometry = (
                     clone_mask_geometry(geometry)

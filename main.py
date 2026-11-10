@@ -160,11 +160,13 @@ from trajectory import resolve_bodypart_coordinate_columns
 from trajectory_plot import build_trajectory_figure
 from ui_controls import NoWheelComboBox, NoWheelSpinBox
 from ui_theme import build_app_stylesheet
+from mask_tools import constrained_rectangle_points
 from tab_mixins import (
     ChamberTabMixin,
     CircleTabMixin,
     InterpolationTabMixin,
     OcclusionTabMixin,
+    Occlusion3DTabMixin,
     PinTabMixin,
     PipelinePanelMixin,
     SmoothingTabMixin,
@@ -383,6 +385,7 @@ class FrameViewer(QWidget):
     occ_transform_finished = pyqtSignal()
     occ_mask_double_clicked = pyqtSignal(str)
     annotate_context_menu_requested = pyqtSignal(object)
+    reference_line_completed = pyqtSignal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -473,6 +476,14 @@ class FrameViewer(QWidget):
         self._rect_drag_start: tuple[float, float] | None = None
         self._rect_drag_current: tuple[float, float] | None = None
         self._rect_drag_add = True
+        self.square_drag_enabled = False
+        self._rect_drag_square = False
+        self.object3d_active = False
+        self.reference_pick_active = False
+        self.reference_pick_points = []
+        self.reference_lines = []
+        self.reference_selected_id = None
+        self._reference_drag_index = None
         self._polygon_draw_add: bool | None = None
         self._polygon_preview_point: tuple[float, float] | None = None
         self._cursor_image_point: tuple[float, float] | None = None
@@ -764,6 +775,7 @@ class FrameViewer(QWidget):
             self._rect_drag_current = None
             self._polygon_draw_add = None
             self._polygon_preview_point = None
+            self._reference_drag_index = None
         self.mode = mode
         self.update()
 
@@ -1515,24 +1527,35 @@ class FrameViewer(QWidget):
     def _mask_name_at_point(self, point: tuple[float, float], margin: int = 8) -> str | None:
         if not self.mask_records:
             return None
-        best_name: str | None = None
-        best_distance = float("inf")
         ordered_names = list(self.mask_records.keys())
         if self.selected_mask_name in self.mask_records:
             ordered_names = [self.selected_mask_name] + [name for name in ordered_names if name != self.selected_mask_name]
-        for name in ordered_names:
-            record = self.mask_records.get(name)
-            if record is None:
-                continue
-            distance = self._mask_hit_distance(record.mask.astype(np.uint8), point, margin)
-            if distance is None:
-                continue
-            if distance < best_distance:
-                best_distance = distance
-                best_name = name
-                if distance <= 0.0:
-                    break
-        return best_name
+        groups = [ordered_names]
+        if self.object3d_active:
+            # Source faces sit inside the envelope. Test both faces (including
+            # their outline tolerance) first, with the active face breaking ties.
+            groups = [
+                [name for name in ordered_names if name.startswith("face:")],
+                [name for name in ordered_names if not name.startswith("face:")],
+            ]
+        for names in groups:
+            best_name: str | None = None
+            best_distance = float("inf")
+            for name in names:
+                record = self.mask_records.get(name)
+                if record is None:
+                    continue
+                distance = self._mask_hit_distance(record.mask.astype(np.uint8), point, margin)
+                if distance is None:
+                    continue
+                if distance < best_distance:
+                    best_distance = distance
+                    best_name = name
+                    if distance <= 0.0:
+                        break
+            if best_name is not None:
+                return best_name
+        return None
 
     def _set_mask_hover_info(
         self,
@@ -1837,14 +1860,18 @@ class FrameViewer(QWidget):
                     cursor=None,
                 )
 
-        if self.mode.startswith("occ_"):
+        if self.mode.startswith("occ_") or self.object3d_active:
             mask_name = self._mask_name_at_point(image_point, margin=8)
             if mask_name is not None:
                 record = self.mask_records.get(mask_name)
                 if record is not None:
                     geometry = self._cached_hover_geometry(f"occ:{mask_name}", record.geometry, record.mask)
+                    title = f"Mask: {mask_name}"
+                    if self.object3d_active:
+                        prefix = "3D Object" if mask_name.startswith("object:") else "Mask"
+                        title = f"{prefix}: {record.name}"
                     return self._format_geometry_hover(
-                        f"Mask: {mask_name}",
+                        title,
                         geometry,
                         image_point,
                         record.color.name(),
@@ -1960,20 +1987,25 @@ class FrameViewer(QWidget):
         self._rect_drag_start = draw_point
         self._rect_drag_current = draw_point
         self._rect_drag_add = self._active_shape_add_with_modifiers(modifiers)
+        self._rect_drag_square = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
         points = self._shape_points_for_mode()
         if points is not None:
             points[:] = self._axis_aligned_rect_points(draw_point, draw_point)
             self.update()
             self._emit_shape_points_changed()
 
-    def _update_rect_drag(self, point: tuple[float, float]) -> bool:
+    def _update_rect_drag(self, point: tuple[float, float], modifiers=None) -> bool:
         if self._rect_drag_mode != self.mode or self._rect_drag_start is None:
             return False
         draw_point = self._snapped_drawing_point(point)
+        if modifiers is not None:
+            self._rect_drag_square = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
         self._rect_drag_current = draw_point
         points = self._shape_points_for_mode(self._rect_drag_mode)
         if points is not None:
-            points[:] = self._axis_aligned_rect_points(self._rect_drag_start, draw_point)
+            points[:] = constrained_rectangle_points(self._rect_drag_start, draw_point,
+                square=self.square_drag_enabled or self._rect_drag_square,
+                bounds=(self._frame_width, self._frame_height))
             self.update()
             self._emit_shape_points_changed(self._rect_drag_mode)
         return True
@@ -1991,13 +2023,33 @@ class FrameViewer(QWidget):
         if end_point is None:
             self._clear_active_shape_points(mode)
             return True
-        points = self._axis_aligned_rect_points(start_point, self._snapped_drawing_point(end_point))
+        points = constrained_rectangle_points(start_point, self._snapped_drawing_point(end_point),
+            square=self.square_drag_enabled or self._rect_drag_square,
+            bounds=(self._frame_width, self._frame_height))
         width = abs(points[1][0] - points[0][0])
         height = abs(points[2][1] - points[1][1])
         self._clear_active_shape_points(mode)
         if width >= 1.0 and height >= 1.0:
             self._emit_shape_completed(mode, points, add, "rectangle_drag")
         return True
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Shift and self._rect_drag_mode is not None:
+            self._rect_drag_square = True
+            if self._rect_drag_current is not None:
+                self._update_rect_drag(self._rect_drag_current)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Shift and self._rect_drag_mode is not None:
+            self._rect_drag_square = False
+            if self._rect_drag_current is not None:
+                self._update_rect_drag(self._rect_drag_current)
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
 
     def _clear_active_shape_points(self, mode: str | None = None) -> None:
         mode = self.mode if mode is None else mode
@@ -2185,6 +2237,16 @@ class FrameViewer(QWidget):
             return
         self._set_mask_hover_info(None, event.position())
 
+        if self.mode == "reference_line" and self.reference_pick_active:
+            hit = self._point_hit_index(event.position(), self.reference_pick_points)
+            if hit is not None:
+                self._reference_drag_index = hit
+            elif len(self.reference_pick_points) < 2:
+                self.reference_pick_points.append(image_point)
+                if len(self.reference_pick_points) == 2:
+                    self.reference_line_completed.emit(list(self.reference_pick_points))
+            self.update()
+            return
         if self.mode == "trajectory_region":
             draw_point = self._snapped_drawing_point(image_point)
             if len(self.trajectory_region_points) >= 4:
@@ -2399,6 +2461,19 @@ class FrameViewer(QWidget):
             return
         self._set_brush_cursor_position(image_point, event.modifiers())
 
+        if self.mode == "reference_line" and self.reference_pick_active:
+            if self._reference_drag_index is not None:
+                if event.buttons() & Qt.MouseButton.LeftButton:
+                    self.reference_pick_points[self._reference_drag_index] = image_point
+                else:
+                    self._reference_drag_index = None
+                self.update()
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                self._set_mask_hover_info(None, event.position())
+            else:
+                self._update_mask_hover(event.position(), image_point)
+            return
+
         if (
             self.mode.startswith("interp_")
             and self.interpolation_transform_mode
@@ -2406,7 +2481,7 @@ class FrameViewer(QWidget):
         ):
             self._update_interpolation_transform_preview(image_point)
         elif self._rect_drag_mode == self.mode and self._rect_drag_start is not None:
-            self._update_rect_drag(image_point)
+            self._update_rect_drag(image_point, event.modifiers())
         elif self.mode == "interp_circle" and self._interpolation_circle_dragging:
             self._interpolation_circle_current = image_point
             self.update()
@@ -2501,7 +2576,15 @@ class FrameViewer(QWidget):
             return
 
         image_point = self._widget_to_image(event.position())
+        if self.mode == "reference_line" and event.button() == Qt.MouseButton.LeftButton:
+            if self._reference_drag_index is not None and image_point is not None:
+                self.reference_pick_points[self._reference_drag_index] = image_point
+                self.reference_line_completed.emit(list(self.reference_pick_points))
+            self._reference_drag_index = None
+            self.update()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._rect_drag_mode == self.mode:
+            self._rect_drag_square = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
             if self._finish_rect_drag(image_point):
                 return
         if (
@@ -2702,6 +2785,7 @@ class FrameViewer(QWidget):
         self._draw_trajectory_region_overlay(painter)
         self._draw_circle_overlay(painter)
         self._draw_occ_shape_overlay(painter)
+        self._draw_reference_lines(painter)
         self._draw_node_overlay(painter)
         self._draw_brush_cursor_overlay(painter)
         self._draw_mask_hover_overlay(painter)
@@ -2981,7 +3065,7 @@ class FrameViewer(QWidget):
         painter.restore()
 
     def _draw_mask_overlays(self, painter: QPainter) -> None:
-        if not self.mask_records or not self.mode.startswith("occ_"):
+        if not self.mask_records or not (self.mode.startswith("occ_") or self.object3d_active):
             return
         painter.save()
         rect = self._image_rect()
@@ -3012,7 +3096,7 @@ class FrameViewer(QWidget):
                 fill_path,
                 target_rect,
                 fill_color=record.color,
-                fill_alpha=105 if selected else 55,
+                fill_alpha=0 if self.object3d_active and name.startswith("face:") else (105 if selected else 55),
             ):
                 fill_pixmap = self._mask_fill_cache.get(name)
                 if fill_pixmap is not None:
@@ -3032,6 +3116,81 @@ class FrameViewer(QWidget):
                 margin_pixmap = self._mask_margin_cache.get(name)
                 if margin_pixmap is not None:
                     painter.drawPixmap(rect, margin_pixmap, QRectF(margin_pixmap.rect()))
+        painter.restore()
+
+    def _reference_lines_for_display(self):
+        """Replace the selected stored line with its draft instead of drawing both."""
+        lines = []
+        for reference_id, name, points in self.reference_lines:
+            active = self.reference_pick_active and reference_id == self.reference_selected_id
+            lines.append((name, list(self.reference_pick_points if active else points), active))
+        return lines
+
+    @staticmethod
+    def _reference_label_rect(anchor, width, height, bounds, occupied):
+        """Keep reference name badges inside the viewer and apart from one another."""
+        available = bounds.adjusted(6, 6, -6, -6)
+        if width > available.width() or height > available.height():
+            return None
+        x = max(available.left(), min(anchor.x() + 8, available.right() - width))
+        step = height + 4
+        rows = int(available.height() / step) + 2
+        candidates = [anchor.y() - height - 8, anchor.y() + 8]
+        for index in range(1, rows):
+            candidates.extend((anchor.y() - height - 8 - index * step, anchor.y() + 8 + index * step))
+        for y in candidates:
+            y = max(available.top(), min(y, available.bottom() - height))
+            candidate = QRectF(x, y, width, height)
+            if not any(candidate.adjusted(-2, -2, 2, 2).intersects(other) for other in occupied):
+                return candidate
+        # Very dense reference layouts can leave no room beside the anchor.
+        for index in range(rows):
+            candidate = QRectF(x, available.top() + index * step, width, height)
+            if available.contains(candidate) and not any(candidate.adjusted(-2, -2, 2, 2).intersects(other) for other in occupied):
+                return candidate
+        return None
+
+    def _draw_reference_lines(self, painter):
+        if not self.object3d_active:
+            return
+        rect = self._image_rect()
+        if rect is None:
+            return
+        visible = rect.intersected(QRectF(self.rect()))
+        painter.save()
+        painter.setClipRect(visible)
+        rows = []
+        for name, points, active in self._reference_lines_for_display():
+            mapped = [self._image_to_widget(p) for p in points]
+            rows.append((name, [p for p in mapped if p is not None], active))
+        # Draw the active line last so crossing or coincident lines cannot hide it.
+        for name, mapped, active in sorted(rows, key=lambda row: row[2]):
+            color = QColor("#60a5fa" if active else "#f8fafc")
+            painter.setPen(QPen(color, 2.5 if active else 1.5, Qt.PenStyle.DashLine))
+            if len(mapped) == 2:
+                painter.drawLine(*mapped)
+            for point in mapped:
+                painter.setBrush(color)
+                painter.drawEllipse(point, 5 if active else 4, 5 if active else 4)
+        occupied = []
+        metrics = painter.fontMetrics()
+        # Paint name badges above all lines; prioritize space for the active name.
+        for name, mapped, active in sorted(rows, key=lambda row: not row[2]):
+            if not mapped:
+                continue
+            text = metrics.elidedText(name, Qt.TextElideMode.ElideRight, max(0, int(visible.width()) - 24))
+            if not text:
+                continue
+            label = self._reference_label_rect(mapped[0], metrics.horizontalAdvance(text) + 12,
+                                                metrics.height() + 6, visible, occupied)
+            if label is None:
+                continue
+            occupied.append(label)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(20, 39, 62, 230) if active else QColor(17, 24, 39, 220))
+            painter.drawRoundedRect(label, 4, 4)
+            painter.setPen(QColor("#60a5fa" if active else "#f8fafc"))
+            painter.drawText(label.adjusted(6, 3, -6, -3), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
         painter.restore()
 
     def _draw_pin_overlays(self, painter: QPainter) -> None:
@@ -3136,7 +3295,7 @@ class FrameViewer(QWidget):
         painter.save()
         selected = self.mask_records.get(self.selected_mask_name) if self.selected_mask_name is not None else None
         selected_color = selected.color if selected is not None else QColor("#0891b2")
-        if self.occ_margin_points:
+        if self.occ_margin_points and not self.object3d_active:
             widget_points = [self._image_to_widget(point) for point in self.occ_margin_points]
             widget_points = [point for point in widget_points if point is not None]
             if len(widget_points) >= 3:
@@ -3183,6 +3342,7 @@ class MainWindow(
     CircleTabMixin,
     PinTabMixin,
     OcclusionTabMixin,
+    Occlusion3DTabMixin,
     PipelinePanelMixin,
     QMainWindow,
 ):
@@ -3196,6 +3356,7 @@ class MainWindow(
     TAB_TRAJECTORY = 7
     TAB_PIN = 8
     TAB_PIPELINE = 9
+    TAB_OCCLUSION_3D = 10
     CATEGORY_PREPARE = 0
     CATEGORY_ANNOTATE = 1
     CATEGORY_INSPECT = 2
@@ -3204,7 +3365,7 @@ class MainWindow(
     FILE_SIDEBAR_DEFAULT_WIDTH = 230
     FILE_SIDEBAR_MIN_RESTORE_WIDTH = 160
     FILE_SIDEBAR_MAX_WIDTH = 360
-    TAB_VISIBILITY_SCHEMA_VERSION = 3
+    TAB_VISIBILITY_SCHEMA_VERSION = 4
     PERSISTENT_SPINBOX_SETTINGS_KEY = "spinbox_values"
     PERSISTENT_SPINBOX_NAMES = (
         "tracking_duplicate_criteria_spinbox",
@@ -3570,6 +3731,7 @@ class MainWindow(
         self.chamber_tab = self._build_chamber_tab()
         self.circle_tab = self._build_circle_tab()
         self.occlusion_tab = self._build_occlusion_tab()
+        self.occlusion_3d_tab = self._build_occlusion_3d_tab()
         self.trajectory_tab = self._build_trajectory_tab()
         self.pin_tab = self._build_pin_tab()
         self.pipeline_tab = self._build_pipeline_tab()
@@ -3583,6 +3745,7 @@ class MainWindow(
         self.mode_tabs.addTab(self.trajectory_tab, "Visualize")
         self.mode_tabs.addTab(self.pin_tab, "Pin Coordinates")
         self.mode_tabs.addTab(self.pipeline_tab, "Multi Pipeline")
+        self.mode_tabs.addTab(self.occlusion_3d_tab, "Occlusion (3D Object)")
         self.mode_tabs.setTabToolTip(
             self.TAB_TRACKING_REPAIR,
             "Remove duplicate skeletons first, then robust Z-score length outliers.",
@@ -3847,6 +4010,7 @@ class MainWindow(
             (self.TAB_CHAMBER, "chamber", "Chamber"),
             (self.TAB_CIRCLE, "circle", "Circle"),
             (self.TAB_OCCLUSION, "occlusion", "Occlusion"),
+            (self.TAB_OCCLUSION_3D, "occlusion_3d", "Occlusion (3D Object)"),
             (self.TAB_TRAJECTORY, "trajectory", "Visualize"),
             (self.TAB_PIN, "pin", "Pin Coordinates"),
             (self.TAB_PIPELINE, "pipeline", "Multi Pipeline"),
@@ -3860,7 +4024,7 @@ class MainWindow(
             self.TAB_SQUARE,
         }:
             return self.CATEGORY_PREPARE
-        if tab_index in {self.TAB_CHAMBER, self.TAB_CIRCLE, self.TAB_OCCLUSION}:
+        if tab_index in {self.TAB_CHAMBER, self.TAB_CIRCLE, self.TAB_OCCLUSION, self.TAB_OCCLUSION_3D}:
             return self.CATEGORY_ANNOTATE
         if tab_index == self.TAB_PIPELINE:
             return self.CATEGORY_PIPELINE
@@ -4002,6 +4166,8 @@ class MainWindow(
         except (TypeError, ValueError):
             visibility_schema_version = 1
         if visibility_schema_version < self.TAB_VISIBILITY_SCHEMA_VERSION:
+            visible_keys.add("occlusion_3d")
+        if visibility_schema_version < 3:
             visible_keys.add("trajectory")
             visible_keys.add("smoothing")
         if not visible_keys:
@@ -4248,18 +4414,19 @@ class MainWindow(
             self._show_annotate_mask_context_menu
         )
         self.frame_viewer.pin_added.connect(self.add_pin)
-        self.frame_viewer.occ_rect_completed.connect(self.apply_occ_rect_mask)
+        self.frame_viewer.occ_rect_completed.connect(lambda payload: self._dispatch_occlusion_edit("apply_occ_rect_mask", payload))
         self.frame_viewer.occ_rect_points_changed.connect(self._refresh_mask_draft_ui)
-        self.frame_viewer.occ_circle_completed.connect(self.apply_occ_circle_mask)
+        self.frame_viewer.occ_circle_completed.connect(lambda payload: self._dispatch_occlusion_edit("apply_occ_circle_mask", payload))
         self.frame_viewer.occ_circle_changed.connect(self._refresh_mask_draft_ui)
         self.frame_viewer.occ_margin_points_changed.connect(self._on_occ_margin_points_changed)
-        self.frame_viewer.free_draw_segment.connect(self.apply_occ_free_segment)
-        self.frame_viewer.free_draw_finished.connect(self._finalize_mask_draw)
-        self.frame_viewer.occ_transform_requested.connect(self.translate_selected_mask)
-        self.frame_viewer.occ_scale_requested.connect(self.scale_selected_mask)
-        self.frame_viewer.occ_transform_erase_requested.connect(self.erase_occ_transform_point)
-        self.frame_viewer.occ_transform_erase_segment_requested.connect(self.erase_occ_transform_segment)
-        self.frame_viewer.occ_transform_finished.connect(self._finalize_occ_transform)
+        self.frame_viewer.free_draw_segment.connect(lambda payload: self._dispatch_occlusion_edit("apply_occ_free_segment", payload))
+        self.frame_viewer.free_draw_finished.connect(lambda: self._dispatch_occlusion_edit("_finalize_mask_draw"))
+        self.frame_viewer.occ_transform_requested.connect(lambda payload: self._dispatch_occlusion_edit("translate_selected_mask", payload))
+        self.frame_viewer.occ_scale_requested.connect(lambda scale: self._object3d_affine(scale=scale) if self._object3d_active() else self.scale_selected_mask(scale))
+        self.frame_viewer.occ_transform_erase_requested.connect(lambda point: self._dispatch_occlusion_edit("erase_occ_transform_point", point))
+        self.frame_viewer.occ_transform_erase_segment_requested.connect(lambda payload: self._dispatch_occlusion_edit("erase_occ_transform_segment", payload))
+        self.frame_viewer.occ_transform_finished.connect(lambda: self._dispatch_occlusion_edit("_finalize_occ_transform"))
+        self.frame_viewer.reference_line_completed.connect(self._object3d_reference_line)
         self.frame_viewer.occ_mask_double_clicked.connect(self._on_occ_mask_double_clicked)
         self._connect_persistent_spinbox_settings()
 
@@ -4274,7 +4441,11 @@ class MainWindow(
 
     def _switch_region_edit_mode_shortcut(self, transform_mode: bool) -> None:
         current_tab = self.mode_tabs.currentIndex()
-        if current_tab == self.TAB_INTERPOLATION:
+        if current_tab == self.TAB_OCCLUSION_3D:
+            if self._object3d_edit_target == "line":
+                return
+            self.object3d_face_controls[self._object3d_face]["transform" if transform_mode else "draw"].setChecked(True)
+        elif current_tab == self.TAB_INTERPOLATION:
             if transform_mode and self._has_interpolation_region():
                 self.interpolation_region_transform_radio.setChecked(True)
             elif not transform_mode:
@@ -4299,6 +4470,10 @@ class MainWindow(
             self.mask_draw_radio.setChecked(True)
 
     def _select_mask_by_slot(self, slot_index: int) -> None:
+        if self._object3d_active():
+            if 0 <= slot_index < self.object3d_combo.count():
+                self.object3d_combo.setCurrentIndex(slot_index)
+            return
         if self.mode_tabs.currentIndex() != self.TAB_OCCLUSION:
             return
         if slot_index < 0 or slot_index >= min(10, self.mask_combo.count()):
@@ -4306,6 +4481,14 @@ class MainWindow(
         self.mask_combo.setCurrentIndex(slot_index)
 
     def _on_occ_mask_double_clicked(self, name: str) -> None:
+        if self._object3d_active():
+            if name.startswith("face:"):
+                self._object3d_activate_face(name.split(":", 1)[1])
+            elif name.startswith("object:"):
+                index = self.object3d_combo.findData(name.split(":", 1)[1])
+                if index >= 0:
+                    self.object3d_combo.setCurrentIndex(index)
+            return
         if not name:
             return
         index = self.mask_combo.findData(name)
@@ -4589,12 +4772,13 @@ class MainWindow(
         return width, height
 
     def _batch_job_is_running(self) -> bool:
-        active_thread = getattr(self, "_active_batch_thread", None)
-        return active_thread is not None and active_thread.isRunning()
+        # Keep the job busy until the queued GUI cleanup has released its state.
+        return getattr(self, "_active_batch_thread", None) is not None
 
     def _single_save_job_is_running(self) -> bool:
-        active_thread = getattr(self, "_active_single_save_thread", None)
-        return active_thread is not None and active_thread.isRunning()
+        # A stopped thread can still have its finished signal queued. Starting
+        # another save first would let that signal clear the new worker's state.
+        return getattr(self, "_active_single_save_thread", None) is not None
 
     def _save_job_is_running(self) -> bool:
         return self._single_save_job_is_running() or self._batch_job_is_running()
@@ -4925,6 +5109,10 @@ class MainWindow(
         if self._focus_active_save_progress():
             return
         mode_index = self.mode_tabs.currentIndex()
+        if mode_index == self.TAB_OCCLUSION_3D:
+            QMessageBox.information(self, "3D Object Batch Unavailable",
+                "3D objects require references measured for each video. Open each video and use Save CSV.")
+            return
         supported_modes = {
             self.TAB_TRACKING_REPAIR,
             self.TAB_INTERPOLATION,
@@ -5225,6 +5413,7 @@ class MainWindow(
         current_index = self.mode_tabs.currentIndex() if hasattr(self, "mode_tabs") else 0
         self._set_output_workspace_mode(current_index)
         self.save_current_button.setText("Save CSV")
+        self.save_current_button.setToolTip("Save the current mode's CSV.")
         if hasattr(self, "save_multiple_button"):
             self.save_multiple_button.setText("Save Multiple CSVs")
 
@@ -5291,6 +5480,11 @@ class MainWindow(
                 and self.frame_viewer.circle_geometry() is not None
                 and bool(self.bodyparts)
             )
+        elif current_index == self.TAB_OCCLUSION_3D:
+            output = self._occlusion_output_path()
+            ready = self._object3d_refresh_readiness()
+            self.save_current_button.setEnabled(output is not None and ready)
+            self.save_current_button.setToolTip(self.object3d_summary.toolTip())
         elif current_index in {self.TAB_TRAJECTORY, self.TAB_PIN, self.TAB_PIPELINE}:
             output = None
             self.save_current_button.setEnabled(False)
@@ -5308,12 +5502,14 @@ class MainWindow(
                 and geometric_ready
             )
 
-        batch_enabled = self.save_current_button.isEnabled()
+        batch_enabled = self.save_current_button.isEnabled() and current_index != self.TAB_OCCLUSION_3D
         self.current_output_label.setText(str(output) if output is not None else "-")
         self.current_output_label.setToolTip(str(output) if output is not None else "")
         if hasattr(self, "save_multiple_button"):
             self.save_multiple_button.setEnabled(batch_enabled)
-            if current_index in {self.TAB_TRAJECTORY, self.TAB_PIN}:
+            if current_index == self.TAB_OCCLUSION_3D:
+                self.save_multiple_button.setToolTip("Unavailable for 3D objects. Measure references and save each video separately.")
+            elif current_index in {self.TAB_TRAJECTORY, self.TAB_PIN}:
                 self.save_multiple_button.setToolTip(
                     "CSV saving is not available in Inspect tabs."
                 )
@@ -5475,6 +5671,7 @@ class MainWindow(
             width=max(1, int(round(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))),
             height=max(1, int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))),
         )
+        self._object3d_video_changed(video_path, self.video_state.width, self.video_state.height)
         self._loading_slider = True
         self.frame_slider.setEnabled(True)
         self.frame_slider.setRange(1, self.video_state.frame_count)
@@ -5591,7 +5788,10 @@ class MainWindow(
         self._refresh_chamber_viewer(refresh=False)
         self.frame_viewer.set_interpolation_mask(self.interpolation_mask)
         self.frame_viewer.set_pin_records(self.pins)
-        self.frame_viewer.set_mask_records(self.mask_records, self.selected_mask_name)
+        if self._object3d_active():
+            self._object3d_refresh_viewer(refresh=False)
+        else:
+            self.frame_viewer.set_mask_records(self.mask_records, self.selected_mask_name)
         self._refresh_node_overlay()
         self._refresh_view_ui()
         self._refresh_chamber_ui()
@@ -5935,9 +6135,17 @@ class MainWindow(
         self.zoom_label.setText(f"{int(round(self.frame_viewer.zoom_factor * 100))}%")
 
     def _on_mode_changed(self, index: int) -> None:
+        self.frame_viewer.object3d_active = index == self.TAB_OCCLUSION_3D
+        self.frame_viewer.reference_pick_active = False
+        self.frame_viewer.square_drag_enabled = False
+        if index != self.TAB_OCCLUSION_3D:
+            self.frame_viewer.set_mask_records(self.mask_records, self.selected_mask_name, refresh=True)
         self._remember_mode_tab_by_workflow(index)
         self._sync_current_output_default_suffix(index)
-        if index == self.TAB_TRACKING_REPAIR:
+        if index == self.TAB_OCCLUSION_3D:
+            self._object3d_refresh()
+            self._sync_object3d_mode()
+        elif index == self.TAB_TRACKING_REPAIR:
             self.frame_viewer.set_mode("inspect")
             self.frame_viewer.set_margin_value(0.0)
             self._refresh_tracking_repair_ui()
@@ -6144,6 +6352,9 @@ class MainWindow(
         self._refresh_mask_ui()
 
     def undo_active_mask_edit(self) -> None:
+        if self._object3d_active():
+            self._object3d_undo_edit()
+            return
         tab_key = self._active_mask_undo_key()
         if tab_key is None:
             self.statusBar().showMessage("Undo is available in Interpolation, Chamber, Circle, and Occlusion tabs.", 3000)
@@ -6181,6 +6392,7 @@ class MainWindow(
             self.TAB_CHAMBER,
             self.TAB_CIRCLE,
             self.TAB_OCCLUSION,
+            self.TAB_OCCLUSION_3D,
         }:
             return
         global_pos = None
@@ -6215,6 +6427,15 @@ class MainWindow(
         if self.video_state is None:
             return None
         tab_index = self.mode_tabs.currentIndex()
+        if tab_index == self.TAB_OCCLUSION_3D:
+            obj = self._object3d_object()
+            if obj is None or self._object3d_edit_target == "line":
+                return None
+            face = getattr(obj, self._object3d_face)
+            if not np.any(face.mask):
+                return None
+            return MaskClipboardItem(label=f"{obj.name} {self._object3d_face}",
+                                     source="Occlusion 3D", mask=face.mask.copy())
         if tab_index == self.TAB_CHAMBER:
             if self.chamber_edit_chamber_radio.isChecked():
                 chamber_mask = self._current_chamber_mask()
@@ -6350,6 +6571,10 @@ class MainWindow(
         if self.video_state is None:
             return "Paste Mask (load a video first)", False
         tab_index = self.mode_tabs.currentIndex()
+        if tab_index == self.TAB_OCCLUSION_3D:
+            if self._object3d_edit_target == "line":
+                return "Paste Mask (choose Top or Bottom first)", False
+            return f"Paste Mask to {self._object3d_face.title()} Face", self._object3d_object() is not None
         if tab_index == self.TAB_CIRCLE:
             if self._scaled_clipboard_circle_geometry() is not None:
                 return f"Paste Mask to Circle: {self._mask_clipboard.label}", True
@@ -6372,7 +6597,14 @@ class MainWindow(
             QMessageBox.information(self, "Paste Mask", "Load a video first.")
             return
         tab_index = self.mode_tabs.currentIndex()
-        if tab_index == self.TAB_CHAMBER:
+        if tab_index == self.TAB_OCCLUSION_3D:
+            obj = self._object3d_object()
+            mask = self._mask_clipboard_for_current_video()
+            if obj is not None and mask is not None and self._object3d_edit_target != "line":
+                self._object3d_push_undo()
+                getattr(obj, self._object3d_face).mask = mask.copy()
+                self._object3d_changed()
+        elif tab_index == self.TAB_CHAMBER:
             self._paste_mask_to_chamber()
         elif tab_index == self.TAB_CIRCLE:
             self._paste_mask_to_circle()
@@ -6693,7 +6925,9 @@ class MainWindow(
         )
 
     def _scale_active_region_shortcut(self, scale_factor: float) -> None:
-        if self._interpolation_transform_shortcuts_enabled():
+        if self._object3d_active():
+            self._object3d_affine(scale=scale_factor)
+        elif self._interpolation_transform_shortcuts_enabled():
             self.scale_interpolation_region(scale_factor)
         elif self._chamber_transform_shortcuts_enabled():
             self.scale_selected_chamber_layer(scale_factor)
@@ -6703,7 +6937,9 @@ class MainWindow(
             self._scale_selected_mask_shortcut(scale_factor)
 
     def _rotate_active_region_shortcut(self, angle_degrees: float) -> None:
-        if self._interpolation_transform_shortcuts_enabled():
+        if self._object3d_active():
+            self._object3d_affine(angle=angle_degrees)
+        elif self._interpolation_transform_shortcuts_enabled():
             self.rotate_interpolation_region(angle_degrees)
         elif self._chamber_transform_shortcuts_enabled():
             self.rotate_selected_chamber_layer(angle_degrees)
@@ -6736,6 +6972,8 @@ class MainWindow(
 
     def _current_mode_save_task(self):
         index = self.mode_tabs.currentIndex()
+        if index == self.TAB_OCCLUSION_3D:
+            return self._object3d_save_task()
         if index == self.TAB_TRACKING_REPAIR:
             if self.csv_df is None or self.video_state is None:
                 QMessageBox.warning(self, "Tracking Repair", "Load a video and CSV first.")

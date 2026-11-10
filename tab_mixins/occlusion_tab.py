@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from mask_io import read_mask_png, write_mask_png
 from mask_tools import build_circle_mask, build_polygon_mask, merge_mask, paint_brush_segment, parse_draw_shape_payload
 from shared import (
     MASK_PALETTE,
@@ -103,7 +104,7 @@ class OcclusionTabMixin:
 
         self.mask_shape_combo = NoWheelComboBox()
         self.mask_shape_combo.addItems(
-            ["Rectangle Drag", "Rectangle 4 Points", "Polygon", "Circle Drag", "Brush"]
+            ["Rectangle Drag", "Rectangle 4 Points", "Polygon", "Circle Drag", "Brush", "Square Drag"]
         )
         self.mask_shape_combo.setMinimumWidth(0)
         self.mask_shape_combo.setToolTip("Choose how mask pixels are drawn in the viewer.")
@@ -318,10 +319,12 @@ class OcclusionTabMixin:
             2: "occ_polygon",
             3: "occ_circle",
             4: "occ_free",
+            5: "occ_rect_drag",
         }
         self.frame_viewer.clear_occ_rect_points()
         self.frame_viewer.clear_occ_circle()
         self.frame_viewer.set_mode(mapping.get(self.mask_shape_combo.currentIndex(), "occ_rect_drag"))
+        self.frame_viewer.square_drag_enabled = self.mask_shape_combo.currentIndex() == 5
         self.frame_viewer.set_margin_value(float(self.mask_margin_slider.value()))
         self.frame_viewer.set_occ_transform_mode(self.mask_transform_radio.isChecked())
         if not self.mask_margin_geometric_radio.isChecked():
@@ -771,7 +774,7 @@ class OcclusionTabMixin:
     def _import_mask_file(self, path: Path, metadata: dict | None = None) -> None:
         if self.video_state is None:
             return
-        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        img = read_mask_png(path)
         if img is None:
             return
         original_height, original_width = img.shape[:2]
@@ -795,7 +798,8 @@ class OcclusionTabMixin:
         scale_y = self.video_state.height / source_height
         if img.shape != (self.video_state.height, self.video_state.width):
             img = cv2.resize(img, (self.video_state.width, self.video_state.height), interpolation=cv2.INTER_NEAREST)
-        name = self._next_available_mask_name(path.stem)
+        imported_name = metadata.get("name")
+        name = self._next_available_mask_name(imported_name if isinstance(imported_name, str) and imported_name.strip() else path.stem)
         try:
             margin = int(metadata.get("margin", 0))
         except (TypeError, ValueError):
@@ -833,7 +837,7 @@ class OcclusionTabMixin:
         }
         for name, record in self.mask_records.items():
             img = record.mask.astype(np.uint8) * 255
-            ok = cv2.imwrite(str(folder / f"{name}.png"), img)
+            ok = write_mask_png(folder / f"{name}.png", img)
             if not ok:
                 QMessageBox.warning(self, "Export Masks", f"Could not write mask image:\n{folder / f'{name}.png'}")
                 return

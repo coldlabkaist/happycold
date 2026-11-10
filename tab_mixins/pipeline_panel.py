@@ -533,6 +533,17 @@ class PipelinePanelMixin:
                 )
                 self.pipeline_stage_cards[key] = card
                 phase_layout.addWidget(card)
+            if phase_title == "Analysis Columns":
+                placeholder = QFrame()
+                placeholder.setObjectName("pipelineStageCard")
+                placeholder_layout = QVBoxLayout(placeholder)
+                unavailable = QCheckBox("Occlusion (3D Object) — Unavailable")
+                unavailable.setEnabled(False)
+                placeholder_layout.addWidget(unavailable)
+                explanation = QLabel("3D objects are not supported in Multi Pipeline. Measure references and save each video in the 3D Object tab.")
+                explanation.setWordWrap(True)
+                placeholder_layout.addWidget(explanation)
+                phase_layout.addWidget(placeholder)
             scroll_layout.addWidget(phase_group)
         self._refresh_pipeline_repair_order_buttons()
         scroll_layout.addStretch(1)
@@ -669,7 +680,7 @@ class PipelinePanelMixin:
         self._current_output_auto_suffix = None
 
     def _default_current_output_suffix_for_tab(self, tab_index: int) -> str:
-        if tab_index in {self.TAB_CHAMBER, self.TAB_CIRCLE, self.TAB_OCCLUSION}:
+        if tab_index in {self.TAB_CHAMBER, self.TAB_CIRCLE, self.TAB_OCCLUSION, self.TAB_OCCLUSION_3D}:
             return "annotated"
         return ""
 

@@ -45,6 +45,7 @@ ANNOTATE_SHORTCUT_HELP_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ..
             ("Ctrl+E  or  Ctrl+[", "Rotate left where supported"),
             ("Ctrl+R  or  Ctrl+]", "Rotate right where supported"),
             ("Ctrl+drag", "Temporarily erase while free drawing where supported"),
+            ("Shift+rectangle drag", "Constrain the rectangle to a square"),
             ("Ctrl+Z", "Undo the latest mask content edit in the current tab"),
             ("F1", "Open this shortcut guide"),
         ),

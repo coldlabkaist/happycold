@@ -8,7 +8,8 @@ __pycache__/
 .ruff_cache/
 .pycache_tmp/
 _codex_*
-tests/
+tests/*
+!tests/test_occlusion_3d.py
 
 # Virtual environments
 .venv/

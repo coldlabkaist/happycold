@@ -95,3 +95,23 @@ def paint_brush_segment(
     add: bool,
 ) -> None:
     paint_brush(target_mask, start, end, max(1, int(radius)), 1 if add else 0)
+
+
+def constrained_rectangle_points(start, end, *, square=False, bounds=None):
+    """Image-space corners shared by drag preview and commit."""
+    x, y = map(float, start)
+    dx, dy = float(end[0]) - x, float(end[1]) - y
+    if square:
+        side = max(abs(dx), abs(dy))
+        sx, sy = (-1 if dx < 0 else 1), (-1 if dy < 0 else 1)
+        if bounds:
+            width, height = bounds
+            side = max(0.0, min(side, x if sx < 0 else width - 1 - x,
+                                y if sy < 0 else height - 1 - y))
+        dx, dy = sx * side, sy * side
+    elif bounds:
+        dx = max(0, min(bounds[0] - 1, x + dx)) - x
+        dy = max(0, min(bounds[1] - 1, y + dy)) - y
+    left, right = sorted((x, x + dx))
+    top, bottom = sorted((y, y + dy))
+    return [(left, top), (right, top), (right, bottom), (left, bottom)]
