@@ -10,6 +10,7 @@ __pycache__/
 _codex_*
 tests/*
 !tests/test_occlusion_3d.py
+!tests/test_direction.py
 
 # Virtual environments
 .venv/

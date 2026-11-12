@@ -162,6 +162,7 @@ from ui_controls import NoWheelComboBox, NoWheelSpinBox
 from ui_theme import build_app_stylesheet
 from mask_tools import constrained_rectangle_points
 from tab_mixins import (
+    DirectionTabMixin,
     ChamberTabMixin,
     CircleTabMixin,
     InterpolationTabMixin,
@@ -386,6 +387,7 @@ class FrameViewer(QWidget):
     occ_mask_double_clicked = pyqtSignal(str)
     annotate_context_menu_requested = pyqtSignal(object)
     reference_line_completed = pyqtSignal(object)
+    direction_quad_completed = pyqtSignal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -479,6 +481,13 @@ class FrameViewer(QWidget):
         self.square_drag_enabled = False
         self._rect_drag_square = False
         self.object3d_active = False
+        self.direction_active = False
+        self.direction_preview = None
+        self.direction_distance_point = None
+        self.direction_range_overlay = None
+        self.direction_show_calibration = False
+        self.direction_quad_points = []
+        self._direction_quad_drag = None
         self.reference_pick_active = False
         self.reference_pick_points = []
         self.reference_lines = []
@@ -1860,7 +1869,7 @@ class FrameViewer(QWidget):
                     cursor=None,
                 )
 
-        if self.mode.startswith("occ_") or self.object3d_active:
+        if self.mode.startswith("occ_") or self.object3d_active or self.direction_active:
             mask_name = self._mask_name_at_point(image_point, margin=8)
             if mask_name is not None:
                 record = self.mask_records.get(mask_name)
@@ -2237,6 +2246,16 @@ class FrameViewer(QWidget):
             return
         self._set_mask_hover_info(None, event.position())
 
+        if self.mode == "direction_quad":
+            hit = self._point_hit_index(event.position(), self.direction_quad_points)
+            if hit is not None:
+                self._direction_quad_drag = hit
+            elif len(self.direction_quad_points) < 4:
+                self.direction_quad_points.append(image_point)
+                if len(self.direction_quad_points) == 4:
+                    self.direction_quad_completed.emit(list(self.direction_quad_points))
+            self.update()
+            return
         if self.mode == "reference_line" and self.reference_pick_active:
             hit = self._point_hit_index(event.position(), self.reference_pick_points)
             if hit is not None:
@@ -2461,6 +2480,11 @@ class FrameViewer(QWidget):
             return
         self._set_brush_cursor_position(image_point, event.modifiers())
 
+        if self.mode == "direction_quad":
+            if self._direction_quad_drag is not None and event.buttons() & Qt.MouseButton.LeftButton:
+                self.direction_quad_points[self._direction_quad_drag] = image_point
+            self.update()
+            return
         if self.mode == "reference_line" and self.reference_pick_active:
             if self._reference_drag_index is not None:
                 if event.buttons() & Qt.MouseButton.LeftButton:
@@ -2576,6 +2600,15 @@ class FrameViewer(QWidget):
             return
 
         image_point = self._widget_to_image(event.position())
+        if self.mode == "direction_quad" and event.button() == Qt.MouseButton.LeftButton:
+            if self._direction_quad_drag is not None:
+                if image_point is not None:
+                    self.direction_quad_points[self._direction_quad_drag] = image_point
+                if len(self.direction_quad_points) == 4:
+                    self.direction_quad_completed.emit(list(self.direction_quad_points))
+            self._direction_quad_drag = None
+            self.update()
+            return
         if self.mode == "reference_line" and event.button() == Qt.MouseButton.LeftButton:
             if self._reference_drag_index is not None and image_point is not None:
                 self.reference_pick_points[self._reference_drag_index] = image_point
@@ -2788,6 +2821,7 @@ class FrameViewer(QWidget):
         self._draw_reference_lines(painter)
         self._draw_node_overlay(painter)
         self._draw_brush_cursor_overlay(painter)
+        self._draw_direction_overlay(painter)
         self._draw_mask_hover_overlay(painter)
 
     def _draw_node_overlay(self, painter: QPainter) -> None:
@@ -2858,6 +2892,64 @@ class FrameViewer(QWidget):
         inner_pen.setCosmetic(True)
         painter.setPen(inner_pen)
         painter.drawEllipse(center, widget_radius + 1.8, widget_radius + 1.8)
+        painter.restore()
+
+    def _draw_direction_overlay(self, painter: QPainter) -> None:
+        if not self.direction_active:
+            return
+        rect = self._image_rect()
+        if rect is None:
+            return
+        painter.save()
+        painter.setClipRect(rect)
+        if self.direction_range_overlay is not None:
+            outer, ring = self.direction_range_overlay
+            self._draw_mask_path(painter, ring, rect, fill_color=QColor("#38bdf8"), fill_alpha=22)
+            self._draw_mask_path(painter, outer, rect, outline_color=QColor("#38bdf8"),
+                                 outline_width=1.5, outline_style=Qt.PenStyle.DashLine)
+        if self.direction_show_calibration and self.direction_quad_points:
+            points = [self._image_to_widget(p) for p in self.direction_quad_points]
+            painter.setPen(QPen(QColor("#c4b5fd"), 2, Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            if len(points) >= 3:
+                painter.drawPolygon(QPolygonF(points))
+            for index, point in enumerate(points):
+                painter.drawEllipse(point, 5, 5)
+                painter.drawText(point + QPointF(7, -7), str(index + 1))
+        if self.direction_distance_point is not None:
+            point, name = self.direction_distance_point
+            position = self._image_to_widget(point)
+            painter.setPen(QPen(QColor("#f8fafc"), 1.5))
+            painter.setBrush(QColor("#a78bfa"))
+            painter.drawEllipse(position, 6, 6)
+            painter.drawText(position + QPointF(8, -8), f"D: {name}")
+        painter.restore()
+        if self.direction_preview is None:
+            return
+        origin, nose, angle = self.direction_preview
+        start, tip, rect = self._image_to_widget(origin), self._image_to_widget(nose), self._image_rect()
+        if start is None or tip is None or rect is None:
+            return
+        heading = math.atan2(nose[1] - origin[1], nose[0] - origin[0])
+        length = 2 * math.hypot(rect.width(), rect.height())
+        ray = lambda value: tip + QPointF(math.cos(value) * length, math.sin(value) * length)
+        painter.save()
+        painter.setClipRect(rect)
+        color = QColor("#fbbf24")
+        painter.setPen(QPen(color, 2))
+        if angle > 0:
+            half = math.radians(angle)
+            painter.setBrush(QColor(251, 191, 36, 32))
+            painter.drawPolygon(QPolygonF([tip] + [ray(value) for value in np.linspace(heading - half, heading + half, 37)]))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(color, 2, Qt.PenStyle.DashLine))
+        painter.drawLine(tip, ray(heading))
+        painter.setPen(QPen(QColor("#f8fafc"), 2))
+        painter.drawLine(start, tip)
+        for delta in (-0.5, 0.5):
+            painter.drawLine(tip, tip - QPointF(math.cos(heading + delta) * 10, math.sin(heading + delta) * 10))
+        painter.setBrush(color)
+        painter.drawEllipse(tip, 4, 4)
         painter.restore()
 
     def _draw_mask_hover_overlay(self, painter: QPainter) -> None:
@@ -3065,7 +3157,7 @@ class FrameViewer(QWidget):
         painter.restore()
 
     def _draw_mask_overlays(self, painter: QPainter) -> None:
-        if not self.mask_records or not (self.mode.startswith("occ_") or self.object3d_active):
+        if not self.mask_records or not (self.mode.startswith("occ_") or self.object3d_active or self.direction_active):
             return
         painter.save()
         rect = self._image_rect()
@@ -3163,7 +3255,7 @@ class FrameViewer(QWidget):
         return None
 
     def _draw_reference_lines(self, painter):
-        if not self.object3d_active:
+        if not (self.object3d_active or self.direction_active and self.direction_show_calibration):
             return
         rect = self._image_rect()
         if rect is None:
@@ -3346,6 +3438,7 @@ class FrameViewer(QWidget):
 
 
 class MainWindow(
+    DirectionTabMixin,
     TrackingRepairTabMixin,
     InterpolationTabMixin,
     SmoothingTabMixin,
@@ -3369,6 +3462,7 @@ class MainWindow(
     TAB_PIN = 8
     TAB_PIPELINE = 9
     TAB_OCCLUSION_3D = 10
+    TAB_DIRECTION = 11
     CATEGORY_PREPARE = 0
     CATEGORY_ANNOTATE = 1
     CATEGORY_INSPECT = 2
@@ -3377,7 +3471,7 @@ class MainWindow(
     FILE_SIDEBAR_DEFAULT_WIDTH = 230
     FILE_SIDEBAR_MIN_RESTORE_WIDTH = 160
     FILE_SIDEBAR_MAX_WIDTH = 360
-    TAB_VISIBILITY_SCHEMA_VERSION = 4
+    TAB_VISIBILITY_SCHEMA_VERSION = 5
     PERSISTENT_SPINBOX_SETTINGS_KEY = "spinbox_values"
     PERSISTENT_SPINBOX_NAMES = (
         "tracking_duplicate_criteria_spinbox",
@@ -3733,7 +3827,7 @@ class MainWindow(
         self.mode_tabs.tabBar().setObjectName("modeToolTabBar")
         self.mode_tabs.tabBar().setExpanding(False)
         self.mode_tabs.tabBar().setUsesScrollButtons(True)
-        self.mode_tabs.setElideMode(Qt.TextElideMode.ElideRight)
+        self.mode_tabs.setElideMode(Qt.TextElideMode.ElideNone)
         self.mode_tabs.setMinimumHeight(300)
         self.mode_tabs.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self.tracking_repair_tab = self._build_tracking_repair_tab()
@@ -3744,6 +3838,7 @@ class MainWindow(
         self.circle_tab = self._build_circle_tab()
         self.occlusion_tab = self._build_occlusion_tab()
         self.occlusion_3d_tab = self._build_occlusion_3d_tab()
+        self.direction_tab = self._build_direction_tab()
         self.trajectory_tab = self._build_trajectory_tab()
         self.pin_tab = self._build_pin_tab()
         self.pipeline_tab = self._build_pipeline_tab()
@@ -3758,6 +3853,8 @@ class MainWindow(
         self.mode_tabs.addTab(self.pin_tab, "Pin Coordinates")
         self.mode_tabs.addTab(self.pipeline_tab, "Multi Pipeline")
         self.mode_tabs.addTab(self.occlusion_3d_tab, "Occlusion (3D Object)")
+        self.mode_tabs.addTab(self.direction_tab, "Direction")
+        self.mode_tabs.setTabToolTip(self.TAB_DIRECTION, "Classify object-facing directions using read-only masks and an angle margin.")
         self.mode_tabs.setTabToolTip(
             self.TAB_TRACKING_REPAIR,
             "Remove duplicate skeletons first, then robust Z-score length outliers.",
@@ -4023,6 +4120,7 @@ class MainWindow(
             (self.TAB_CIRCLE, "circle", "Circle"),
             (self.TAB_OCCLUSION, "occlusion", "Occlusion"),
             (self.TAB_OCCLUSION_3D, "occlusion_3d", "Occlusion (3D Object)"),
+            (self.TAB_DIRECTION, "direction", "Direction"),
             (self.TAB_TRAJECTORY, "trajectory", "Visualize"),
             (self.TAB_PIN, "pin", "Pin Coordinates"),
             (self.TAB_PIPELINE, "pipeline", "Multi Pipeline"),
@@ -4036,7 +4134,7 @@ class MainWindow(
             self.TAB_SQUARE,
         }:
             return self.CATEGORY_PREPARE
-        if tab_index in {self.TAB_CHAMBER, self.TAB_CIRCLE, self.TAB_OCCLUSION, self.TAB_OCCLUSION_3D}:
+        if tab_index in {self.TAB_CHAMBER, self.TAB_CIRCLE, self.TAB_OCCLUSION, self.TAB_OCCLUSION_3D, self.TAB_DIRECTION}:
             return self.CATEGORY_ANNOTATE
         if tab_index == self.TAB_PIPELINE:
             return self.CATEGORY_PIPELINE
@@ -4177,8 +4275,10 @@ class MainWindow(
             visibility_schema_version = int(self.settings.get("tab_visibility_schema_version", 1))
         except (TypeError, ValueError):
             visibility_schema_version = 1
-        if visibility_schema_version < self.TAB_VISIBILITY_SCHEMA_VERSION:
+        if visibility_schema_version < 4:
             visible_keys.add("occlusion_3d")
+        if visibility_schema_version < 5:
+            visible_keys.add("direction")
         if visibility_schema_version < 3:
             visible_keys.add("trajectory")
             visible_keys.add("smoothing")
@@ -4439,6 +4539,8 @@ class MainWindow(
         self.frame_viewer.occ_transform_erase_segment_requested.connect(lambda payload: self._dispatch_occlusion_edit("erase_occ_transform_segment", payload))
         self.frame_viewer.occ_transform_finished.connect(lambda: self._dispatch_occlusion_edit("_finalize_occ_transform"))
         self.frame_viewer.reference_line_completed.connect(self._object3d_reference_line)
+        self.frame_viewer.reference_line_completed.connect(self._direction_reference_line)
+        self.frame_viewer.direction_quad_completed.connect(self._direction_quad_completed)
         self.frame_viewer.occ_mask_double_clicked.connect(self._on_occ_mask_double_clicked)
         self._connect_persistent_spinbox_settings()
 
@@ -4514,6 +4616,7 @@ class MainWindow(
             self.TAB_CIRCLE,
             self.TAB_OCCLUSION,
             self.TAB_OCCLUSION_3D,
+            self.TAB_DIRECTION,
         }:
             self.show_annotate_controls_help()
 
@@ -4660,6 +4763,7 @@ class MainWindow(
         data.update(self._interpolation_settings_payload())
         data.update(self._smoothing_settings_payload())
         data.update(self._pin_settings_payload())
+        data.update(self._direction_settings_payload())
         data.update(self._persistent_spinbox_settings_payload())
         try:
             SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -5122,6 +5226,9 @@ class MainWindow(
         if self._focus_active_save_progress():
             return
         mode_index = self.mode_tabs.currentIndex()
+        if mode_index == self.TAB_DIRECTION:
+            self._direction_save_multiple()
+            return
         if mode_index == self.TAB_OCCLUSION_3D:
             QMessageBox.information(self, "3D Object Batch Unavailable",
                 "3D objects require references measured for each video. Open each video and use Save CSV.")
@@ -5493,6 +5600,10 @@ class MainWindow(
                 and self.frame_viewer.circle_geometry() is not None
                 and bool(self.bodyparts)
             )
+        elif current_index == self.TAB_DIRECTION:
+            output = self._direction_output_path()
+            self.save_current_button.setEnabled(self._direction_refresh_readiness())
+            self.save_current_button.setToolTip(self.direction_ready.toolTip())
         elif current_index == self.TAB_OCCLUSION_3D:
             output = self._occlusion_output_path()
             ready = self._object3d_refresh_readiness()
@@ -5515,12 +5626,13 @@ class MainWindow(
                 and geometric_ready
             )
 
-        batch_enabled = self.save_current_button.isEnabled() and current_index != self.TAB_OCCLUSION_3D
+        direction_scoped = current_index == self.TAB_DIRECTION and self._direction_batch_scoped()
+        batch_enabled = self.save_current_button.isEnabled() and current_index != self.TAB_OCCLUSION_3D and not direction_scoped
         self.current_output_label.setText(str(output) if output is not None else "-")
         self.current_output_label.setToolTip(str(output) if output is not None else "")
         if hasattr(self, "save_multiple_button"):
             self.save_multiple_button.setEnabled(batch_enabled)
-            if current_index == self.TAB_OCCLUSION_3D:
+            if current_index == self.TAB_OCCLUSION_3D or direction_scoped:
                 self.save_multiple_button.setToolTip("Unavailable for 3D objects. Measure references and save each video separately.")
             elif current_index in {self.TAB_TRAJECTORY, self.TAB_PIN}:
                 self.save_multiple_button.setToolTip(
@@ -5685,6 +5797,7 @@ class MainWindow(
             height=max(1, int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))),
         )
         self._object3d_video_changed(video_path, self.video_state.width, self.video_state.height)
+        self._direction_video_changed(video_path, self.video_state.width, self.video_state.height)
         self._loading_slider = True
         self.frame_slider.setEnabled(True)
         self.frame_slider.setRange(1, self.video_state.frame_count)
@@ -5735,6 +5848,7 @@ class MainWindow(
             self.csv_path = None
             self.csv_df = None
             self.bodyparts = []
+            self._direction_refresh_columns()
             self._prepare_node_overlay_data()
             self._update_csv_path_label(None)
             self._refresh_node_overlay()
@@ -5771,6 +5885,7 @@ class MainWindow(
             return
         self.csv_path = csv_path
         self.bodyparts = bodyparts_from_dataframe(self.csv_df)
+        self._direction_refresh_columns()
         self._prepare_node_overlay_data()
         self._update_csv_path_label(csv_path)
         if auto_matched:
@@ -5785,6 +5900,7 @@ class MainWindow(
         self._refresh_circle_ui()
         self._refresh_interpolation_ui()
         self._refresh_smoothing_ui()
+        self._direction_refresh_preview()
 
     def _load_frame(self, frame_number: int) -> None:
         if self.video_state is None:
@@ -5801,7 +5917,9 @@ class MainWindow(
         self._refresh_chamber_viewer(refresh=False)
         self.frame_viewer.set_interpolation_mask(self.interpolation_mask)
         self.frame_viewer.set_pin_records(self.pins)
-        if self._object3d_active():
+        if self._direction_active():
+            self._direction_refresh_preview()
+        elif self._object3d_active():
             self._object3d_refresh_viewer(refresh=False)
         else:
             self.frame_viewer.set_mask_records(self.mask_records, self.selected_mask_name)
@@ -6148,6 +6266,9 @@ class MainWindow(
         self.zoom_label.setText(f"{int(round(self.frame_viewer.zoom_factor * 100))}%")
 
     def _on_mode_changed(self, index: int) -> None:
+        self._direction_cancel_calibration()
+        self.frame_viewer.direction_active = index == self.TAB_DIRECTION
+        self.frame_viewer.direction_preview = None
         self.frame_viewer.object3d_active = index == self.TAB_OCCLUSION_3D
         self.frame_viewer.reference_pick_active = False
         self.frame_viewer.square_drag_enabled = False
@@ -6155,7 +6276,16 @@ class MainWindow(
             self.frame_viewer.set_mask_records(self.mask_records, self.selected_mask_name, refresh=True)
         self._remember_mode_tab_by_workflow(index)
         self._sync_current_output_default_suffix(index)
-        if index == self.TAB_OCCLUSION_3D:
+        if index == self.TAB_DIRECTION:
+            self.frame_viewer.set_mode("direction")
+            self.frame_viewer.set_occ_transform_mode(False)
+            self.frame_viewer.set_occ_margin_pick_mode(False)
+            self._direction_refresh_columns()
+            if self._direction_reuse_video_references():
+                self._direction_rebuild_ranges()
+            self._direction_sync_ranges()
+            self._direction_options_changed()
+        elif index == self.TAB_OCCLUSION_3D:
             self._object3d_refresh()
             self._sync_object3d_mode()
         elif index == self.TAB_TRACKING_REPAIR:
@@ -6988,6 +7118,8 @@ class MainWindow(
 
     def _current_mode_save_task(self):
         index = self.mode_tabs.currentIndex()
+        if index == self.TAB_DIRECTION:
+            return self._direction_save_task()
         if index == self.TAB_OCCLUSION_3D:
             return self._object3d_save_task()
         if index == self.TAB_TRACKING_REPAIR:

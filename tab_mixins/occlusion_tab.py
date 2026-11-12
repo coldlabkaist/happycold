@@ -833,6 +833,7 @@ class OcclusionTabMixin:
             "metadata_version": 2,
             "width": int(width),
             "height": int(height),
+            "geometric_points": [list(point) for point in self.frame_viewer.occ_margin_points],
             "masks": {},
         }
         for name, record in self.mask_records.items():

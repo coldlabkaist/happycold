@@ -1,3 +1,4 @@
+from .direction_tab import DirectionTabMixin
 from .chamber_tab import ChamberTabMixin
 from .circle_tab import CircleTabMixin
 from .interpolation_tab import InterpolationTabMixin
@@ -10,6 +11,7 @@ from .square_tab import SquareTabMixin
 from .tracking_repair_tab import TrackingRepairTabMixin
 
 __all__ = [
+    "DirectionTabMixin",
     "ChamberTabMixin",
     "CircleTabMixin",
     "InterpolationTabMixin",

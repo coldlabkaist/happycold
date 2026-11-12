@@ -402,6 +402,7 @@ def build_app_stylesheet() -> str:
         border-color: {c['accent_hover']};
     }}
     QPushButton[object3dTarget="line"]:checked:enabled,
+    QPushButton[object3dTarget="object"]:checked:enabled,
     QPushButton[object3dTarget="top"]:checked:enabled,
     QPushButton[object3dTarget="bottom"]:checked:enabled {{
         background: {c['accent']};
@@ -410,6 +411,7 @@ def build_app_stylesheet() -> str:
         font-weight: 600;
     }}
     QPushButton[object3dTarget="line"]:checked:enabled:hover,
+    QPushButton[object3dTarget="object"]:checked:enabled:hover,
     QPushButton[object3dTarget="top"]:checked:enabled:hover,
     QPushButton[object3dTarget="bottom"]:checked:enabled:hover {{
         background: {c['accent_hover']};

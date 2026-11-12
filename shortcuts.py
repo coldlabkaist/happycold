@@ -36,6 +36,20 @@ APP_SHORTCUTS: tuple[ShortcutSpec, ...] = (
 
 ANNOTATE_SHORTCUT_HELP_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
+        "Direction",
+        (
+            ("Load Masks", "Copy raw shapes from Occlusion or 3D Object; source margins are ignored"),
+            ("Import Mask / Folder", "Load a PNG, editable 3D folder, or saved Direction recipe"),
+            ("Distance Node", "Choose the point used for Overlap / Near / Far, separately from the heading"),
+            ("Object / Near Margin", "Set both offsets from the same base shape; Near must be at least Object"),
+            ("Calibration", "Measure physical reference lines or select four perspective points; base masks stay read-only"),
+            ("Line / Top / Bottom", "Select Line to draw or adjust a ruler; Top and Bottom assign a ruler to each face"),
+            ("Angle = 0 deg", "Test a forward ray from the nose against the Object region"),
+            ("Angle > 0 deg", "Test the cone on both sides of the heading when the distance node is Near"),
+            ("Left / Right", "Inspect Overlap, Near / Facing, Near / Not Facing, Far, or Unknown"),
+        ),
+    ),
+    (
         "Shared",
         (
             ("D", "Draw mode"),
