@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 from PyQt6.QtCore import QEvent, QEventLoop, QPointF, QRectF, QTimer, Qt
 from PyQt6.QtGui import QMouseEvent
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QCheckBox, QMessageBox
 
 import main
@@ -806,6 +807,56 @@ class ObjectQtTests(unittest.TestCase):
         w._dispatch_occlusion_edit("translate_selected_mask", (20, 0))
         np.testing.assert_array_equal(obj.top.mask, original)
         self.assertIsNone(w._active_mask_clipboard_item())
+
+    def test_f_shortcut_switches_drawing_faces_and_discards_unfinished_shapes(self):
+        w = self.window
+        w.resize(1320, 900)
+        w.show()
+        w.activateWindow()
+        self.app.processEvents()
+        viewer = w.frame_viewer
+        original = {face: getattr(w._object3d_object(), face).mask.copy() for face in ("top", "bottom")}
+        w.object3d_face_controls["bottom"]["transform"].setChecked(True)
+        w.object3d_face_controls["top"]["tool"].setCurrentText("Polygon")
+        self.mouse(viewer, QEvent.Type.MouseButtonPress, (20, 20))
+        self.mouse(viewer, QEvent.Type.MouseButtonRelease, (20, 20))
+        self.assertTrue(viewer.occ_rect_points)
+        QTest.keyClick(viewer, Qt.Key.Key_F)
+        self.assertEqual(w._object3d_edit_target, "bottom")
+        self.assertTrue(w.object3d_face_controls["bottom"]["draw"].isChecked())
+        self.assertTrue(w.object3d_target_buttons["bottom"].isChecked())
+        self.assertEqual(viewer.occ_rect_points, [])
+        for face in ("top", "bottom"):
+            np.testing.assert_array_equal(getattr(w._object3d_object(), face).mask, original[face])
+        QTest.keyClick(viewer, Qt.Key.Key_F)
+        self.assertEqual(w._object3d_edit_target, "top")
+        self.assertTrue(w.object3d_face_controls["top"]["draw"].isChecked())
+
+    def test_f_shortcut_keeps_transform_mode_and_respects_line_and_text_input(self):
+        w = self.window
+        w.resize(1320, 900)
+        w.show()
+        w.activateWindow()
+        self.app.processEvents()
+        viewer = w.frame_viewer
+        w.object3d_face_controls["top"]["transform"].setChecked(True)
+        viewer.setFocus()
+        QTest.keyClick(viewer, Qt.Key.Key_F)
+        self.assertEqual(w._object3d_edit_target, "bottom")
+        self.assertTrue(w.object3d_face_controls["bottom"]["transform"].isChecked())
+        w.current_output_prefix_edit.setFocus()
+        QTest.keyClicks(w.current_output_prefix_edit, "f")
+        self.assertEqual(w.current_output_prefix_edit.text(), "f")
+        self.assertEqual(w._object3d_edit_target, "bottom")
+        w._object3d_set_edit_target("line")
+        viewer.setFocus()
+        points = list(w._object3d_reference().points)
+        QTest.keyClick(viewer, Qt.Key.Key_F)
+        self.assertEqual(w._object3d_edit_target, "line")
+        self.assertEqual(w._object3d_reference().points, points)
+        w._open_pipeline_settings(w.TAB_OCCLUSION)
+        QTest.keyClick(viewer, Qt.Key.Key_F)
+        self.assertEqual(w._object3d_edit_target, "line")
 
     def test_object_first_workflow_can_open_line_panel_to_add_first_reference(self):
         w = self.window

@@ -31,6 +31,19 @@ def new_id() -> str:
     return uuid4().hex
 
 
+def reference_pixel_length(points) -> float:
+    """Validate the minimum span, allowing coordinate roundoff at exactly 1 px."""
+    pixels = math.dist(*points)
+    if not math.isfinite(pixels):
+        raise ValueError("Reference length must be finite.")
+    tolerance = 4 * max(math.ulp(float(value)) for point in points for value in point)
+    if abs(pixels - 1) <= tolerance:
+        pixels = 1.0
+    if pixels < 1:
+        raise ValueError("Reference endpoints must be at least 1 px apart.")
+    return pixels
+
+
 @dataclass
 class LengthReference:
     name: str
@@ -49,11 +62,10 @@ class LengthReference:
             raise ValueError(f"{self.name}: measure the reference in this video.") from None
         if points.shape != (2, 2) or not np.all(np.isfinite(points)):
             raise ValueError(f"{self.name}: measure the reference in this video.")
-        pixels = math.dist(*points)
-        if not math.isfinite(pixels):
-            raise ValueError(f"{self.name}: reference length must be finite.")
-        if pixels < 1.0:
-            raise ValueError(f"{self.name}: reference endpoints must be at least 1 px apart.")
+        try:
+            pixels = reference_pixel_length(points)
+        except ValueError as exc:
+            raise ValueError(f"{self.name}: {exc}") from None
         metres = self.length * UNITS[self.unit]
         if metres <= 0:
             raise ValueError(f"{self.name}: reference length is too small.")

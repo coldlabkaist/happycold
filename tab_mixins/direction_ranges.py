@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import QButtonGroup, QFormLayout, QGroupBox, QHBoxLayout, Q
 from direction import DirectionZones
 from occlusion_3d import LengthReference, UNITS, convert_length
 from ui_controls import NoWheelComboBox, NoWheelDoubleSpinBox
+from annotation_settings import preference_choice
 
 
 class DirectionRangesMixin:
@@ -20,8 +21,9 @@ class DirectionRangesMixin:
         self._direction_range_paths = {}
         self._direction_calibration = None
         self._direction_range_syncing = False
-        self._direction_reference_target = "line"
-        self._direction_reference_id = None
+        saved = self._direction_saved_settings
+        self._direction_reference_target = preference_choice(saved.get("reference_target"), {"line", "object", "top", "bottom"}, "line")
+        self._direction_reference_id = saved.get("reference_id") if isinstance(saved.get("reference_id"), str) else None
         group = QGroupBox("2. Ranges")
         layout = QVBoxLayout(group)
         form = QFormLayout()
@@ -33,18 +35,26 @@ class DirectionRangesMixin:
         self.direction_range_mode = NoWheelComboBox()
         for label, key in (("Pixels", "pixels"), ("Physical", "physical"), ("Perspective", "geometric")):
             self.direction_range_mode.addItem(label, key)
+        self.direction_range_mode.setCurrentIndex(self.direction_range_mode.findData(self._direction_default_ranges.mode))
         form.addRow("Margins", self.direction_range_mode)
         self.direction_object_margin = NoWheelDoubleSpinBox()
         self.direction_near_margin = NoWheelDoubleSpinBox()
         self.direction_range_unit = NoWheelComboBox()
         self.direction_range_unit.addItems(list(UNITS))
-        self.direction_range_unit.setCurrentText("cm")
+        self.direction_range_unit.setCurrentText(self._direction_default_ranges.unit)
         row = QHBoxLayout()
         row.addWidget(self.direction_object_margin, 1)
         row.addWidget(self.direction_range_unit)
         form.addRow("Object Margin", row)
         form.addRow("Near Margin", self.direction_near_margin)
-        for spin in (self.direction_object_margin, self.direction_near_margin):
+        spec = self._direction_default_ranges
+        for spin, value in ((self.direction_object_margin, spec.object_margin), (self.direction_near_margin, spec.near_margin)):
+            physical = spec.mode == "physical"
+            limit = 100000 / UNITS[spec.unit] if physical else 300
+            spin.setDecimals(5 if physical else 0)
+            spin.setRange(-limit, limit)
+            spin.setSuffix(f" {spec.unit}" if physical else " px")
+            spin.setValue(value)
             spin.setKeyboardTracking(False)
             spin.setToolTip("Offset from the raw base shape. Near Margin must be at least Object Margin.")
             spin.valueChanged.connect(self._direction_range_changed)
@@ -52,6 +62,7 @@ class DirectionRangesMixin:
         row = QHBoxLayout()
         self.direction_calibration_toggle = QPushButton("Calibration")
         self.direction_calibration_toggle.setCheckable(True)
+        self.direction_calibration_toggle.setChecked(saved.get("calibration_open") is True)
         self.direction_apply_ranges = QPushButton("Apply to All")
         self.direction_apply_ranges.setToolTip("Copy margins and units; keep each object's calibration.")
         row.addWidget(self.direction_calibration_toggle)
@@ -101,6 +112,8 @@ class DirectionRangesMixin:
             button.clicked.connect(handler)
             actions.addWidget(button)
         editor.addRow(actions)
+        self.direction_line_input = self._build_reference_line_controls("direction", saved.get("line_input"))
+        editor.addRow("Pixel Length", self.direction_line_input)
         self.direction_reference_length = NoWheelDoubleSpinBox()
         self.direction_reference_length.setKeyboardTracking(False)
         self.direction_reference_length.setToolTip("Actual distance between the reference line's two endpoints.")
@@ -110,7 +123,7 @@ class DirectionRangesMixin:
         length.setContentsMargins(0, 0, 0, 0)
         length.addWidget(self.direction_reference_length, 1)
         length.addWidget(self.direction_reference_unit)
-        editor.addRow("Length", length)
+        editor.addRow("Real Length", length)
         self.direction_redraw_line = QPushButton("Redraw Selected Line")
         self.direction_redraw_line.setToolTip("Click two new endpoints. Changing target cancels an unfinished redraw.")
         editor.addRow(self.direction_redraw_line)
@@ -416,6 +429,7 @@ class DirectionRangesMixin:
                         if candidate.id == ref.id:
                             candidate.name = name.strip()
                 self._direction_sync_ranges()
+                self._save_settings()
 
     def _direction_delete_reference(self):
         ref = self._direction_edit_reference()
@@ -427,6 +441,7 @@ class DirectionRangesMixin:
         for mask in self.direction_masks:
             mask.references = [r for r in mask.references if r.id != ref.id]
         self._direction_sync_ranges()
+        self._save_settings()
 
     def _direction_edit_line(self, _checked=False, *, redraw=False):
         self._direction_cancel_calibration()
@@ -436,8 +451,11 @@ class DirectionRangesMixin:
         self._direction_reference_target = "line"
         self._direction_calibration = {"kind": "line", "object": item.name, "reference": ref.id,
                                        "pending": redraw or not self._direction_reference_measured(ref)}
-        self.frame_viewer.reference_pick_points = [] if redraw else list(ref.points)
         self._direction_sync_ranges()
+        if redraw:
+            options = self.direction_line_input.preferences()
+            self.frame_viewer.configure_reference_line(("direction", self._direction_video_key, ref.id),
+                ref.points, options["fixed"], options["length"], redraw=True)
         self._direction_options_changed()
 
     def _direction_edit_quad(self, _checked=False):
@@ -457,8 +475,8 @@ class DirectionRangesMixin:
         self._direction_calibration = None
         if hasattr(self, "frame_viewer"):
             viewer = self.frame_viewer
-            viewer.reference_pick_active = False
-            viewer._reference_drag_index = None
+            if viewer.reference_editor_key and viewer.reference_editor_key[0] == "direction":
+                viewer.deactivate_reference_line()
             viewer.direction_quad_points = []
             viewer._direction_quad_drag = None
             if self._direction_active():
@@ -468,12 +486,29 @@ class DirectionRangesMixin:
         context = self._direction_calibration
         if not self._direction_active() or not context or context["kind"] != "line":
             return
+        previous = next((ref.points for mask in self.direction_masks for ref in mask.references if ref.id == context["reference"]), [])
+        self._direction_line_undo.append((context["reference"], list(previous)))
+        del self._direction_line_undo[:-10]
         for mask in self.direction_masks:
             for ref in mask.references:
                 if ref.id == context["reference"]:
                     ref.points = list(points)
                     mask.ranges.calibration_video_key = self._direction_video_key
         self._direction_cancel_calibration()
+        self._direction_ranges_updated()
+
+    def _direction_undo_reference_line(self):
+        if not self._direction_line_undo:
+            self.statusBar().showMessage("Nothing to undo in this tab.", 2500)
+            return
+        key, points = self._direction_line_undo.pop()
+        self._direction_cancel_calibration()
+        for mask in self.direction_masks:
+            for ref in mask.references:
+                if ref.id == key:
+                    ref.points = list(points)
+        self._direction_reference_id = key
+        self._direction_reference_target = "line"
         self._direction_ranges_updated()
 
     def _direction_quad_completed(self, points):
@@ -502,9 +537,10 @@ class DirectionRangesMixin:
             if context is None or context["kind"] != "line" or context["reference"] != ref.id:
                 self._direction_calibration = {"kind": "line", "object": item.name, "reference": ref.id,
                                                "pending": not self._direction_reference_measured(ref)}
-                viewer.reference_pick_points = list(ref.points)
-            viewer.reference_pick_active = True
             viewer.set_mode("reference_line")
+            options = self.direction_line_input.preferences()
+            viewer.configure_reference_line(("direction", self._direction_video_key, ref.id),
+                ref.points, options["fixed"], options["length"])
         elif self._direction_calibration and self._direction_calibration["kind"] == "line":
             self._direction_cancel_calibration()
         if item and item.ranges.mode == "geometric" and self._direction_calibration is None:

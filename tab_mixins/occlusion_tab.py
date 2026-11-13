@@ -42,6 +42,7 @@ from shared import (
 )
 from shortcuts import ANNOTATE_SHORTCUT_HELP_GROUPS
 from ui_controls import NoWheelComboBox, NoWheelSpinBox
+from annotation_settings import settings_section
 
 
 class OcclusionTabMixin:
@@ -241,7 +242,19 @@ class OcclusionTabMixin:
         file_actions.addWidget(self.import_mask_folder_button, 0, 1)
         file_actions.addWidget(self.export_masks_button, 1, 0, 1, 2)
         outer_layout.addLayout(file_actions)
+        saved = settings_section(self.settings, "occlusion")
+        index = self.mask_shape_combo.findText(saved.get("tool", "Rectangle Drag") if isinstance(saved.get("tool"), str) else "Rectangle Drag")
+        self.mask_shape_combo.setCurrentIndex(max(0, index))
+        self.mask_transform_radio.setChecked(saved.get("edit_mode") == "transform")
+        self.mask_draw_radio.setChecked(saved.get("edit_mode") != "transform")
+        self.mask_erase_radio.setChecked(saved.get("draw_action") == "erase")
+        self.mask_add_radio.setChecked(saved.get("draw_action") != "erase")
         return tab
+
+    def _occlusion_settings_payload(self):
+        return {"occlusion": {"tool": self.mask_shape_combo.currentText(),
+            "edit_mode": "transform" if self.mask_transform_radio.isChecked() else "draw",
+            "draw_action": "erase" if self.mask_erase_radio.isChecked() else "add"}}
 
     def show_annotate_controls_help(self) -> None:
         dialog = QDialog(self)

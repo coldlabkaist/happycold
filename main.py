@@ -160,6 +160,7 @@ from trajectory import resolve_bodypart_coordinate_columns
 from trajectory_plot import build_trajectory_figure
 from ui_controls import NoWheelComboBox, NoWheelSpinBox
 from ui_theme import build_app_stylesheet
+from reference_line import ReferenceLineTabMixin, ReferenceLineViewerMixin
 from mask_tools import constrained_rectangle_points
 from tab_mixins import (
     DirectionTabMixin,
@@ -349,7 +350,7 @@ class TrajectoryPreviewDialog(QDialog):
             y_values * float(self._normalized_display_size[1]),
         )
 
-class FrameViewer(QWidget):
+class FrameViewer(ReferenceLineViewerMixin, QWidget):
     interpolation_rect_points_changed = pyqtSignal()
     interpolation_rect_completed = pyqtSignal(object)
     interpolation_circle_changed = pyqtSignal()
@@ -387,6 +388,7 @@ class FrameViewer(QWidget):
     occ_mask_double_clicked = pyqtSignal(str)
     annotate_context_menu_requested = pyqtSignal(object)
     reference_line_completed = pyqtSignal(object)
+    reference_line_state_changed = pyqtSignal()
     direction_quad_completed = pyqtSignal(object)
 
     def __init__(self) -> None:
@@ -493,6 +495,7 @@ class FrameViewer(QWidget):
         self.reference_lines = []
         self.reference_selected_id = None
         self._reference_drag_index = None
+        self._init_reference_line_editor()
         self._polygon_draw_add: bool | None = None
         self._polygon_preview_point: tuple[float, float] | None = None
         self._cursor_image_point: tuple[float, float] | None = None
@@ -2043,6 +2046,8 @@ class FrameViewer(QWidget):
         return True
 
     def keyPressEvent(self, event) -> None:
+        if self._reference_key_press(event):
+            return
         if event.key() == Qt.Key.Key_Shift and self._rect_drag_mode is not None:
             self._rect_drag_square = True
             if self._rect_drag_current is not None:
@@ -2052,6 +2057,10 @@ class FrameViewer(QWidget):
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Shift and self._reference_keyboard_active():
+            self.set_reference_shift(False)
+            event.accept()
+            return
         if event.key() == Qt.Key.Key_Shift and self._rect_drag_mode is not None:
             self._rect_drag_square = False
             if self._rect_drag_current is not None:
@@ -2257,14 +2266,7 @@ class FrameViewer(QWidget):
             self.update()
             return
         if self.mode == "reference_line" and self.reference_pick_active:
-            hit = self._point_hit_index(event.position(), self.reference_pick_points)
-            if hit is not None:
-                self._reference_drag_index = hit
-            elif len(self.reference_pick_points) < 2:
-                self.reference_pick_points.append(image_point)
-                if len(self.reference_pick_points) == 2:
-                    self.reference_line_completed.emit(list(self.reference_pick_points))
-            self.update()
+            self._reference_mouse_press(event, image_point)
             return
         if self.mode == "trajectory_region":
             draw_point = self._snapped_drawing_point(image_point)
@@ -2486,12 +2488,7 @@ class FrameViewer(QWidget):
             self.update()
             return
         if self.mode == "reference_line" and self.reference_pick_active:
-            if self._reference_drag_index is not None:
-                if event.buttons() & Qt.MouseButton.LeftButton:
-                    self.reference_pick_points[self._reference_drag_index] = image_point
-                else:
-                    self._reference_drag_index = None
-                self.update()
+            self._reference_mouse_move(event, image_point)
             if event.buttons() & Qt.MouseButton.LeftButton:
                 self._set_mask_hover_info(None, event.position())
             else:
@@ -2610,11 +2607,7 @@ class FrameViewer(QWidget):
             self.update()
             return
         if self.mode == "reference_line" and event.button() == Qt.MouseButton.LeftButton:
-            if self._reference_drag_index is not None and image_point is not None:
-                self.reference_pick_points[self._reference_drag_index] = image_point
-                self.reference_line_completed.emit(list(self.reference_pick_points))
-            self._reference_drag_index = None
-            self.update()
+            self._reference_mouse_release(event, image_point)
             return
         if event.button() == Qt.MouseButton.LeftButton and self._rect_drag_mode == self.mode:
             self._rect_drag_square = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
@@ -3227,7 +3220,7 @@ class FrameViewer(QWidget):
         lines = []
         for reference_id, name, points in self.reference_lines:
             active = self.reference_pick_active and reference_id == self.reference_selected_id
-            lines.append((name, list(self.reference_pick_points if active else points), active))
+            lines.append((name, self.reference_display_points() if active else list(points), active))
         return lines
 
     @staticmethod
@@ -3269,7 +3262,7 @@ class FrameViewer(QWidget):
             rows.append((name, [p for p in mapped if p is not None], active))
         # Draw the active line last so crossing or coincident lines cannot hide it.
         for name, mapped, active in sorted(rows, key=lambda row: row[2]):
-            color = QColor("#60a5fa" if active else "#f8fafc")
+            color = QColor("#ef4444" if active and self._reference_error else "#60a5fa" if active else "#f8fafc")
             painter.setPen(QPen(color, 2.5 if active else 1.5, Qt.PenStyle.DashLine))
             if len(mapped) == 2:
                 painter.drawLine(*mapped)
@@ -3282,7 +3275,9 @@ class FrameViewer(QWidget):
         for name, mapped, active in sorted(rows, key=lambda row: not row[2]):
             if not mapped:
                 continue
-            text = metrics.elidedText(name, Qt.TextElideMode.ElideRight, max(0, int(visible.width()) - 24))
+            value = self._reference_number or "..." if self._reference_typing else f"{self.reference_display_length():.2f}"
+            caption = f"{name} | {value} px" if active and (len(mapped) == 2 or self._reference_typing) else name
+            text = metrics.elidedText(caption, Qt.TextElideMode.ElideRight, max(0, int(visible.width()) - 24))
             if not text:
                 continue
             label = self._reference_label_rect(mapped[0], metrics.horizontalAdvance(text) + 12,
@@ -3438,6 +3433,7 @@ class FrameViewer(QWidget):
 
 
 class MainWindow(
+    ReferenceLineTabMixin,
     DirectionTabMixin,
     TrackingRepairTabMixin,
     InterpolationTabMixin,
@@ -3580,7 +3576,7 @@ class MainWindow(
         if self.default_mask_margin_mode not in {"simple", "geometric"}:
             self.default_mask_margin_mode = "simple"
         self._mode_tab_memory_suspended = False
-        self._settings_save_suspended = False
+        self._settings_save_suspended = True
         self._restoring_persistent_spinbox_values = False
         self.last_mode_tab_by_workflow = self._load_last_mode_tab_by_workflow()
 
@@ -3604,6 +3600,8 @@ class MainWindow(
         self._refresh_chamber_ui()
         self._on_mode_changed(self.mode_tabs.currentIndex())
         self._refresh_output_ui()
+        self._settings_save_suspended = False
+        self._save_settings()
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -4488,6 +4486,9 @@ class MainWindow(
         self.occ_margin_set_button.clicked.connect(self._on_occ_margin_set_clicked)
         self.mask_add_radio.toggled.connect(self._sync_draw_mode)
         self.mask_erase_radio.toggled.connect(self._sync_draw_mode)
+        self.mask_shape_combo.currentIndexChanged.connect(lambda _index: self._save_settings())
+        for radio in (self.mask_draw_radio, self.mask_transform_radio, self.mask_add_radio, self.mask_erase_radio):
+            radio.toggled.connect(lambda checked: self._save_settings() if checked else None)
         self.mask_brush_slider.valueChanged.connect(self._on_mask_brush_changed)
         self.mask_brush_spinbox.valueChanged.connect(self._on_mask_brush_changed)
         self.mask_margin_slider.valueChanged.connect(self._on_mask_margin_changed)
@@ -4540,6 +4541,8 @@ class MainWindow(
         self.frame_viewer.occ_transform_finished.connect(lambda: self._dispatch_occlusion_edit("_finalize_occ_transform"))
         self.frame_viewer.reference_line_completed.connect(self._object3d_reference_line)
         self.frame_viewer.reference_line_completed.connect(self._direction_reference_line)
+        self.frame_viewer.reference_line_completed.connect(lambda _points: self._save_settings())
+        self.frame_viewer.reference_line_state_changed.connect(self._reference_line_state_changed)
         self.frame_viewer.direction_quad_completed.connect(self._direction_quad_completed)
         self.frame_viewer.occ_mask_double_clicked.connect(self._on_occ_mask_double_clicked)
         self._connect_persistent_spinbox_settings()
@@ -4693,6 +4696,7 @@ class MainWindow(
         widgets = self._persistent_spinbox_widgets()
         if not widgets:
             return
+        was_suspended = self._settings_save_suspended
         self._restoring_persistent_spinbox_values = True
         self._settings_save_suspended = True
         try:
@@ -4710,7 +4714,7 @@ class MainWindow(
                 value = max(widget.minimum(), min(widget.maximum(), value))
                 widget.setValue(value)
         finally:
-            self._settings_save_suspended = False
+            self._settings_save_suspended = was_suspended
             self._restoring_persistent_spinbox_values = False
 
     def _connect_persistent_spinbox_settings(self) -> None:
@@ -4763,6 +4767,8 @@ class MainWindow(
         data.update(self._interpolation_settings_payload())
         data.update(self._smoothing_settings_payload())
         data.update(self._pin_settings_payload())
+        data.update(self._occlusion_settings_payload())
+        data.update(self._object3d_settings_payload())
         data.update(self._direction_settings_payload())
         data.update(self._persistent_spinbox_settings_payload())
         try:
@@ -6266,6 +6272,7 @@ class MainWindow(
         self.zoom_label.setText(f"{int(round(self.frame_viewer.zoom_factor * 100))}%")
 
     def _on_mode_changed(self, index: int) -> None:
+        self.frame_viewer.deactivate_reference_line()
         self._direction_cancel_calibration()
         self.frame_viewer.direction_active = index == self.TAB_DIRECTION
         self.frame_viewer.direction_preview = None
@@ -6495,6 +6502,12 @@ class MainWindow(
         self._refresh_mask_ui()
 
     def undo_active_mask_edit(self) -> None:
+        if self.frame_viewer.reference_line_pending:
+            self.frame_viewer.cancel_reference_line()
+            return
+        if self._direction_active():
+            self._direction_undo_reference_line()
+            return
         if self._object3d_active():
             self._object3d_undo_edit()
             return

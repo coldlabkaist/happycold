@@ -20,6 +20,10 @@ from direction import (
 from shared import MaskRecord
 from .direction_ranges import DirectionRangesMixin
 from ui_controls import NoWheelComboBox, NoWheelDoubleSpinBox
+from annotation_settings import (
+    range_preferences, reference_preferences, restore_ranges,
+    restore_references, settings_section,
+)
 
 
 class DirectionTabMixin(DirectionRangesMixin):
@@ -31,8 +35,13 @@ class DirectionTabMixin(DirectionRangesMixin):
         self._direction_refreshing = False
         self._direction_pose_cache = None
         self._direction_viewer_dirty = True
-        saved = self.settings.get("direction", {})
-        saved = saved if isinstance(saved, dict) else {}
+        self._direction_line_undo = []
+        saved = settings_section(self.settings, "direction")
+        self._direction_saved_settings = saved
+        self._direction_saved_profiles = copy.deepcopy(saved.get("objects", {})) if isinstance(saved.get("objects"), dict) else {}
+        self._direction_preference_references = restore_references(saved.get("references"))
+        self._direction_default_ranges = restore_ranges(saved.get("range_defaults"))
+        self._direction_preferred_object = saved.get("selected_object") if isinstance(saved.get("selected_object"), str) else None
         self._direction_point_names = dict(saved.get("points", {})) if isinstance(saved.get("points"), dict) else {}
         tab = QWidget()
         outer = QVBoxLayout(tab)
@@ -52,6 +61,7 @@ class DirectionTabMixin(DirectionRangesMixin):
         self.direction_source = NoWheelComboBox()
         for label, key in (("Occlusion Tab", "occlusion"), ("3D Object Tab", "3d")):
             self.direction_source.addItem(label, key)
+        self.direction_source.setCurrentIndex(max(0, self.direction_source.findData(saved.get("source", "occlusion"))))
         self.direction_load = QPushButton("Load Masks")
         self.direction_load.setToolTip("Load a read-only snapshot. Load again after changing the source masks.")
         row.addWidget(self.direction_source, 1)
@@ -139,6 +149,7 @@ class DirectionTabMixin(DirectionRangesMixin):
         export.clicked.connect(self._direction_export)
         outer.addWidget(export)
         self.direction_load.clicked.connect(self._direction_load_masks)
+        self.direction_source.currentIndexChanged.connect(self._direction_options_changed)
         self.direction_objects.itemChanged.connect(self._direction_options_changed)
         self.direction_objects.currentRowChanged.connect(self._direction_selection_changed)
         self.direction_method.currentIndexChanged.connect(self._direction_method_changed)
@@ -211,8 +222,51 @@ class DirectionTabMixin(DirectionRangesMixin):
             self.direction_point_controls["right_ear"][0].currentData(), self.direction_angle.value(), self.direction_coordinates.currentData(), self.direction_point_controls["distance"][0].currentData())
 
     def _direction_settings_payload(self):
+        current = self._direction_range_object()
+        if current:
+            self._direction_default_ranges = copy.deepcopy(current.ranges)
+            self._direction_preferred_object = current.name
+        for index, mask in enumerate(self.direction_masks):
+            self._direction_saved_profiles[mask.name] = {
+                "kind": "3d" if mask.top is not None else "2d", "ranges": range_preferences(mask.ranges),
+                "included": self.direction_objects.item(index).checkState() == Qt.CheckState.Checked,
+            }
+        if self.direction_masks:
+            refs = {ref.id: ref for mask in self.direction_masks for ref in mask.references}
+            self._direction_preference_references = restore_references(reference_preferences(refs.values()))
         return {"direction": {"method": self.direction_method.currentData(), "points": self._direction_point_names,
-                               "coordinates": self.direction_coordinates.currentData(), "angle": self.direction_angle.value()}}
+            "coordinates": self.direction_coordinates.currentData(), "angle": self.direction_angle.value(),
+            "source": self.direction_source.currentData(), "calibration_open": self.direction_calibration_toggle.isChecked(),
+            "reference_target": self._direction_reference_target, "reference_id": self._direction_reference_id,
+            "range_defaults": range_preferences(self._direction_default_ranges), "objects": self._direction_saved_profiles,
+            "selected_object": self._direction_preferred_object,
+            "references": reference_preferences(self._direction_preference_references),
+            "line_input": self.direction_line_input.preferences()}}
+
+    def _direction_restore_mask_preferences(self, mask):
+        profile = self._direction_saved_profiles.get(mask.name, {})
+        if not isinstance(profile, dict) or profile.get("kind") != ("3d" if mask.top is not None else "2d"):
+            profile = {}
+        data = profile.get("ranges", range_preferences(self._direction_default_ranges))
+        if not profile:
+            data = {key: value for key, value in data.items() if key not in {"reference_id", "top_reference_id", "bottom_reference_id"}}
+        mask.ranges = restore_ranges(data, mask.ranges, three_d=mask.top is not None)
+        refs = {r.id: copy.deepcopy(r) for r in mask.references}
+        names = {r.name: r for r in mask.references}
+        remap = {}
+        for definition in self._direction_preference_references:
+            ref = copy.deepcopy(definition)
+            source = refs.get(ref.id) or names.get(ref.name)
+            if source:
+                remap[ref.id] = source.id
+                ref.id, ref.points = source.id, list(source.points)
+            refs[ref.id] = ref
+        mask.references = list(refs.values())
+        for key in ("reference_id", "top_reference_id", "bottom_reference_id"):
+            value = getattr(mask.ranges, key)
+            setattr(mask.ranges, key, remap.get(value, value))
+        self._direction_reference_id = remap.get(self._direction_reference_id, self._direction_reference_id)
+        return profile.get("included", True) is not False
 
     def _direction_selected_masks(self):
         return [item for index, item in enumerate(self.direction_masks)
@@ -225,6 +279,7 @@ class DirectionTabMixin(DirectionRangesMixin):
         for item in masks:
             DirectionTarget(item.mask)
         self._direction_cancel_calibration()
+        self._direction_line_undo = []
         self.direction_masks = masks
         self._direction_reuse_video_references()
         self._direction_rebuild_ranges()
@@ -275,14 +330,22 @@ class DirectionTabMixin(DirectionRangesMixin):
                 raise ValueError("Prepare at least one object mask in the selected source.")
             if any(item.mask.shape != (height, width) for item in masks):
                 raise ValueError("Mask dimensions do not match this video.")
-            if source in {"occlusion", "3d"}:
-                previous = {m.name: m for m in self.direction_masks}
-                for mask in masks:
-                    old = previous.get(mask.name)
-                    if old is not None and (old.top is None) == (mask.top is None):
-                        mask.ranges = copy.deepcopy(old.ranges)
-                        mask.references = copy.deepcopy(old.references)
-            self._direction_set_masks(masks)
+            previous = {m.name: m for m in self.direction_masks}
+            previous_checked = {m.name for m in self._direction_selected_masks()}
+            checked = set()
+            for mask in masks:
+                old = previous.get(mask.name) if source in {"occlusion", "3d"} else None
+                if old is not None and (old.top is None) == (mask.top is None):
+                    mask.ranges = copy.deepcopy(old.ranges)
+                    mask.references = copy.deepcopy(old.references)
+                    included = mask.name in previous_checked
+                elif not getattr(mask, "_direction_recipe_loaded", False):
+                    included = self._direction_restore_mask_preferences(mask)
+                else:
+                    included = True
+                if included:
+                    checked.add(mask.name)
+            self._direction_set_masks(masks, checked, self._direction_preferred_object)
             self.statusBar().showMessage(f"Loaded {len(masks)} read-only direction masks.", 4000)
         except (OSError, ValueError, TypeError, cv2.error) as exc:
             QMessageBox.warning(self, "Load Direction Masks", str(exc))
@@ -303,6 +366,7 @@ class DirectionTabMixin(DirectionRangesMixin):
             self._direction_sync_ranges()
             self._direction_refresh_preview()
             self._refresh_output_ui()
+            self._save_settings()
 
     def _direction_errors(self):
         if self.video_state is None or self.csv_df is None or self.csv_path is None:

@@ -449,6 +449,7 @@ def _load_direction_masks(path: Path, width, height, video_key=None):
         if recipe is not None:
             if not isinstance(recipe, dict):
                 raise ValueError(f"Invalid direction recipe for {name}.")
+            item._direction_recipe_loaded = True
             item.video_key = recipe.get("video_key")
             settings = recipe.get("ranges", {})
             item.ranges = DirectionRanges(**{k: v for k, v in settings.items() if k in DirectionRanges.__dataclass_fields__})

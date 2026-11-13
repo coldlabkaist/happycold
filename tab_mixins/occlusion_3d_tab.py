@@ -22,16 +22,32 @@ from occlusion_3d import (
 )
 from shared import MASK_PALETTE, MaskRecord, MaskTransformSource, build_occlusion_dataframe, mask_polygon_geometry
 from ui_controls import NoWheelComboBox, NoWheelDoubleSpinBox, NoWheelSpinBox
+from annotation_settings import preference_choice, preference_number, reference_preferences, restore_references, settings_section
 
 
 class Occlusion3DTabMixin:
     def _build_occlusion_3d_tab(self) -> QWidget:
-        self.object3d_workspace = ObjectWorkspace()
+        saved = settings_section(self.settings, "occlusion_3d")
+        self.object3d_workspace = ObjectWorkspace(references=restore_references(saved.get("references")))
+        self._object3d_saved_reference_id = saved.get("reference_id") if isinstance(saved.get("reference_id"), str) else None
+        self._object3d_default_included = saved.get("included", True) is not False
+        self._object3d_defaults = {}
+        for key in ("top", "bottom"):
+            face = settings_section(settings_section(saved, "faces"), key)
+            unit = preference_choice(face.get("unit"), UNITS, "cm")
+            self._object3d_defaults[key] = {
+                "margin": preference_number(face.get("margin"), 2, -100000 / UNITS[unit], 100000 / UNITS[unit]),
+                "unit": unit, "reference_id": face.get("reference_id") if isinstance(face.get("reference_id"), str) else None,
+                "tool": face.get("tool") if isinstance(face.get("tool"), str) else "Rectangle Drag",
+                "edit_mode": preference_choice(face.get("edit_mode"), {"draw", "transform"}, "draw"),
+                "draw_action": preference_choice(face.get("draw_action"), {"add", "erase"}, "add"),
+                "brush": round(preference_number(face.get("brush"), 12, 1, 200)),
+            }
         self._object3d_videos = {}
         self._object3d_video_key = None
         self._object3d_selected_id = None
-        self._object3d_face = "top"
-        self._object3d_edit_target = "line"
+        self._object3d_face = preference_choice(saved.get("face"), {"top", "bottom"}, "top")
+        self._object3d_edit_target = preference_choice(saved.get("target"), {"line", "top", "bottom"}, "line")
         self._object3d_refreshing = False
         self._object3d_stroke_open = False
         self._object3d_last_brush_refresh = 0.0
@@ -81,7 +97,7 @@ class Occlusion3DTabMixin:
             button = QPushButton(label)
             button.setCheckable(True)
             button.setProperty("object3dTarget", target)
-            button.setToolTip(f"Edit the selected reference line." if target == "line" else f"Edit the selected object's {target} face.")
+            button.setToolTip("Edit the selected reference line." if target == "line" else f"Edit the selected object's {target} face. Press F to switch faces.")
             button.setChecked(target == "line")
             self.object3d_target_group.addButton(button)
             self.object3d_target_buttons[target] = button
@@ -111,6 +127,8 @@ class Occlusion3DTabMixin:
             button.clicked.connect(handler)
             actions.addWidget(button, 0, index)
         form.addRow(actions)
+        self.object3d_line_input = self._build_reference_line_controls("object3d", saved.get("line_input"))
+        form.addRow("Pixel Length", self.object3d_line_input)
         row = QHBoxLayout()
         self.object3d_reference_length = NoWheelDoubleSpinBox()
         self.object3d_reference_length.setDecimals(5)
@@ -129,12 +147,14 @@ class Occlusion3DTabMixin:
 
         self.object3d_face_controls = {}
         for key in ("top", "bottom"):
+            preset = self._object3d_defaults[key]
             group = QGroupBox(f"2. {key.title()} Face")
             face_form = QFormLayout(group)
             face_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
             draw = QRadioButton("Draw")
             transform = QRadioButton("Transform")
-            draw.setChecked(True)
+            draw.setChecked(preset["edit_mode"] == "draw")
+            transform.setChecked(preset["edit_mode"] == "transform")
             draw.setToolTip("Draw mode (D).")
             transform.setToolTip("Transform mode (T): drag to move, E/R to resize, Ctrl+E/R to rotate.")
             mode_group = QButtonGroup(group)
@@ -151,10 +171,12 @@ class Occlusion3DTabMixin:
                                 ("Circle Drag", "occ_circle"), ("Brush", "occ_free")):
                 tool.addItem(label, mode)
             tool.setToolTip("Hold Shift while dragging a rectangle for a square. Right-click to finish a polygon.")
+            tool.setCurrentIndex(max(0, tool.findText(preset["tool"])))
             face_form.addRow("Mask Tool", tool)
             add = QRadioButton("Add")
             erase = QRadioButton("Erase")
-            add.setChecked(True)
+            add.setChecked(preset["draw_action"] == "add")
+            erase.setChecked(preset["draw_action"] == "erase")
             action_group = QButtonGroup(group)
             action_group.addButton(add)
             action_group.addButton(erase)
@@ -165,12 +187,12 @@ class Occlusion3DTabMixin:
             face_form.addRow("Draw Action", action_row)
             brush = NoWheelSpinBox()
             brush.setRange(1, 200)
-            brush.setValue(12)
+            brush.setValue(preset["brush"])
             brush.setSuffix(" px")
             brush.setFixedWidth(88)
             brush_slider = QSlider(Qt.Orientation.Horizontal)
             brush_slider.setRange(1, 200)
-            brush_slider.setValue(12)
+            brush_slider.setValue(preset["brush"])
             brush_row = QHBoxLayout()
             brush_row.addWidget(brush_slider, 1)
             brush_row.addWidget(brush)
@@ -184,6 +206,9 @@ class Occlusion3DTabMixin:
             margin.setRange(-100000, 100000)
             unit = NoWheelComboBox()
             unit.addItems(list(UNITS))
+            unit.setCurrentText(preset["unit"])
+            self._object3d_configure_length_input(margin, preset["unit"])
+            margin.setValue(preset["margin"])
             row = QHBoxLayout()
             row.addWidget(margin, 1)
             row.addWidget(unit)
@@ -245,6 +270,27 @@ class Occlusion3DTabMixin:
             combo.setMinimumWidth(64)
             combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         return tab
+
+    def _object3d_settings_payload(self):
+        obj = self._object3d_object()
+        if obj:
+            self._object3d_default_included = obj.included
+        for key, controls in self.object3d_face_controls.items():
+            preset = self._object3d_defaults[key]
+            preset.update(tool=controls["tool"].currentText(),
+                edit_mode="transform" if controls["transform"].isChecked() else "draw",
+                draw_action="erase" if controls["erase"].isChecked() else "add", brush=controls["brush"].value())
+            if obj:
+                face = getattr(obj, key)
+                preset.update(margin=face.margin, unit=face.unit, reference_id=face.reference_id)
+        current = self.object3d_reference_combo.currentData()
+        if current:
+            self._object3d_saved_reference_id = current
+        return {"occlusion_3d": {"face": self._object3d_face, "target": self._object3d_edit_target,
+            "faces": copy.deepcopy(self._object3d_defaults), "included": self._object3d_default_included,
+            "reference_id": self._object3d_saved_reference_id,
+            "references": reference_preferences(self.object3d_workspace.references),
+            "line_input": self.object3d_line_input.preferences()}}
 
     def _object3d_active(self):
         return hasattr(self, "mode_tabs") and self.mode_tabs.currentIndex() == self.TAB_OCCLUSION_3D
@@ -310,6 +356,7 @@ class Occlusion3DTabMixin:
                 self._object3d_push_undo()
                 reference.name = name
                 self._object3d_changed()
+                self._save_settings()
 
     def _object3d_delete_reference(self):
         reference = self._object3d_reference()
@@ -322,12 +369,14 @@ class Occlusion3DTabMixin:
         self.object3d_workspace.references.remove(reference)
         self._object3d_changed()
         self._sync_object3d_mode()
+        self._save_settings()
 
     def _object3d_reference_selected(self, _index=0):
         if not self._object3d_refreshing:
             self.frame_viewer.reference_pick_active = False
             self._object3d_refresh()
             self._sync_object3d_mode()
+            self._save_settings()
 
     def _object3d_reference_setting(self, _value=None):
         reference = self._object3d_reference()
@@ -339,17 +388,18 @@ class Occlusion3DTabMixin:
                             if unit != reference.unit else self.object3d_reference_length.value())
         reference.unit = unit
         self._object3d_changed()
+        self._save_settings()
 
     def _object3d_measure(self, _checked=False, *, replace=False):
-        """Enter the shared Line target; redrawing also invalidates the old measurement."""
+        """Redraw in a draft; keep the committed reference until confirmation."""
         reference = self._object3d_reference()
         if reference is None or not self._object3d_active():
             return
-        if replace:
-            self._object3d_push_undo()
-            reference.points = []
-            self._object3d_render_cache.clear()
         self._object3d_set_edit_target("line")
+        if replace:
+            options = self.object3d_line_input.preferences()
+            self.frame_viewer.configure_reference_line(("object3d", self._object3d_video_key, reference.id),
+                reference.points, options["fixed"], options["length"], redraw=True)
 
     def _object3d_reference_line(self, points):
         reference = self._object3d_reference()
@@ -362,14 +412,20 @@ class Occlusion3DTabMixin:
         if not self._object3d_require_video():
             return
         ws = self.object3d_workspace
+        self._object3d_settings_payload()
         name = self._object3d_name("Add Object", f"Object {len(ws.objects) + 1}", [o.name for o in ws.objects])
         if name:
             self._object3d_push_undo()
             reference = self._object3d_reference()
             shape = (ws.height, ws.width)
-            top = ObjectFace(np.zeros(shape, np.uint8), reference_id=reference.id if reference else None)
-            bottom = copy.deepcopy(top)
-            obj = OcclusionObject(name, top, bottom, MASK_PALETTE[len(ws.objects) % len(MASK_PALETTE)].name())
+            faces = {}
+            for key in ("top", "bottom"):
+                preset = self._object3d_defaults[key]
+                ref_id = preset["reference_id"]
+                if not any(r.id == ref_id for r in ws.references):
+                    ref_id = reference.id if reference else None
+                faces[key] = ObjectFace(np.zeros(shape, np.uint8), preset["margin"], preset["unit"], ref_id)
+            obj = OcclusionObject(name, faces["top"], faces["bottom"], MASK_PALETTE[len(ws.objects) % len(MASK_PALETTE)].name(), self._object3d_default_included)
             ws.objects.append(obj)
             self._object3d_selected_id = obj.id
             self._object3d_changed()
@@ -421,7 +477,9 @@ class Occlusion3DTabMixin:
         if obj and not self._object3d_refreshing:
             self._object3d_push_undo()
             obj.included = checked
+            self._object3d_default_included = checked
             self._object3d_changed()
+            self._save_settings()
 
     def _object3d_face_setting(self, face):
         obj = self._object3d_object()
@@ -435,11 +493,25 @@ class Occlusion3DTabMixin:
         item.margin = (convert_length(item.margin, item.unit, unit)
                        if unit != item.unit else controls["margin"].value())
         item.unit = unit
+        self._object3d_defaults[face].update(margin=item.margin, unit=item.unit, reference_id=item.reference_id)
         obj.same_reference = False
         self._object3d_changed(object_id=obj.id)
+        self._save_settings()
 
     def _object3d_activate_face(self, face):
         self._object3d_set_edit_target(face)
+
+    def _object3d_toggle_face_shortcut(self):
+        if not self._object3d_active() or self._object3d_object() is None or self._object3d_edit_target not in {"top", "bottom"}:
+            return
+        current = self.object3d_face_controls[self._object3d_edit_target]
+        target = "bottom" if self._object3d_edit_target == "top" else "top"
+        mode = "transform" if current["transform"].isChecked() else "draw"
+        control = self.object3d_face_controls[target][mode]
+        if control.isChecked():
+            self._object3d_set_edit_target(target)
+        else:
+            control.setChecked(True)
 
     def _object3d_set_edit_target(self, target):
         if self._object3d_refreshing or target not in {"line", "top", "bottom"}:
@@ -461,6 +533,7 @@ class Occlusion3DTabMixin:
         self._sync_object3d_mode()
         self._object3d_refresh()
         self._refresh_output_ui()
+        self._save_settings()
 
     def _object3d_refresh_edit_target(self):
         obj = self._object3d_object()
@@ -515,7 +588,7 @@ class Occlusion3DTabMixin:
             ws = self.object3d_workspace
             self.object3d_references_group.setToolTip(
                 f"References for {self.video_state.path.name}." if self.video_state else "Load a video first.")
-            reference_id = reference_id or self.object3d_reference_combo.currentData()
+            reference_id = reference_id or self.object3d_reference_combo.currentData() or self._object3d_saved_reference_id
             self.object3d_reference_combo.clear()
             for reference in ws.references:
                 try:
@@ -608,10 +681,14 @@ class Occlusion3DTabMixin:
         viewer.set_margin_value(0)
         editing_line = self._object3d_edit_target == "line"
         reference = self._object3d_reference()
-        viewer.reference_pick_active = editing_line and reference is not None
-        viewer.reference_pick_points = list(reference.points) if reference and editing_line else []
         viewer.square_drag_enabled = not editing_line and controls["tool"].currentText() == "Square Drag"
         viewer.set_mode("reference_line" if editing_line else controls["tool"].currentData())
+        if editing_line and reference:
+            options = self.object3d_line_input.preferences()
+            viewer.configure_reference_line(("object3d", self._object3d_video_key, reference.id),
+                reference.points, options["fixed"], options["length"])
+        else:
+            viewer.deactivate_reference_line()
         viewer.set_occ_transform_mode(not editing_line and controls["transform"].isChecked())
         viewer.set_occlusion_draw_mode(add=controls["add"].isChecked(),
                                        brush_radius=controls["brush"].value())
@@ -631,7 +708,7 @@ class Occlusion3DTabMixin:
                 self._object3d_undo = []
         else:
             ws = self.object3d_workspace
-            self.object3d_workspace = ws.for_new_video(width, height) if ws.width else ObjectWorkspace(width, height)
+            self.object3d_workspace = ws.for_new_video(width, height)
             self._object3d_undo = []
         self._object3d_video_key = key
         self.object3d_workspace.video_key = key
@@ -726,6 +803,8 @@ class Occlusion3DTabMixin:
         self._object3d_transform_source = [source[0], next_scale, next_angle]
 
     def _object3d_save_errors(self):
+        if self._object3d_active() and self.frame_viewer.reference_line_pending:
+            return ["Finish or cancel the reference line."]
         included = [o for o in self.object3d_workspace.objects if o.included]
         if not included:
             return ["Include at least one 3D object."]

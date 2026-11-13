@@ -11,6 +11,8 @@ _codex_*
 tests/*
 !tests/test_occlusion_3d.py
 !tests/test_direction.py
+!tests/test_annotation_settings.py
+!tests/test_reference_line.py
 
 # Virtual environments
 .venv/

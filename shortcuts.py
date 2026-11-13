@@ -18,6 +18,7 @@ APP_SHORTCUTS: tuple[ShortcutSpec, ...] = (
     ShortcutSpec("Right", "step_frame", (1,)),
     ShortcutSpec("D", "_switch_region_edit_mode_shortcut", (False,)),
     ShortcutSpec("T", "_switch_region_edit_mode_shortcut", (True,)),
+    ShortcutSpec("F", "_object3d_toggle_face_shortcut"),
     ShortcutSpec("E", "_scale_active_region_shortcut", (0.96,)),
     ShortcutSpec("R", "_scale_active_region_shortcut", (1.04,)),
     ShortcutSpec("Ctrl+E", "_rotate_active_region_shortcut", (-4.0,)),
@@ -35,6 +36,17 @@ APP_SHORTCUTS: tuple[ShortcutSpec, ...] = (
 
 
 ANNOTATE_SHORTCUT_HELP_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    (
+        "Reference Lines (Direction / 3D Object)",
+        (
+            ("Click, then move", "Set the start point and preview the line direction"),
+            ("Type pixels + Enter", "Set an exact length in original video pixels and confirm"),
+            ("Shift", "Constrain the direction to horizontal or vertical while held"),
+            ("Fixed", "Keep pixel length while choosing direction or dragging either endpoint"),
+            ("Enter / Esc", "Confirm the draft / restore the previous line"),
+            ("Ctrl+Z", "Cancel a draft or undo the last committed reference edit"),
+        ),
+    ),
     (
         "Direction",
         (
@@ -67,6 +79,7 @@ ANNOTATE_SHORTCUT_HELP_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ..
     (
         "Occlusion / 3D Object",
         (
+            ("F (3D Object)", "Switch Top / Bottom while keeping Draw or Transform mode"),
             ("1 - 9", "Select mask or object 1 - 9"),
             ("0", "Select mask or object 10"),
             ("Double-click", "Select the mask, object, or face under the cursor"),
